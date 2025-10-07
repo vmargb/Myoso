@@ -38,4 +38,7 @@ interface DeckDao {
     
     @Query("SELECT COUNT(*) FROM decks")
     suspend fun getDeckCount(): Int
+    
+    @Query("DELETE FROM decks")
+    suspend fun deleteAllDecks()
 }

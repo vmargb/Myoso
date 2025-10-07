@@ -44,4 +44,7 @@ interface NoteDao {
     
     @Query("SELECT COUNT(*) FROM notes WHERE deckId = :deckId")
     suspend fun getNoteCountByDeck(deckId: String): Int
+    
+    @Query("DELETE FROM notes")
+    suspend fun deleteAllNotes()
 }

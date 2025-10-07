@@ -41,4 +41,7 @@ interface CitationDao {
     
     @Query("SELECT COUNT(*) FROM citations WHERE cardId = :cardId")
     suspend fun getCitationCountByCard(cardId: String): Int
+    
+    @Query("DELETE FROM citations")
+    suspend fun deleteAllCitations()
 }

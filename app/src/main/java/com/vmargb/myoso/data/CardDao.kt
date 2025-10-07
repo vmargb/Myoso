@@ -47,4 +47,7 @@ interface CardDao {
     
     @Query("SELECT COUNT(*) FROM cards WHERE deckId IN (:deckIds) AND nextDueAt <= :nowMs")
     suspend fun getDueCardCount(deckIds: List<String>, nowMs: Long): Int
+    
+    @Query("DELETE FROM cards")
+    suspend fun deleteAllCards()
 }

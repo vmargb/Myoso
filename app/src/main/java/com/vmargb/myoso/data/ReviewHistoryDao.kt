@@ -35,4 +35,7 @@ interface ReviewHistoryDao {
     
     @Query("SELECT AVG(responseTimeMs) FROM review_history WHERE cardId = :cardId")
     suspend fun getAverageResponseTimeByCard(cardId: String): Double?
+    
+    @Query("DELETE FROM review_history")
+    suspend fun deleteAllReviewHistory()
 }
