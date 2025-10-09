@@ -4,6 +4,7 @@ import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import kotlinx.serialization.Serializable
 
 @Entity(
     tableName = "citations",
@@ -26,6 +27,7 @@ import androidx.room.PrimaryKey
         Index(value = ["cardId"])
     ]
 )
+@Serializable
 data class CitationEntity(
     @PrimaryKey
     val id: String,

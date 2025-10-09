@@ -2,6 +2,7 @@ package com.vmargb.myoso.io
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -17,6 +18,7 @@ import androidx.compose.ui.unit.dp
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
+import com.vmargb.myoso.data.DeckEntity
 
 @Composable
 fun FileChooserDialog(
@@ -119,7 +121,7 @@ fun FileChooserDialog(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            Icons.Default.FolderOpen,
+                            Icons.Default.MoreVert,
                             contentDescription = "Open",
                             tint = MaterialTheme.colorScheme.onSecondaryContainer
                         )
@@ -262,8 +264,12 @@ fun ExportProgressDialog(
                     )
                     
                     LinearProgressIndicator(
-                        progress = progress,
-                        modifier = Modifier.fillMaxWidth()
+                        progress = { progress },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.24f),
+                        gapSize = 0.dp, // adjust gap size
+                        drawStopIndicator = {} // remove stop dot
                     )
                     
                     Text(

@@ -3,12 +3,19 @@ package com.vmargb.myoso.data
 import androidx.room.*
 import kotlinx.coroutines.flow.Flow
 
+// ==========================================
+// Data Access Object (DAO) for CardEntity.kt
+// ==========================================
+/**
+ * Interface for managing CardEntity database operations 
+ */
 @Dao
 interface CardDao {
-    
+    // fetch all cards that match the given deck IDs and are due for review
     @Query("SELECT * FROM cards WHERE deckId IN (:deckIds) AND nextDueAt <= :nowMs ORDER BY nextDueAt ASC")
     suspend fun getDueCards(deckIds: List<String>, nowMs: Long): List<CardEntity>
-    
+
+    // fetch all cards for a specific deck
     @Query("SELECT * FROM cards WHERE deckId = :deckId ORDER BY createdAt ASC")
     suspend fun getCardsByDeck(deckId: String): List<CardEntity>
     
@@ -45,6 +52,7 @@ interface CardDao {
     @Query("SELECT COUNT(*) FROM cards WHERE deckId = :deckId")
     suspend fun getCardCountByDeck(deckId: String): Int
     
+    // Get total count of due cards across multiple decks
     @Query("SELECT COUNT(*) FROM cards WHERE deckId IN (:deckIds) AND nextDueAt <= :nowMs")
     suspend fun getDueCardCount(deckIds: List<String>, nowMs: Long): Int
     

@@ -4,6 +4,7 @@ import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import kotlinx.serialization.Serializable
 
 @Entity(
     tableName = "review_history",
@@ -20,6 +21,7 @@ import androidx.room.PrimaryKey
         Index(value = ["reviewedAt"])
     ]
 )
+@Serializable
 data class ReviewHistoryEntity(
     @PrimaryKey
     val id: String,
