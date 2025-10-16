@@ -12,15 +12,15 @@ class CardRepository(
     private val cardDao: CardDao = database.cardDao()
     private val deckDao: DeckDao = database.deckDao()
 
-    // Get cards for a deck (one-shot)
+    // get cards for a specific deck
     suspend fun getCardsByDeck(deckId: String): List<CardEntity> =
         cardDao.getCardsByDeck(deckId)
 
-    // Observe cards by deck
+    // get cards for a specific deck as Flow (to observe changes)
     fun getCardsByDeckFlow(deckId: String): Flow<List<CardEntity>> =
         cardDao.getCardsByDeckFlow(deckId)
 
-    // Get due cards from multiple decks (uses current time)
+    // get due cards from multiple decks (uses current time)
     suspend fun getDueCards(deckIds: List<String>): List<CardEntity> {
         val now = System.currentTimeMillis()
         return cardDao.getDueCards(deckIds, now)
@@ -35,8 +35,8 @@ class CardRepository(
     }
 
     /**
-     * Reviews a card using Scheduler.computeNextReview and persists the updated card.
-     * Returns Pair of updated CardEntity and nextDueAt timestamp (ms).
+     * Reviews a card using Scheduler.computeNextReview and persists the updated card
+     * Returns Pair of updated CardEntity and nextDueAt timestamp (ms)
      */
     suspend fun reviewCard(
         card: CardEntity,
@@ -45,8 +45,7 @@ class CardRepository(
     ): Pair<CardEntity, Long> {
         val result = ReviewResult(confidence, responseTimeMs)
         val (updatedCard, nextDueAt) = Scheduler.computeNextReview(card, result, useResponseTime = true)
-        // Persist review-specific update
-        cardDao.updateCardAfterReview(updatedCard)
+        cardDao.updateCardAfterReview(updatedCard) // persist review-specific update
         return Pair(updatedCard, nextDueAt)
     }
 }

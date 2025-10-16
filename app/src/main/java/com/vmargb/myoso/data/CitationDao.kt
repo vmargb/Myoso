@@ -5,13 +5,14 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface CitationDao {
-    
+    // get all citations in a specific note
     @Query("SELECT * FROM citations WHERE noteId = :noteId ORDER BY startIndex ASC")
     suspend fun getCitationsByNote(noteId: String): List<CitationEntity>
     
     @Query("SELECT * FROM citations WHERE noteId = :noteId ORDER BY startIndex ASC")
     fun getCitationsByNoteFlow(noteId: String): Flow<List<CitationEntity>>
     
+    // get all citations that reference a specific card
     @Query("SELECT * FROM citations WHERE cardId = :cardId ORDER BY startIndex ASC")
     suspend fun getCitationsByCard(cardId: String): List<CitationEntity>
     
@@ -30,12 +31,15 @@ interface CitationDao {
     @Delete
     suspend fun deleteCitation(citation: CitationEntity)
     
+    // delete all citations associated with a specific note
     @Query("DELETE FROM citations WHERE noteId = :noteId")
     suspend fun deleteCitationsByNote(noteId: String)
     
+    // delete all citations associated with a specific card
     @Query("DELETE FROM citations WHERE cardId = :cardId")
     suspend fun deleteCitationsByCard(cardId: String)
     
+    // get all citations count for a specific note or card
     @Query("SELECT COUNT(*) FROM citations WHERE noteId = :noteId")
     suspend fun getCitationCountByNote(noteId: String): Int
     

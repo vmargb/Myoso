@@ -25,7 +25,7 @@ class DeckRepository(
     suspend fun getCardCountByDeck(deckId: String): Int = cardDao.getCardCountByDeck(deckId)
 
     /**
-     * Returns number of due cards across provided deck IDs (based on current time).
+     * Returns number of due cards across provided deck IDs (based on current time)
      */
     suspend fun getDueCardCount(deckIds: List<String>): Int {
         val now = System.currentTimeMillis()

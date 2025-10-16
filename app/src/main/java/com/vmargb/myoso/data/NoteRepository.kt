@@ -30,8 +30,8 @@ class NoteRepository(
     suspend fun deleteCitationsByNote(noteId: String) = citationDao.deleteCitationsByNote(noteId)
 
     /**
-     * Helper that inserts/updates a note and replaces its citations atomically (simple approach).
-     * Note: call from a transaction scope if you need stronger atomicity.
+     * Helper that inserts/updates a note and replaces its citations atomically (simple approach)
+     * Note: call from a transaction scope if you need stronger atomicity
      */
     suspend fun insertNoteWithCitations(note: NoteEntity, citations: List<CitationEntity>) {
         noteDao.insertNote(note)

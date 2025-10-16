@@ -11,8 +11,8 @@ import kotlinx.serialization.Serializable
     foreignKeys = [
         ForeignKey(
             entity = NoteEntity::class,
-            parentColumns = ["id"],
-            childColumns = ["noteId"],
+            parentColumns = ["id"], // primary key columns
+            childColumns = ["noteId"], // foreign key columns
             onDelete = ForeignKey.CASCADE
         ),
         ForeignKey(
