@@ -11,6 +11,7 @@ data class DeckEntity(
     val id: String,
     val name: String,
     val description: String? = null,
+    val color: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = System.currentTimeMillis()
 )

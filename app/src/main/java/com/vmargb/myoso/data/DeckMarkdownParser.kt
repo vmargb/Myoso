@@ -56,7 +56,7 @@ data class ParsedCard( // each card in the 'cards' section
     val back: String,
     val tags: String? = null,
     val pinned: String? = null,
-    val reversible: Boolean
+    val reversible: Boolean? = null
 )
 
 data class ParsedDeck( // the whole parsed deck
@@ -227,7 +227,7 @@ class DeckMarkdownParser(
             }
             
             val notes = notesBuilder.toString().trim()
-            return Pair(if (notes.isEmpty()) null else notes, currentIndex) // return notes or null
+            return Pair(notes.ifEmpty { null }, currentIndex) // return notes or null
         }
         
         return Pair(null, currentIndex) // if we reach here, no notes section so null
