@@ -5,11 +5,13 @@ import androidx.lifecycle.viewModelScope
 import com.vmargb.myoso.data.CitationEntity
 import com.vmargb.myoso.data.NoteEntity
 import com.vmargb.myoso.data.NoteRepository
+import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.util.UUID
+import javax.inject.Inject
 
 @kotlinx.serialization.ExperimentalSerializationApi
 data class NotesUiState(
@@ -20,7 +22,8 @@ data class NotesUiState(
     val citations: List<CitationEntity> = emptyList()
 )
 
-class NotesViewModel(
+@HiltViewModel
+class NotesViewModel @Inject constructor (
     private val noteRepository: NoteRepository
 ) : ViewModel() {
 

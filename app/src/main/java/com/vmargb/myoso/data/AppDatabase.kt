@@ -18,8 +18,6 @@ import android.content.Context
     entities = [
         CardEntity::class,
         DeckEntity::class,
-        NoteEntity::class,
-        CitationEntity::class,
         ReviewHistoryEntity::class
     ],
     version = 1,
@@ -30,9 +28,7 @@ abstract class AppDatabase : RoomDatabase() {
     // when inheriting from RoomDatabase, define abstract methods for each DAO
     abstract fun cardDao(): CardDao
     abstract fun deckDao(): DeckDao
-    abstract fun noteDao(): NoteDao
     abstract fun reviewHistoryDao(): ReviewHistoryDao
-    abstract fun citationDao(): CitationDao
     
     companion object {
         @Volatile

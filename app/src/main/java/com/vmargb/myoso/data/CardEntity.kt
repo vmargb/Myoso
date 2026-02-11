@@ -5,6 +5,18 @@ import androidx.room.Index
 import androidx.room.PrimaryKey
 import kotlinx.serialization.Serializable
 
+/*
+ * everything is just a "Card"
+ * pinned = null (standard spaced repetition)
+ * 
+ * pinned = "daily", "weekly":
+ *   pinned q&a card, ignores all scheduling
+ * 
+ * pinned = "note"
+ *  Note card that only uses 'front'
+ *  ignores 'back' and all scheduling
+ */
+
 
 @Entity(
     tableName = "cards",

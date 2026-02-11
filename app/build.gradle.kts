@@ -60,6 +60,9 @@ dependencies {
     implementation(libs.androidx.room.ktx)
     implementation(libs.navigation.compose)
     ksp("androidx.room:room-compiler:2.8.3")
+    
+    //dependency injection
+    implementation("com.google.dagger:hilt-android:2.57.2")
 
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.androidx.lifecycle.viewmodel.compose)

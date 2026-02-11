@@ -87,7 +87,6 @@ class DeckMarkdownParser(
     private val context: Context,
     private val cardDao: CardDao,
     private val deckDao: DeckDao,
-    private val noteDao: NoteDao
 ) {
     
     /**
@@ -109,18 +108,7 @@ class DeckMarkdownParser(
             updatedAt = System.currentTimeMillis()
         )
         deckDao.insertDeck(deckEntity)
-        
-        // Import notes if present
-        if (!parsedDeck.notes.isNullOrBlank()) { // if notes are present
-            val noteEntity = NoteEntity( // create NoteEntity
-                id = UUID.randomUUID().toString(),
-                deckId = parsedDeck.metadata.id, // foreign key to Deck
-                markdownBody = parsedDeck.notes,
-                updatedAt = System.currentTimeMillis()
-            )
-            noteDao.insertNote(noteEntity)
-        }
-        
+
         // Import cards
         val cardEntities = parsedDeck.cards.map { card -> // map each card to a CardEntity
             CardEntity(
@@ -139,8 +127,30 @@ class DeckMarkdownParser(
                 nextDueAt = System.currentTimeMillis(),
                 createdAt = System.currentTimeMillis()
             )
-        }
+        }.toMutableList()
         cardDao.insertCards(cardEntities)
+
+        // Import the # Notes section as a single "note" card
+        if (!parsedDeck.notes.isNullOrBlank()) {
+            val noteCard = CardEntity(
+                id = UUID.randomUUID().toString(), // A new ID for this note
+                deckId = parsedDeck.metadata.id,
+                front = parsedDeck.notes.trim(), // The note content
+                back = "", // Notes have no back
+                tags = null, // You could add a "note" tag here if you want
+                pinned = "note", // <-- *** This is the key ***
+                isReversible = false,
+                // Defaults for a non-reviewable card
+                intervalDays = 1,
+                easeFactor = 2.3,
+                reviewCount = 0,
+                consecutiveFails = 0,
+                lastReviewedAt = 0L,
+                nextDueAt = 0L, // Not due for review
+                createdAt = deckEntity.createdAt // Match deck creation time
+            )
+            cardEntities.add(noteCard) // Add it to the list of cards
+        }
         
         return parsedDeck
     }

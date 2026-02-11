@@ -5,6 +5,12 @@ import com.vmargb.myoso.scheduling.ReviewResult
 import com.vmargb.myoso.scheduling.Scheduler
 import kotlinx.coroutines.flow.Flow
 
+/**
+ * Spaced Repetition: Call cardRepository.getDueCards(...)
+ * Daily Review: Call cardRepository.getDailyCardsByDeck(...)
+ * Notes Review: Call cardRepository.getNoteCardsByDeck(...)
+ */
+
 class CardRepository(
     private val database: AppDatabase // inject AppDatabase so DAOs come from it
 ) {
@@ -12,13 +18,30 @@ class CardRepository(
     private val cardDao: CardDao = database.cardDao()
     private val deckDao: DeckDao = database.deckDao()
 
-    // get cards for a specific deck
+	/*
+	 * Get ALL cards
+	 */
     suspend fun getCardsByDeck(deckId: String): List<CardEntity> =
         cardDao.getCardsByDeck(deckId)
 
-    // get cards for a specific deck as Flow (to observe changes)
     fun getCardsByDeckFlow(deckId: String): Flow<List<CardEntity>> =
         cardDao.getCardsByDeckFlow(deckId)
+
+	/**
+	 * Get all "Note" cards
+	 */
+	suspend fun getNodeCardsByDeck(deckId: String): List<CardEntity> =
+		cardDao.getCardsByDeckAndType(deckId, "Note")
+
+	suspend fun getNodeCardsByDeckFlow(deckId: String): Flow<List<CardEntity>> =
+		cardDao.getCardsByDeckAndTypeFlow(deckId, "Note")
+
+	/*
+	 * Get all "daily" cards
+	 */
+	suspend fun getDailyCardsByDeck(deckId: String): List<CardEntity> =
+		cardDao.getCardsByDeckAndType(deckId, "daily")
+
 
     // get due cards from multiple decks (uses current time)
     suspend fun getDueCards(deckIds: List<String>): List<CardEntity> {

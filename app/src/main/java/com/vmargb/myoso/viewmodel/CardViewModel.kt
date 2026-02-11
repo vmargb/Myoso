@@ -6,10 +6,13 @@ import com.vmargb.myoso.data.CardDao
 import com.vmargb.myoso.data.CardEntity
 import com.vmargb.myoso.data.CardRepository
 import com.vmargb.myoso.scheduling.Confidence
+import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
+import javax.inject.Inject
 
-class CardViewModel(
+@HiltViewModel
+class CardViewModel @Inject constructor (
     private val cardRepository: CardRepository,
     private val cardDao: CardDao // provided so we can access pinned / dao-specific queries not exposed by repo
 ) : ViewModel() {

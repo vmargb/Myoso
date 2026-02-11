@@ -7,10 +7,12 @@ import com.vmargb.myoso.io.DeckExporter
 import com.vmargb.myoso.data.DeckMarkdownParser
 import com.vmargb.myoso.data.DeckEntity
 import com.vmargb.myoso.data.DeckRepository
+import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.io.File
+import javax.inject.Inject
 
 data class ImportExportUiState(
     val isLoading: Boolean = false,
@@ -19,7 +21,8 @@ data class ImportExportUiState(
     val exportMessage: String = ""
 )
 
-class ImportExportViewModel(
+@HiltViewModel
+class ImportExportViewModel @Inject constructor (
     private val deckRepository: DeckRepository,
     private val backupManager: BackupManager,
     private val deckExporter: DeckExporter,

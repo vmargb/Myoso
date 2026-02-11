@@ -17,7 +17,9 @@ import androidx.navigation.compose.rememberNavController
 import com.vmargb.myoso.ui.home.MainScreen
 import com.vmargb.myoso.ui.theme.MyosoTheme
 import com.vmargb.myoso.data.DeckEntity
+import dagger.hilt.android.AndroidEntryPoint
 
+@AndroidEntryPoint
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
