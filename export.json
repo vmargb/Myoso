@@ -1,0 +1,222 @@
+{
+  "exported_at": "2026-04-07T13:44:39.701113Z",
+  "cards": [
+    {
+      "card": {
+        "id": "ae3fbdb7-d343-420c-90f6-f6261de0d79e",
+        "deck": "default",
+        "kind": "simple",
+        "question": "What is a closure?",
+        "reversible": true,
+        "created_at": "2026-04-04T03:33:00.604812Z",
+        "updated_at": "2026-04-04T03:33:00.604812Z"
+      },
+      "items": [
+        {
+          "id": "973d94c4-0262-4b82-85fa-c5f94cdc43bf",
+          "card_id": "ae3fbdb7-d343-420c-90f6-f6261de0d79e",
+          "position": 1,
+          "kind": "forward",
+          "prompt": "What is a closure?",
+          "answer": "A function that captures variables from its surrounding lexical scope.",
+          "due_at": "2026-04-07T15:29:38.489561Z",
+          "interval_days": 0.5,
+          "ease": 2.0999999999999996,
+          "last_reviewed_at": "2026-04-07T03:29:38.489561Z",
+          "lapses": 2,
+          "review_count": 2,
+          "confidence_avg": 1.0
+        },
+        {
+          "id": "3e551159-3cc1-4cd7-a231-a9e0bbd19745",
+          "card_id": "ae3fbdb7-d343-420c-90f6-f6261de0d79e",
+          "position": 2,
+          "kind": "reverse",
+          "prompt": "A function that captures variables from its surrounding lexical scope.",
+          "answer": "What is a closure?",
+          "due_at": "2026-04-10T03:29:43.391192Z",
+          "interval_days": 3.0,
+          "ease": 2.5,
+          "last_reviewed_at": "2026-04-07T03:29:43.391192Z",
+          "lapses": 0,
+          "review_count": 2,
+          "confidence_avg": 3.0
+        }
+      ]
+    },
+    {
+      "card": {
+        "id": "5254b857-17dd-480a-bb0a-b06839c9cb8d",
+        "deck": "test",
+        "kind": "multi",
+        "question": "this is a test card lol",
+        "reversible": false,
+        "created_at": "2026-04-05T03:01:36.032027Z",
+        "updated_at": "2026-04-05T03:01:36.032027Z"
+      },
+      "items": [
+        {
+          "id": "af2a7064-a42d-472b-af17-1341ffbab3a1",
+          "card_id": "5254b857-17dd-480a-bb0a-b06839c9cb8d",
+          "position": 1,
+          "kind": "step",
+          "prompt": "Step 1",
+          "answer": "1",
+          "due_at": "2026-12-29T02:18:41.437656Z",
+          "interval_days": 267.96875,
+          "ease": 2.9,
+          "last_reviewed_at": "2026-04-05T03:03:41.437656Z",
+          "lapses": 0,
+          "review_count": 5,
+          "confidence_avg": 4.6
+        },
+        {
+          "id": "17f58a28-00db-4c84-b06c-74c3533aff67",
+          "card_id": "5254b857-17dd-480a-bb0a-b06839c9cb8d",
+          "position": 2,
+          "kind": "step",
+          "prompt": "Step 2",
+          "answer": "2",
+          "due_at": "2026-04-13T21:03:43.950155Z",
+          "interval_days": 8.75,
+          "ease": 2.4,
+          "last_reviewed_at": "2026-04-05T03:03:43.950155Z",
+          "lapses": 1,
+          "review_count": 4,
+          "confidence_avg": 3.0
+        },
+        {
+          "id": "782d1866-816b-48b6-a205-e590c9c6acd9",
+          "card_id": "5254b857-17dd-480a-bb0a-b06839c9cb8d",
+          "position": 3,
+          "kind": "step",
+          "prompt": "Step 3",
+          "answer": "3",
+          "due_at": "2026-05-05T18:03:46.468432Z",
+          "interval_days": 30.625,
+          "ease": 2.75,
+          "last_reviewed_at": "2026-04-05T03:03:46.468432Z",
+          "lapses": 0,
+          "review_count": 3,
+          "confidence_avg": 4.666666666666667
+        },
+        {
+          "id": "c5fa7dbe-96ef-462f-a197-5a54702991e2",
+          "card_id": "5254b857-17dd-480a-bb0a-b06839c9cb8d",
+          "position": 4,
+          "kind": "step",
+          "prompt": "Step 4",
+          "answer": "4",
+          "due_at": "2026-04-13T21:03:48.916941Z",
+          "interval_days": 8.75,
+          "ease": 2.65,
+          "last_reviewed_at": "2026-04-05T03:03:48.916941Z",
+          "lapses": 0,
+          "review_count": 2,
+          "confidence_avg": 4.5
+        },
+        {
+          "id": "80d3fbf7-29e2-47b7-8991-57747349347e",
+          "card_id": "5254b857-17dd-480a-bb0a-b06839c9cb8d",
+          "position": 5,
+          "kind": "step",
+          "prompt": "Step 5",
+          "answer": "5",
+          "due_at": "2026-04-08T15:03:51.312596Z",
+          "interval_days": 3.5,
+          "ease": 2.6,
+          "last_reviewed_at": "2026-04-05T03:03:51.312596Z",
+          "lapses": 0,
+          "review_count": 1,
+          "confidence_avg": 5.0
+        }
+      ]
+    },
+    {
+      "card": {
+        "id": "f3db01fb-be7a-4cfb-b3f6-77284b7f7b62",
+        "deck": "test2lol",
+        "kind": "simple",
+        "question": "blablabla",
+        "reversible": true,
+        "created_at": "2026-04-07T03:31:47.455366Z",
+        "updated_at": "2026-04-07T03:31:47.455366Z"
+      },
+      "items": [
+        {
+          "id": "98e315f3-db19-4b17-8581-c13637675bb7",
+          "card_id": "f3db01fb-be7a-4cfb-b3f6-77284b7f7b62",
+          "position": 1,
+          "kind": "forward",
+          "prompt": "blablabla",
+          "answer": "the answer was bla",
+          "due_at": "2026-04-09T15:32:18.119853Z",
+          "interval_days": 2.5,
+          "ease": 2.55,
+          "last_reviewed_at": "2026-04-07T03:32:18.119853Z",
+          "lapses": 0,
+          "review_count": 1,
+          "confidence_avg": 4.0
+        },
+        {
+          "id": "03dc9464-d33d-4d40-983a-89ce960ea095",
+          "card_id": "f3db01fb-be7a-4cfb-b3f6-77284b7f7b62",
+          "position": 2,
+          "kind": "reverse",
+          "prompt": "the answer was bla",
+          "answer": "blablabla",
+          "due_at": "2026-04-10T15:32:24.907799Z",
+          "interval_days": 3.5,
+          "ease": 2.6,
+          "last_reviewed_at": "2026-04-07T03:32:24.907799Z",
+          "lapses": 0,
+          "review_count": 1,
+          "confidence_avg": 5.0
+        }
+      ]
+    },
+    {
+      "card": {
+        "id": "560c6df9-0050-472f-8e1e-b08a4f747bfc",
+        "deck": "default",
+        "kind": "simple",
+        "question": "this should be in default",
+        "reversible": true,
+        "created_at": "2026-04-07T03:34:45.088027Z",
+        "updated_at": "2026-04-07T03:34:45.088027Z"
+      },
+      "items": [
+        {
+          "id": "ecc25fc9-2de0-4693-bb87-ff078aa0bd2d",
+          "card_id": "560c6df9-0050-472f-8e1e-b08a4f747bfc",
+          "position": 1,
+          "kind": "forward",
+          "prompt": "this should be in default",
+          "answer": "yep its in default",
+          "due_at": "2026-04-10T15:35:23.929308Z",
+          "interval_days": 3.5,
+          "ease": 2.6,
+          "last_reviewed_at": "2026-04-07T03:35:23.929308Z",
+          "lapses": 0,
+          "review_count": 1,
+          "confidence_avg": 5.0
+        },
+        {
+          "id": "9953d776-a579-400c-9243-f1ab20d21f3b",
+          "card_id": "560c6df9-0050-472f-8e1e-b08a4f747bfc",
+          "position": 2,
+          "kind": "reverse",
+          "prompt": "yep its in default",
+          "answer": "this should be in default",
+          "due_at": "2026-04-10T15:35:25.566173Z",
+          "interval_days": 3.5,
+          "ease": 2.6,
+          "last_reviewed_at": "2026-04-07T03:35:25.566173Z",
+          "lapses": 0,
+          "review_count": 1,
+          "confidence_avg": 5.0
+        }
+      ]
+    }
+  ]
+}

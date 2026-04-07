@@ -1,58 +1,75 @@
-# Myoso
+# myoso
 
-A Kotlin + Jetpack Compose Android app with Room for SQLite storage.
+Step-by-step spaced-repetition flashcards for the terminal.
 
-## Project Structure
+Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.org/) (bundled, zero system dependencies) for storage.
 
-The project is organized into the following packages:
-- `com.vmargb.myoso.model` - Data models and entities
-- `com.vmargb.myoso.data` - Room database, DAOs, and repositories
-- `com.vmargb.myoso.ui` - Jetpack Compose UI components and screens
-- `com.vmargb.myoso.scheduling` - Scheduling-related functionality
-- `com.vmargb.myoso.notes` - Notes management features
-- `com.vmargb.myoso.session` - Session management features
+---
 
-## How to Run
+## What is it?
 
-### Prerequisites
-- Android Studio Arctic Fox or later
-- Android SDK 29 or higher
-- Java 11 or higher
+Standard flashcard apps are great for 1:1 facts and definitions but struggle with longer chain
+**procedural knowledge**, things like "What are all the verb endings for past tense?" or "how do I reverse a linked list?" or
+"walk me through this calculus derivation".
 
-### Build and Run Commands
+Myoso lets you author cards with **ordered steps**. During review you
+reconstruct the full reasoning chain one step at a time, rating each step
+separately. Spaced repetition then schedules each step independently so that
+you must "unlock" the later steps. Likewise, forgetting a particular step
+will "de-unlock" that step in the chain.
 
-To build the project:
+### Card types
+
+| Type | Description |
+|------|-------------|
+| **simple** | Classic Q→A (optionally reversible A→Q) |
+| **multi** | One question, N ordered answer steps |
+
+---
+
+## Installation
+
 ```bash
-./gradlew assembleDebug
+# Requires Rust ≥ 1.75 and a C compiler (for the bundled SQLite)
+git clone https://github.com/vmargb/Myoso.git
+cd myoso
+cargo run
 ```
 
-To run the app on a connected device or emulator:
-```bash
-./gradlew installDebug
-```
+---
 
-To clean and rebuild:
-```bash
-./gradlew clean assembleDebug
-```
+## Review TUI controls
 
-### Development Setup
-1. Open the project in Android Studio
-2. Sync the project with Gradle files
-3. Connect an Android device or start an emulator
-4. Click the "Run" button or use the Gradle commands above
+| Key | Action |
+|-----|--------|
+| `Space` / `Enter` | Reveal the answer for the current step |
+| `1` | Rate: **Again** - total blank, short reset |
+| `2` | Rate: **Hard** - recalled with significant effort |
+| `3` | Rate: **Good** - recalled correctly |
+| `4` | Rate: **Great** - recalled correctly & quickly |
+| `5` | Rate: **Easy** - instant/effortless |
+| `q` / `Esc` | Quit the session |
 
-## Dependencies
+---
 
-- **Jetpack Compose**: Latest stable version (2024.09.00)
-- **Room**: 2.6.1 for SQLite database management
-- **Navigation Compose**: For navigation between screens
-- **Material3**: For modern Material Design components
+## Scheduling algorithm
 
-## Features
+Uses a simplified SM-2 variant.  Each **item** (step) is tracked independently:
 
-- Modern Jetpack Compose UI
-- Room database integration
-- Navigation with NavHost
-- Material3 theming
-- Organized package structure for scalability
+| Rating | Ease delta | Interval multiplier |
+|--------|-----------|---------------------|
+| 1 Again | −0.20 | reset to 0.5 days |
+| 2 Hard  | −0.05 | × 1.2 |
+| 3 Good  |  0.00 | × 2.0 |
+| 4 Great | +0.05 | × 2.5 |
+| 5 Easy  | +0.10 | × 3.5 |
+
+Ease is clamped to `[1.3, 3.0]`.  The first interval is always 1 day.
+
+For **multi-step** cards the session logic is:
+- Find the earliest-due step (by position).
+- Include **all preceding steps** plus that step in the session.
+- This forces you to rebuild the full chain from step 1 every time, not just
+  practise the due step in isolation.
+
+---
