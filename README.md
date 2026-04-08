@@ -1,6 +1,6 @@
 # myoso
 
-Step-by-step spaced-repetition flashcards for the terminal.
+Step-by-step flashcards for the terminal.
 
 Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.org/) for storage.
 
@@ -16,6 +16,8 @@ Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.or
     <img src="screenshots/multi.png" alt="multi cards" width="40%" />
 </p>
 
+---
+
 ## What is it?
 
 Standard flashcard apps are great for 1:1 facts and definitions but struggle with long chain
@@ -24,11 +26,7 @@ Standard flashcard apps are great for 1:1 facts and definitions but struggle wit
 - "how do I reverse a linked list?"
 - "walk me through this calculus derivation".
 
-Myoso lets you create cards with **ordered steps**. During review you
-reconstruct the full reasoning chain one step at a time, rating each step
-separately. Spaced repetition then schedules each step independently so that
-you must "unlock" the later steps. Likewise, forgetting an earlier step
-will "de-unlock" the following step in that chain.
+Standard flashcard tools excel at 1:1 isolated facts but often fail for chain of reasoning or procedures. Myoso models each procedure as an ordered sequence of steps. During review you reveal and rate each step individually, unlocking later steps only after earlier ones are recalled. Forgetting an earlier step automatically blocks access to the subsequent steps until you rebuild the chain again, which reinforces the full procedural flow rather than isolated bits.
 
 ---
 

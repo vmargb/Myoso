@@ -376,6 +376,25 @@ impl Store {
             )
             .context("update item")?;
 
+        // "De-unlock" subsequent steps if this step was failed or barely recalled
+        // forces a redo from the failed step and rebuilding the chain
+        if updated.kind == ItemKind::Step && confidence <= 2 {
+            self.conn
+                .execute(
+                    "UPDATE items
+                    SET due_at = ?1
+                    WHERE card_id = ?2
+                    AND position > ?3
+                    AND kind = 'step'",
+                    params![
+                        now.to_rfc3339(),
+                        &updated.card_id,
+                        updated.position,
+                    ],
+                )
+                .context("de-unlock subsequent steps")?;
+        }
+
         self.conn
             .execute(
                 "INSERT INTO review_log(id,item_id,card_id,reviewed_at,confidence,duration_ms,
