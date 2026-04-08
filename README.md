@@ -6,24 +6,17 @@ Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.or
 
 ---
 
-## What is it?
 
-<div class="image-gallery">
-  <figure class="gallery-item">
-    <img src="screenshots/menu.png" alt="Main Menu Interface" style="width: 100%; max-width: 800px; border: 1px solid #e1e4e8; border-radius: 6px;">
-    <figcaption class="gallery-caption">Main Menu</figcaption>
-  </figure>
-  
-  <figure class="gallery-item">
-    <img src="screenshots/cards.png" alt="Card Review Interface" style="width: 100%; max-width: 800px; border: 1px solid #e1e4e8; border-radius: 6px;">
-    <figcaption class="gallery-caption">Card Selection</figcaption>
-  </figure>
-  
-  <figure class="gallery-item">
-    <img src="screenshots/multi.png" alt="Multi-step Card Interface" style="width: 100%; max-width: 800px; border: 1px solid #e1e4e8; border-radius: 6px;">
-    <figcaption class="gallery-caption">Multi-step Card Interface</figcaption>
-  </figure>
-</div>
+<p align="center">
+    <img src="screenshots/multi.png" alt="multi cards" width="100%" />
+</p>
+
+<p align="center">
+    <img src="screenshots/menu.png" alt="menu" width="40%" />
+    <img src="screenshots/cards.png" alt="cards" width="40%" />
+</p>
+
+## What is it?
 
 Standard flashcard apps are great for 1:1 facts and definitions but struggle with long chain
 **procedural knowledge**, things like:
