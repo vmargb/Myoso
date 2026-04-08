@@ -9,10 +9,9 @@ name = "myoso"
 path = "src/main.rs"
 
 [dependencies]
-# SQLite — bundled so no system lib needed
 rusqlite = { version = "0.31", features = ["bundled"] }
 
-# Terminal UI
+# TUI
 ratatui    = "0.28"
 crossterm  = "0.28"
 

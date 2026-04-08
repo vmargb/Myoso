@@ -2,35 +2,46 @@
 
 Step-by-step spaced-repetition flashcards for the terminal.
 
-Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.org/) (bundled, zero system dependencies) for storage.
+Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.org/) for storage.
 
 ---
 
 ## What is it?
 
-Standard flashcard apps are great for 1:1 facts and definitions but struggle with longer chain
-**procedural knowledge**, things like "What are all the verb endings for past tense?" or "how do I reverse a linked list?" or
-"walk me through this calculus derivation".
+<div class="image-gallery">
+  <figure class="gallery-item">
+    <img src="screenshots/menu.png" alt="Main Menu Interface" style="width: 100%; max-width: 800px; border: 1px solid #e1e4e8; border-radius: 6px;">
+    <figcaption class="gallery-caption">Main Menu</figcaption>
+  </figure>
+  
+  <figure class="gallery-item">
+    <img src="screenshots/cards.png" alt="Card Review Interface" style="width: 100%; max-width: 800px; border: 1px solid #e1e4e8; border-radius: 6px;">
+    <figcaption class="gallery-caption">Card Selection</figcaption>
+  </figure>
+  
+  <figure class="gallery-item">
+    <img src="screenshots/multi.png" alt="Multi-step Card Interface" style="width: 100%; max-width: 800px; border: 1px solid #e1e4e8; border-radius: 6px;">
+    <figcaption class="gallery-caption">Multi-step Card Interface</figcaption>
+  </figure>
+</div>
 
-Myoso lets you author cards with **ordered steps**. During review you
+Standard flashcard apps are great for 1:1 facts and definitions but struggle with long chain
+**procedural knowledge**, things like:
+- "What are all the verb endings in past, present, future tense?"
+- "how do I reverse a linked list?"
+- "walk me through this calculus derivation".
+
+Myoso lets you create cards with **ordered steps**. During review you
 reconstruct the full reasoning chain one step at a time, rating each step
 separately. Spaced repetition then schedules each step independently so that
-you must "unlock" the later steps. Likewise, forgetting a particular step
-will "de-unlock" that step in the chain.
-
-### Card types
-
-| Type | Description |
-|------|-------------|
-| **simple** | Classic Q→A (optionally reversible A→Q) |
-| **multi** | One question, N ordered answer steps |
+you must "unlock" the later steps. Likewise, forgetting an earlier step
+will "de-unlock" the following step in that chain.
 
 ---
 
 ## Installation
 
 ```bash
-# Requires Rust ≥ 1.75 and a C compiler (for the bundled SQLite)
 git clone https://github.com/vmargb/Myoso.git
 cd myoso
 cargo run
