@@ -8,12 +8,12 @@ Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.or
 
 
 <p align="center">
-    <img src="screenshots/multi.png" alt="multi cards" width="100%" />
+    <img src="screenshots/menu.png" alt="menu" width="90%" />
 </p>
 
 <p align="center">
-    <img src="screenshots/menu.png" alt="menu" width="40%" />
     <img src="screenshots/cards.png" alt="cards" width="40%" />
+    <img src="screenshots/multi.png" alt="multi cards" width="40%" />
 </p>
 
 ## What is it?
