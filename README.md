@@ -12,21 +12,22 @@ Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.or
 </p>
 
 <p align="center">
-    <img src="screenshots/cards.png" alt="cards" width="40%" />
-    <img src="screenshots/multi.png" alt="multi cards" width="40%" />
+    <img src="screenshots/cards.png" alt="cards" width="50%" />
+    <img src="screenshots/multi.png" alt="multi cards" width="50%" />
 </p>
+
 
 ---
 
 ## What is it?
 
-Standard flashcard apps are great for 1:1 facts and definitions but struggle with long chain
-**procedural knowledge**, things like:
+Standard flashcard apps are great for 1:1 facts and definitions but struggle with long chains of thought or
+**procedural knowledge** like:
 - "What are all the verb endings in past, present, future tense?"
 - "how do I reverse a linked list?"
 - "walk me through this calculus derivation".
 
-Standard flashcard tools excel at 1:1 isolated facts but often fail for chain of reasoning or procedures. Myoso models each procedure as an ordered sequence of steps. During review you reveal and rate each step individually, unlocking later steps only after earlier ones are recalled. Forgetting an earlier step automatically blocks access to the subsequent steps until you rebuild the chain again, which reinforces the full procedural flow rather than isolated bits.
+Standard flashcard *can* be used in this way, but end up adding too much mental load to each card. Myoso models each procedure as an ordered sequence of steps. During review you reveal and rate each step individually, unlocking later steps only after earlier ones are recalled. Forgetting an earlier step automatically blocks access to the subsequent steps until you rebuild the chain again, which reinforces the full procedural flow rather than merely memorising isolated bits.
 
 ---
 
@@ -56,17 +57,8 @@ cargo run
 
 ## Scheduling algorithm
 
-Uses a simplified SM-2 variant.  Each **item** (step) is tracked independently:
-
-| Rating | Ease delta | Interval multiplier |
-|--------|-----------|---------------------|
-| 1 Again | −0.20 | reset to 0.5 days |
-| 2 Hard  | −0.05 | × 1.2 |
-| 3 Good  |  0.00 | × 2.0 |
-| 4 Great | +0.05 | × 2.5 |
-| 5 Easy  | +0.10 | × 3.5 |
-
-Ease is clamped to `[1.3, 3.0]`.  The first interval is always 1 day.
+Uses a simplified SM-2 variant. Each **item** (step) is tracked independently:
+Ease is clamped to `[1.3, 3.0]`. The first interval is always 1 day.
 
 For **multi-step** cards the session logic is:
 - Find the earliest-due step (by position).
@@ -74,4 +66,3 @@ For **multi-step** cards the session logic is:
 - This forces you to rebuild the full chain from step 1 every time, not just
   practise the due step in isolation.
 
----

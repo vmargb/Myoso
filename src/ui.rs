@@ -23,7 +23,7 @@ use ratatui::{
 };
 
 use crate::db::Store;
-use crate::models::{CardKind, CardSummary, ItemKind, ReviewCard, Stats};
+use crate::models::{Card, CardKind, CardSummary, Item, ItemKind, ReviewCard, Stats};
 
 // ~~~ Screens ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -134,6 +134,8 @@ enum AddPhase {
 struct AddCardState {
     phase:            AddPhase,
     kind:             AddKind,
+    // When Some, we are editing an existing card rather than creating one.
+    editing_card_id:  Option<String>,
     // shared
     deck:             String,
     question:         String,
@@ -158,6 +160,7 @@ impl AddCardState {
         Self {
             phase:            AddPhase::PickType,
             kind:             AddKind::Simple,
+            editing_card_id:  None,
             deck:             String::new(),
             question:         String::new(),
             answer:           String::new(),
@@ -250,8 +253,16 @@ impl AddCardState {
                 self.step_list_state.select(Some(self.steps.len() - 1));
             }
             self.step_buf.clear();
-        } else if self.editing_step_idx.is_some() {
-            // Cancel edit if user submits blank
+        } else if let Some(idx) = self.editing_step_idx {
+            // Cancel edit if user submits blank.
+            // If the slot itself is also blank it was a fresh insert placeholder —
+            // remove it so no empty step leaks into the list.
+            if idx < self.steps.len() && self.steps[idx].is_empty() {
+                self.steps.remove(idx);
+                let n = self.steps.len();
+                let sel = if n == 0 { None } else { Some(idx.min(n - 1)) };
+                self.step_list_state.select(sel);
+            }
             self.editing_step_idx = None;
             self.step_buf.clear();
             self.focused = 2;
@@ -268,6 +279,53 @@ impl AddCardState {
                 Err("Add at least one step (type in the step field, then press Enter)."),
             _ => Ok(()),
         }
+    }
+
+    /// Build an AddCardState pre-populated from an existing card for editing.
+    /// Jumps straight to FillForm and skips the PickType screen.
+    fn for_edit(card: &Card, items: &[Item], decks: Vec<String>) -> Self {
+        let mut s = Self::new(decks);
+        s.editing_card_id = Some(card.id.clone());
+        s.phase    = AddPhase::FillForm;
+        s.deck     = card.deck.clone();
+        s.question = card.question.clone();
+        s.reversible = card.reversible;
+        match card.kind {
+            CardKind::Simple => {
+                s.kind = AddKind::Simple;
+                if let Some(item) = items.iter().find(|i| i.kind == ItemKind::Forward) {
+                    s.answer = item.answer.clone();
+                }
+            }
+            CardKind::Multi => {
+                s.kind  = AddKind::Multi;
+                s.steps = items
+                    .iter()
+                    .filter(|i| i.kind == ItemKind::Step)
+                    .map(|i| i.answer.clone())
+                    .collect();
+                if !s.steps.is_empty() {
+                    s.step_list_state.select(Some(0));
+                }
+            }
+        }
+        s
+    }
+
+    /// Insert a blank step immediately after the currently selected step
+    /// (or at the end if nothing is selected), then jump to the step-input
+    /// field so the user can type the new step content straight away.
+    fn insert_step_after_selected(&mut self) {
+        let insert_at = self
+            .step_list_state
+            .selected()
+            .map(|i| i + 1)
+            .unwrap_or(self.steps.len());
+        self.steps.insert(insert_at, String::new());
+        self.editing_step_idx = Some(insert_at);
+        self.step_list_state.select(Some(insert_at));
+        self.step_buf.clear();
+        self.focused = 3; // jump to Step Input field
     }
 }
 
@@ -585,6 +643,9 @@ fn on_add_card(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         }
 
         // Steps List Navigation and Editing
+        KeyCode::Char('i') if is_steps_list => {
+            app.add_card.as_mut().unwrap().insert_step_after_selected();
+        }
         KeyCode::Down if is_steps_list => {
             let s = app.add_card.as_mut().unwrap();
             let n = s.steps.len();
@@ -656,9 +717,32 @@ fn on_add_card(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         KeyCode::Enter if is_save => {
             match save_new_card(app) {
                 Ok(()) => {
-                    app.flash    = Some("✓ Card saved!".into());
+                    let is_edit = app.add_card.as_ref()
+                        .map_or(false, |s| s.editing_card_id.is_some());
+                    app.flash    = Some(if is_edit {
+                        "✓ Card updated!".into()
+                    } else {
+                        "✓ Card saved!".into()
+                    });
                     app.add_card = None;
                     app.go_back();
+                    // If we returned to a card list, refresh it so the edited
+                    // card's new text/deck is visible without navigating away.
+                    if app.screen == Screen::ListCards {
+                        let deck = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
+                        let sel  = app.list_cards.as_ref()
+                            .and_then(|lc| lc.list_state.selected());
+                        if let Ok(cards) = app.store.list_cards(deck.as_deref()) {
+                            let mut new_lc = ListCardsState::new(cards, deck);
+                            // Restore selection position so the cursor doesn't jump.
+                            if let Some(i) = sel {
+                                new_lc.list_state.select(Some(
+                                    i.min(new_lc.cards.len().saturating_sub(1))
+                                ));
+                            }
+                            app.list_cards = Some(new_lc);
+                        }
+                    }
                 }
                 Err(e) => {
                     if let Some(s) = app.add_card.as_mut() {
@@ -724,6 +808,18 @@ fn on_list_cards(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 if !lc.cards.is_empty() && lc.list_state.selected().is_some() {
                     lc.confirm_delete = true;
                 }
+            }
+        }
+        KeyCode::Char('e') => {
+            let card_id = app.list_cards.as_ref()
+                .and_then(|lc| lc.list_state.selected().and_then(|i| lc.cards.get(i)))
+                .map(|c| c.card_id.clone());
+            if let Some(id) = card_id {
+                let card  = app.store.load_card(&id)?;
+                let items = app.store.load_items(&id)?;
+                let decks = app.store.list_decks().unwrap_or_default();
+                app.add_card = Some(AddCardState::for_edit(&card, &items, decks));
+                app.go_to(Screen::AddCard);
             }
         }
         _ => {}
@@ -798,18 +894,38 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("missing add-card state"))?;
     s.validate().map_err(|e| anyhow::anyhow!(e))?;
 
-    match s.kind {
-        AddKind::Simple => store.add_simple_card(
-            s.deck.trim(),
-            s.question.trim(),
-            s.answer.trim(),
-            s.reversible,
-        )?,
-        AddKind::Multi => store.add_multi_card(
-            s.deck.trim(),
-            s.question.trim(),
-            &s.steps,
-        )?,
+    if let Some(ref card_id) = s.editing_card_id.clone() {
+        // ~~ Edit path ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        match s.kind {
+            AddKind::Simple => store.update_simple_card(
+                card_id,
+                s.deck.trim(),
+                s.question.trim(),
+                s.answer.trim(),
+                s.reversible,
+            )?,
+            AddKind::Multi => store.update_multi_card(
+                card_id,
+                s.deck.trim(),
+                s.question.trim(),
+                &s.steps,
+            )?,
+        }
+    } else {
+        // ~~ Create path ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        match s.kind {
+            AddKind::Simple => store.add_simple_card(
+                s.deck.trim(),
+                s.question.trim(),
+                s.answer.trim(),
+                s.reversible,
+            )?,
+            AddKind::Multi => store.add_multi_card(
+                s.deck.trim(),
+                s.question.trim(),
+                &s.steps,
+            )?,
+        }
     }
     Ok(())
 }
@@ -1222,12 +1338,14 @@ fn render_review_done(f: &mut Frame, rs: &ReviewState, size: Rect) {
 
 fn render_add_card(f: &mut Frame, app: &mut AppState) {
     let size = f.area();
-    let phase = app.add_card.as_ref().unwrap().phase;
-    let kind = app.add_card.as_ref().unwrap().kind;
-    
+    let phase           = app.add_card.as_ref().unwrap().phase;
+    let kind            = app.add_card.as_ref().unwrap().kind;
+    let is_editing      = app.add_card.as_ref().unwrap().editing_card_id.is_some();
+
     match phase {
-        AddPhase::PickType => render_pick_type(f, app.add_card.as_ref().unwrap(), size),
-        AddPhase::FillForm => match kind {
+        // Never show PickType when editing — the kind is already fixed.
+        AddPhase::PickType if !is_editing => render_pick_type(f, app.add_card.as_ref().unwrap(), size),
+        _ => match kind {
             AddKind::Simple => render_simple_form(f, app.add_card.as_ref().unwrap(), size),
             AddKind::Multi  => render_multi_form(f, app, size),
         },
@@ -1321,7 +1439,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            "Add Simple Card",
+            if s.editing_card_id.is_some() { "Edit Simple Card" } else { "Add Simple Card" },
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Center),
@@ -1422,7 +1540,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            "Add Multi-step Card",
+            if s.editing_card_id.is_some() { "Edit Multi-step Card" } else { "Add Multi-step Card" },
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Center),
@@ -1492,7 +1610,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
     };
 
     let title = if s.focused == 2 {
-        format!(" Steps ({})  [Enter] edit  [d] delete ", s.steps.len())
+        format!(" Steps ({})  [Enter] edit  [i] insert after  [d] delete ", s.steps.len())
     } else {
         format!(" Steps ({}) ", s.steps.len())
     };
@@ -1664,7 +1782,7 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            " [j/k] navigate  |  [d] delete card  |  [Esc] back",
+            " [j/k] navigate  |  [e] edit card  |  [d] delete card  |  [Esc] back",
             Style::default().fg(Color::DarkGray),
         ))
         .alignment(Alignment::Center),

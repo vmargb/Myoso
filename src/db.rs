@@ -257,7 +257,7 @@ impl Store {
         Ok(session)
     }
 
-    fn load_items(&self, card_id: &str) -> Result<Vec<Item>> {
+    pub fn load_items(&self, card_id: &str) -> Result<Vec<Item>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -376,16 +376,19 @@ impl Store {
             )
             .context("update item")?;
 
-        // "De-unlock" subsequent steps if this step was failed or barely recalled
-        // forces a redo from the failed step and rebuilding the chain
+        // De-unlock subsequent steps when an earlier step is failed or barely
+        // recalled (confidence ≤ 2).  Setting their due_at to now means
+        // due_items_for_card will find them on the next session and, because it
+        // always includes every step up to and including the earliest due one,
+        // the learner is forced to rebuild the chain from the weak link forward.
         if updated.kind == ItemKind::Step && confidence <= 2 {
             self.conn
                 .execute(
                     "UPDATE items
-                    SET due_at = ?1
-                    WHERE card_id = ?2
-                    AND position > ?3
-                    AND kind = 'step'",
+                     SET due_at = ?1
+                     WHERE card_id = ?2
+                       AND position > ?3
+                       AND kind = 'step'",
                     params![
                         now.to_rfc3339(),
                         &updated.card_id,
@@ -502,6 +505,134 @@ impl Store {
             cards: export_cards,
         })
         .context("serialize export")
+    }
+
+    // ~~ Editing ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    /// Update an existing simple card's content in-place.
+    /// The forward item's SRS state is preserved; the reverse item is
+    /// added/removed/updated to match the new `reversible` flag.
+    pub fn update_simple_card(
+        &self,
+        card_id: &str,
+        deck: &str,
+        question: &str,
+        answer: &str,
+        reversible: bool,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let ts  = now.to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE cards
+                 SET deck=?1, question=?2, reversible=?3, updated_at=?4
+                 WHERE id=?5",
+                params![deck, question, reversible as i32, ts, card_id],
+            )
+            .context("update simple card")?;
+
+        self.conn
+            .execute(
+                "UPDATE items SET prompt=?1, answer=?2
+                 WHERE card_id=?3 AND kind='forward'",
+                params![question, answer, card_id],
+            )
+            .context("update forward item")?;
+
+        let reverse_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM items WHERE card_id=?1 AND kind='reverse'",
+                params![card_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .context("check reverse item")?
+            > 0;
+
+        match (reversible, reverse_exists) {
+            (true, true) => {
+                self.conn
+                    .execute(
+                        "UPDATE items SET prompt=?1, answer=?2
+                         WHERE card_id=?3 AND kind='reverse'",
+                        params![answer, question, card_id],
+                    )
+                    .context("update reverse item")?;
+            }
+            (true, false) => {
+                self.insert_item(card_id, 2, "reverse", answer, question, now)?;
+            }
+            (false, true) => {
+                self.conn
+                    .execute(
+                        "DELETE FROM items WHERE card_id=?1 AND kind='reverse'",
+                        params![card_id],
+                    )
+                    .context("delete reverse item")?;
+            }
+            (false, false) => {}
+        }
+        Ok(())
+    }
+
+    /// Update an existing multi-step card's content in-place.
+    ///
+    /// SRS state is preserved for steps whose **position** is unchanged.
+    /// New steps are inserted fresh; steps that no longer exist are deleted.
+    pub fn update_multi_card(
+        &self,
+        card_id: &str,
+        deck: &str,
+        question: &str,
+        steps: &[String],
+    ) -> Result<()> {
+        let now = Utc::now();
+        let ts  = now.to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE cards SET deck=?1, question=?2, updated_at=?3 WHERE id=?4",
+                params![deck, question, ts, card_id],
+            )
+            .context("update multi card")?;
+
+        let existing_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM items WHERE card_id=?1 AND kind='step'",
+                params![card_id],
+                |r| r.get(0),
+            )
+            .context("count step items")?;
+
+        let valid: Vec<&String> = steps.iter().filter(|s| !s.trim().is_empty()).collect();
+
+        for (i, step) in valid.iter().enumerate() {
+            let pos   = (i + 1) as i32;
+            let label = format!("Step {}", i + 1);
+            if (i as i64) < existing_count {
+                // Update prompt/answer but keep all SRS fields intact.
+                self.conn
+                    .execute(
+                        "UPDATE items SET prompt=?1, answer=?2
+                         WHERE card_id=?3 AND position=?4 AND kind='step'",
+                        params![label, step, card_id, pos],
+                    )
+                    .context("update step item")?;
+            } else {
+                self.insert_item(card_id, pos, "step", &label, step, now)?;
+            }
+        }
+
+        // Remove steps that were deleted.
+        let new_count = valid.len() as i32;
+        self.conn
+            .execute(
+                "DELETE FROM items WHERE card_id=?1 AND kind='step' AND position > ?2",
+                params![card_id, new_count],
+            )
+            .context("delete extra step items")?;
+
+        Ok(())
     }
 }
 

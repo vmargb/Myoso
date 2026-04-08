@@ -49,6 +49,7 @@ pub enum ItemKind {
 }
 
 impl ItemKind {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             ItemKind::Forward => "forward",
@@ -115,6 +116,7 @@ pub struct CardSummary {
     pub kind: CardKind,
     pub deck: String,
     pub question: String,
+    #[allow(dead_code)]
     pub reversible: bool,
     pub item_count: i32,
     pub due_at: DateTime<Utc>,
