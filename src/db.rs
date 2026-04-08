@@ -390,7 +390,8 @@ impl Store {
                        AND position > ?3
                        AND kind = 'step'",
                     params![
-                        now.to_rfc3339(),
+                        now.to_rfc3339(), // subsequent due now
+                        //updated.due_at.to_rfc3339(), // syncs with the failed step
                         &updated.card_id,
                         updated.position,
                     ],

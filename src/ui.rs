@@ -85,10 +85,36 @@ impl ReviewState {
         if self.is_done() {
             return Ok(());
         }
-        let item_id = self.session[self.card_idx].items[self.item_idx].id.clone();
+
+        // Grab the current item to check its kind
+        let item = &self.session[self.card_idx].items[self.item_idx];
+        let item_id = item.id.clone();
+        let is_step = item.kind == ItemKind::Step;
         store.record_review(&item_id, confidence, self.item_started_at.elapsed())?;
         self.done_items += 1;
-        self.advance();
+
+        // intercept failures on multi-step cards
+        if is_step && confidence <= 2 { // fail
+            // calculate how many subsequent steps we are skipping
+            let skipped_items = self.session[self.card_idx].items.len() - self.item_idx - 1;
+            // deduct them from the total so the progress bar hits 100% correctly
+            self.total_items -= skipped_items; 
+            
+            // manually jump to the next card
+            self.card_idx += 1;
+            self.item_idx = 0;
+            self.phase = ReviewPhase::Thinking;
+            self.item_started_at = Instant::now();
+            
+            // check if skipping those items ended the whole session
+            if self.is_done() && self.finished_duration.is_none() {
+                self.finished_duration = Some(self.started_at.elapsed());
+            }
+        } else {
+            // normal progression for passes or simple cards
+            self.advance();
+        }
+        
         Ok(())
     }
 

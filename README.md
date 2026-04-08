@@ -1,5 +1,3 @@
-# myoso
-
 Step-by-step flashcards for the terminal.
 
 Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.org/) for storage.
