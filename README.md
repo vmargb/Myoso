@@ -12,8 +12,8 @@ Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.or
 </p>
 
 <p align="center">
-    <img src="screenshots/cards.png" alt="cards" width="50%" />
-    <img src="screenshots/multi.png" alt="multi cards" width="50%" />
+    <img src="screenshots/cards.png" alt="cards" width="90%" />
+    <img src="screenshots/multi.png" alt="multi cards" width="90%" />
 </p>
 
 
