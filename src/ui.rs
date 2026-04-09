@@ -1180,9 +1180,18 @@ fn render_review(f: &mut Frame, app: &AppState) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(v[1]);
 
-    let prompt_label = match item.kind {
-        ItemKind::Reverse => format!(" {} | {} | A->Q ", rc.card.deck, rc.card.kind),
-        _                 => format!(" {} | {} ", rc.card.deck, rc.card.kind),
+    let prompt_label = if rc.card.kind == CardKind::Multi {
+        format!(
+            " {} | multi | step {} of {} ",
+            rc.card.deck,
+            rs.item_idx + 1,
+            rc.items.len(),
+        )
+    } else {
+        match item.kind {
+            ItemKind::Reverse => format!(" {} | {} | A->Q ", rc.card.deck, rc.card.kind),
+            _                 => format!(" {} | {} ", rc.card.deck, rc.card.kind),
+        }
     };
     
     // FIX: Show the overarching question for Multi cards instead of "Step X"
@@ -1207,6 +1216,37 @@ fn render_review(f: &mut Frame, app: &AppState) {
     let mut lines: Vec<Line> = Vec::new();
 
     if rc.card.kind == CardKind::Multi {
+        let total_in_session = rc.items.len();
+        let is_target = rs.item_idx == total_in_session - 1;
+
+        // ~~ Chain breadcrumb ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        let mut crumb_spans: Vec<Span> = vec![Span::raw("  ")];
+        for i in 0..total_in_session {
+            if i < rs.item_idx {
+                crumb_spans.push(Span::styled("✓ ", Style::default().fg(Color::DarkGray)));
+            } else if i == rs.item_idx {
+                let col = if is_target { Color::Cyan } else { Color::Yellow };
+                crumb_spans.push(Span::styled("▶ ", Style::default().fg(col).add_modifier(Modifier::BOLD)));
+            } else {
+                crumb_spans.push(Span::styled("○ ", Style::default().fg(Color::DarkGray)));
+            }
+        }
+        if !is_target {
+            crumb_spans.push(Span::styled(
+                format!(" target is step {total_in_session}"),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ));
+        }
+        lines.push(Line::from(crumb_spans));
+        lines.push(Line::from(""));
+
+        // ~~ Preceding steps, rebuild context ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        // if rs.item_idx > 0 {
+        //     lines.push(Line::from(Span::styled(
+        //         "  ─ chain context (steps you've already recalled) ─",
+        //         Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        //     )));
+        // }
         for (i, prev) in rc.items[..rs.item_idx].iter().enumerate() {
             lines.push(Line::from(Span::styled(
                 format!("  Step {} ✓", i + 1),
@@ -1220,10 +1260,27 @@ fn render_review(f: &mut Frame, app: &AppState) {
             }
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(Span::styled(
-            format!("  Step {}: what comes next?", rs.item_idx + 1),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )));
+
+        // ~~ Current step label ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if is_target {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  Step {}  ", rs.item_idx + 1),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "← current target  (pass to unlock the next step)",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  Step {}  ", rs.item_idx + 1),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
     } else {
         let hint = match item.kind {
             ItemKind::Forward => "  Answer",
@@ -1276,6 +1333,21 @@ fn render_review(f: &mut Frame, app: &AppState) {
             Span::raw("Reveal    "),
             Span::styled(" [q] ", Style::default().fg(Color::DarkGray)),
             Span::raw("Quit session"),
+        ])
+    } else if item.kind == ItemKind::Step {
+        // Rate footer for steps: make the chain-reset consequence explicit
+        Line::from(vec![
+            Span::styled(" [1] ", Style::default().fg(Color::Red)),
+            Span::raw("Again  "),
+            Span::styled(" [2] ", Style::default().fg(Color::Yellow)),
+            Span::raw("Hard  "),
+            Span::styled("← fail   ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+            Span::styled(" [3] ", Style::default().fg(Color::Green)),
+            Span::raw("Good  "),
+            Span::styled(" [4] ", Style::default().fg(Color::Cyan)),
+            Span::raw("Great  "),
+            Span::styled(" [5] ", Style::default().fg(Color::Blue)),
+            Span::raw("Easy"),
         ])
     } else {
         Line::from(vec![
