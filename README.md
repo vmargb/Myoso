@@ -6,30 +6,30 @@ Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.or
 
 
 <p align="center">
-    <img src="screenshots/menu.png" alt="menu" width="90%" />
+    <img src="screenshots/menu.png" alt="menu" width="45%" />
+    <img src="screenshots/cards.png" alt="cards" width="45%" />
 </p>
-
 <p align="center">
-    <img src="screenshots/cards.png" alt="cards" width="90%" />
     <img src="screenshots/multi.png" alt="multi cards" width="90%" />
 </p>
-
 
 ---
 
 ## What is it?
 
 Standard flashcard apps are great for 1:1 facts and definitions but struggle with long chains of thought or
-**procedural knowledge** like:
-- "What are all the verb endings in past, present, future tense?"
+**procedural knowledge**:
+- "What are all the verb endings in past tense?"
 - "how do I reverse a linked list?"
-- "walk me through this calculus derivation".
+- "walk me through this derivation".
 
 Standard flashcard *can* be used in this way, but end up adding too much mental load to each card. Myoso models each procedure as an ordered sequence of steps. During review you reveal and rate each step individually, unlocking later steps only after earlier ones are recalled. Forgetting an earlier step automatically blocks access to the subsequent steps until you rebuild the chain again, which reinforces the full procedural flow rather than merely memorising isolated bits.
 
 ---
 
 ## Installation
+
+If compiling from source, install Rust with your package-manager or from [rustup.rs](https://rustup.rs)
 
 ```bash
 git clone https://github.com/vmargb/Myoso.git

@@ -20,6 +20,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
+    widgets::Clear,
 };
 
 use crate::db::Store;
@@ -832,12 +833,14 @@ fn on_add_card(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         KeyCode::Backspace => {
             let s = app.add_card.as_mut().unwrap();
             if s.focused == 0 { s.deck_list_idx = None; }
+            s.error = None; // remove error msg on change
             s.pop_char();
         }
 
         KeyCode::Char(c) if !is_rev && !is_save => {
             let s = app.add_card.as_mut().unwrap();
             if s.focused == 0 { s.deck_list_idx = None; }
+            s.error = None;
             s.push_char(c);
         }
 
@@ -1116,7 +1119,7 @@ fn render_menu(f: &mut Frame, app: &mut AppState) {
                     .fg(Color::Black)
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol(">> "),
+            .highlight_symbol(" ▶ "),
         centre(v[2]),
         &mut app.menu_state,
     );
@@ -1846,6 +1849,8 @@ fn render_form_hint(f: &mut Frame, error: Option<&str>, area: Rect) {
 
 fn render_confirm_dialog(f: &mut Frame, msg: &str, size: Rect) {
     let area = centered_rect(54, 7, size);
+    // wipe the area clean before drawing the block on top
+    f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(vec![
             Line::from(""),
@@ -1886,7 +1891,7 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
 
     let items: Vec<ListItem> = if lc.cards.is_empty() {
         vec![ListItem::new(Span::styled(
-            "  No cards yet — use Add Card to create one.",
+            "  No cards yet,  use Add Card to create one.",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
