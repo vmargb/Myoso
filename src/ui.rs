@@ -168,8 +168,9 @@ struct AddCardState {
     // simple-only
     answer:           String,
     reversible:       bool,
-    // multi-only
-    steps:            Vec<String>,
+    // multi-only, each step is (optional_name, answer)
+    steps:            Vec<(String, String)>,
+    step_name_buf:    String,
     step_buf:         String,
     step_list_state:  ListState,
     editing_step_idx: Option<usize>,
@@ -192,6 +193,7 @@ impl AddCardState {
             answer:           String::new(),
             reversible:       false,
             steps:            Vec::new(),
+            step_name_buf:    String::new(),
             step_buf:         String::new(),
             step_list_state:  ListState::default(),
             editing_step_idx: None,
@@ -218,12 +220,12 @@ impl AddCardState {
     }
 
     /// Field layout
-    ///   Simple: deck(0)  question(1)  answer(2)      reversible(3)  [Save](4)
-    ///   Multi:  deck(0)  question(1)  steps_list(2)  step_input(3)  [Save](4)
+    ///   Simple: deck(0)  question(1)  answer(2)         reversible(3)  [Save](4)
+    ///   Multi:  deck(0)  question(1)  step_name(2)  step_answer(3)  steps_list(4)  [Save](5)
     fn field_count(&self) -> usize {
         match self.kind {
             AddKind::Simple => 5,
-            AddKind::Multi  => 5,
+            AddKind::Multi  => 6,
         }
     }
 
@@ -238,7 +240,9 @@ impl AddCardState {
 
     fn is_save(&self)       -> bool { self.focused == self.field_count() - 1 }
     fn is_reversible(&self) -> bool { self.kind == AddKind::Simple && self.focused == 3 }
+    fn is_step_name(&self)  -> bool { self.kind == AddKind::Multi  && self.focused == 2 }
     fn is_step_input(&self) -> bool { self.kind == AddKind::Multi  && self.focused == 3 }
+    fn is_steps_list(&self) -> bool { self.kind == AddKind::Multi  && self.focused == 4 }
 
     fn active_buf_mut(&mut self) -> Option<&mut String> {
         match self.kind {
@@ -251,8 +255,9 @@ impl AddCardState {
             AddKind::Multi => match self.focused {
                 0 => Some(&mut self.deck),
                 1 => Some(&mut self.question),
+                2 => Some(&mut self.step_name_buf),
                 3 => Some(&mut self.step_buf),
-                _ => None, // 2 is steps list, 4 is save
+                _ => None, // 4 is steps list, 5 is save
             },
         }
     }
@@ -266,32 +271,33 @@ impl AddCardState {
     }
 
     fn commit_step(&mut self) {
-        let step = self.step_buf.trim().to_string();
-        if !step.is_empty() {
+        let answer = self.step_buf.trim().to_string();
+        let name   = self.step_name_buf.trim().to_string();
+        if !answer.is_empty() {
             if let Some(idx) = self.editing_step_idx {
                 if idx < self.steps.len() {
-                    self.steps[idx] = step;
+                    self.steps[idx] = (name, answer);
                 }
                 self.editing_step_idx = None;
-                self.focused = 2; // Jump back to the list after editing
+                self.focused = 4; // Jump back to the list after editing
             } else {
-                self.steps.push(step);
+                self.steps.push((name, answer));
                 self.step_list_state.select(Some(self.steps.len() - 1));
             }
+            self.step_name_buf.clear();
             self.step_buf.clear();
         } else if let Some(idx) = self.editing_step_idx {
-            // Cancel edit if user submits blank.
-            // If the slot itself is also blank it was a fresh insert placeholder —
-            // remove it so no empty step leaks into the list.
-            if idx < self.steps.len() && self.steps[idx].is_empty() {
+            // Cancel edit if user submits blank answer.
+            if idx < self.steps.len() && self.steps[idx].1.is_empty() {
                 self.steps.remove(idx);
                 let n = self.steps.len();
                 let sel = if n == 0 { None } else { Some(idx.min(n - 1)) };
                 self.step_list_state.select(sel);
             }
             self.editing_step_idx = None;
+            self.step_name_buf.clear();
             self.step_buf.clear();
-            self.focused = 2;
+            self.focused = 4;
         }
     }
 
@@ -303,6 +309,8 @@ impl AddCardState {
                 Err("Answer cannot be empty."),
             AddKind::Multi if self.steps.is_empty() =>
                 Err("Add at least one step (type in the step field, then press Enter)."),
+            AddKind::Multi if self.steps.iter().all(|(_, a)| a.trim().is_empty()) =>
+                Err("Add at least one step with content."),
             _ => Ok(()),
         }
     }
@@ -328,7 +336,14 @@ impl AddCardState {
                 s.steps = items
                     .iter()
                     .filter(|i| i.kind == ItemKind::Step)
-                    .map(|i| i.answer.clone())
+                    .enumerate()
+                    .map(|(idx, i)| {
+                        // Treat auto-generated "Step N" labels as unnamed so the
+                        // name field starts blank and the user isn't forced to clear it.
+                        let auto = format!("Step {}", idx + 1);
+                        let name = if i.prompt == auto { String::new() } else { i.prompt.clone() };
+                        (name, i.answer.clone())
+                    })
                     .collect();
                 if !s.steps.is_empty() {
                     s.step_list_state.select(Some(0));
@@ -347,11 +362,12 @@ impl AddCardState {
             .selected()
             .map(|i| i + 1)
             .unwrap_or(self.steps.len());
-        self.steps.insert(insert_at, String::new());
+        self.steps.insert(insert_at, (String::new(), String::new()));
         self.editing_step_idx = Some(insert_at);
         self.step_list_state.select(Some(insert_at));
+        self.step_name_buf.clear();
         self.step_buf.clear();
-        self.focused = 3; // jump to Step Input field
+        self.focused = 2; // jump to Step Name field first
     }
 }
 
@@ -622,20 +638,22 @@ fn on_add_card(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
     let phase         = app.add_card.as_ref().unwrap().phase;
     let is_save       = app.add_card.as_ref().unwrap().is_save();
     let is_rev        = app.add_card.as_ref().unwrap().is_reversible();
+    let is_step_name  = app.add_card.as_ref().unwrap().is_step_name();
     let is_step       = app.add_card.as_ref().unwrap().is_step_input();
+    let is_steps_list = app.add_card.as_ref().unwrap().is_steps_list();
     let is_deck_field = app.add_card.as_ref().unwrap().focused == 0;
-    let is_steps_list = app.add_card.as_ref().unwrap().focused == 2 && app.add_card.as_ref().unwrap().kind == AddKind::Multi;
     let has_deck_sel  = app.add_card.as_ref().unwrap().deck_list_idx.is_some();
     let sugg_count    = app.add_card.as_ref().unwrap().filtered_decks().len();
+    let is_editing    = app.add_card.as_ref().unwrap().editing_card_id.is_some();
 
     // ~~ Pick-type phase ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if phase == AddPhase::PickType {
         match code {
             KeyCode::Esc => app.go_back(),
-            KeyCode::Left  | KeyCode::Char('h') | KeyCode::Char('1') => {
+            KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('1') => {
                 app.add_card.as_mut().unwrap().kind = AddKind::Simple;
             }
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('2') => {
+            KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('2') => {
                 app.add_card.as_mut().unwrap().kind = AddKind::Multi;
             }
             KeyCode::Enter => {
@@ -648,7 +666,17 @@ fn on_add_card(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
 
     // ~~ Fill-form phase ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     match code {
-        KeyCode::Esc => app.go_back(),
+        // Esc: go back to PickType when creating, go_back when editing
+        KeyCode::Esc => {
+            if is_editing {
+                app.go_back();
+            } else {
+                let s = app.add_card.as_mut().unwrap();
+                s.phase   = AddPhase::PickType;
+                s.focused = 0;
+                s.error   = None;
+            }
+        }
 
         // Deck suggestion navigation
         KeyCode::Down if is_deck_field => {
@@ -692,9 +720,10 @@ fn on_add_card(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
             let s = app.add_card.as_mut().unwrap();
             if let Some(i) = s.step_list_state.selected() {
                 if i < s.steps.len() {
-                    s.step_buf = s.steps[i].clone();
+                    s.step_name_buf   = s.steps[i].0.clone();
+                    s.step_buf        = s.steps[i].1.clone();
                     s.editing_step_idx = Some(i);
-                    s.focused = 3; // jump to Step Input
+                    s.focused = 2; // jump to Step Name field
                 }
             }
         }
@@ -745,29 +774,37 @@ fn on_add_card(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 Ok(()) => {
                     let is_edit = app.add_card.as_ref()
                         .map_or(false, |s| s.editing_card_id.is_some());
-                    app.flash    = Some(if is_edit {
+                    app.flash = Some(if is_edit {
                         "✓ Card updated!".into()
                     } else {
                         "✓ Card saved!".into()
                     });
-                    app.add_card = None;
-                    app.go_back();
-                    // If we returned to a card list, refresh it so the edited
-                    // card's new text/deck is visible without navigating away.
-                    if app.screen == Screen::ListCards {
-                        let deck = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
-                        let sel  = app.list_cards.as_ref()
-                            .and_then(|lc| lc.list_state.selected());
-                        if let Ok(cards) = app.store.list_cards(deck.as_deref()) {
-                            let mut new_lc = ListCardsState::new(cards, deck);
-                            // Restore selection position so the cursor doesn't jump.
-                            if let Some(i) = sel {
-                                new_lc.list_state.select(Some(
-                                    i.min(new_lc.cards.len().saturating_sub(1))
-                                ));
+                    if is_edit {
+                        // Editing: return to the list and refresh it.
+                        app.add_card = None;
+                        app.go_back();
+                        if app.screen == Screen::ListCards {
+                            let deck = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
+                            let sel  = app.list_cards.as_ref()
+                                .and_then(|lc| lc.list_state.selected());
+                            if let Ok(cards) = app.store.list_cards(deck.as_deref()) {
+                                let mut new_lc = ListCardsState::new(cards, deck);
+                                if let Some(i) = sel {
+                                    new_lc.list_state.select(Some(
+                                        i.min(new_lc.cards.len().saturating_sub(1))
+                                    ));
+                                }
+                                app.list_cards = Some(new_lc);
                             }
-                            app.list_cards = Some(new_lc);
                         }
+                    } else {
+                        // New card: reset form to PickType so user can add another.
+                        let saved_kind = app.add_card.as_ref().unwrap().kind;
+                        let decks = app.store.list_decks().unwrap_or_default();
+                        let mut fresh = AddCardState::new(decks);
+                        fresh.kind = saved_kind;
+                        app.add_card = Some(fresh);
+                        // stay on AddCard screen
                     }
                 }
                 Err(e) => {
@@ -776,6 +813,12 @@ fn on_add_card(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        // Tab from step_name advances to step_answer (handled by next_field above,
+        // but Enter on step_name also advances for convenience)
+        KeyCode::Enter if is_step_name => {
+            app.add_card.as_mut().unwrap().next_field();
         }
 
         KeyCode::Enter if is_step => {
@@ -1248,8 +1291,15 @@ fn render_review(f: &mut Frame, app: &AppState) {
         //     )));
         // }
         for (i, prev) in rc.items[..rs.item_idx].iter().enumerate() {
+            let step_label = format!("  {} ✓", prev.prompt);
+            // If the prompt is just the auto "Step N" we already have the number, otherwise show it
+            let display_label = if prev.prompt == format!("Step {}", i + 1) {
+                step_label
+            } else {
+                format!("  {}. {} ✓", i + 1, prev.prompt)
+            };
             lines.push(Line::from(Span::styled(
-                format!("  Step {} ✓", i + 1),
+                display_label,
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
             )));
             for l in prev.answer.lines() {
@@ -1262,10 +1312,15 @@ fn render_review(f: &mut Frame, app: &AppState) {
         }
 
         // ~~ Current step label ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        let cur_step_label = if item.prompt == format!("Step {}", rs.item_idx + 1) {
+            format!("  Step {}  ", rs.item_idx + 1)
+        } else {
+            format!("  {}. {}  ", rs.item_idx + 1, item.prompt)
+        };
         if is_target {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  Step {}  ", rs.item_idx + 1),
+                    cur_step_label,
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -1276,7 +1331,7 @@ fn render_review(f: &mut Frame, app: &AppState) {
         } else {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  Step {}  ", rs.item_idx + 1),
+                    cur_step_label,
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -1619,20 +1674,21 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
         (filtered.len() as u16 + 2).min(6)
     } else { 0 };
 
-    let steps_h = 6; // Fixed height to handle scrolling consistently 
-    let total_h = 1 + 3 + sugg_h + 4 + steps_h + 3 + 3 + 1;
+    let steps_h = 6;
+    let total_h = 1 + 3 + sugg_h + 4 + 3 + 3 + steps_h + 3 + 3 + 1;
     let area = centered_rect(72, total_h, size);
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(sugg_h),
-            Constraint::Length(4),
-            Constraint::Length(steps_h),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(1),
+            Constraint::Length(1),       // heading
+            Constraint::Length(3),       // deck input
+            Constraint::Length(sugg_h),  // deck suggestions
+            Constraint::Length(4),       // question
+            Constraint::Length(3),       // step name input  (focused == 2)
+            Constraint::Length(3),       // step answer input (focused == 3)
+            Constraint::Length(steps_h), // steps list       (focused == 4)
+            Constraint::Length(3),       // save button      (focused == 5)
+            Constraint::Min(1),          // error / help
         ])
         .split(area);
 
@@ -1683,7 +1739,29 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
         v[3],
     );
 
-    // Build the list elements first (drops borrow on s.steps)
+    // Step name (optional) focused == 2
+    f.render_widget(
+        Paragraph::new(with_cursor(&s.step_name_buf, s.focused == 2))
+            .block(field_block(" Step Name  (optional, leave blank for 'Step N') ", s.focused == 2))
+            .style(text_style(s.focused == 2)),
+        v[4],
+    );
+
+    // Step answer focused == 3
+    let answer_title = if s.editing_step_idx.is_some() {
+        " Step Answer  [Enter to save] "
+    } else {
+        " Step Answer  [Enter to add] "
+    };
+    f.render_widget(
+        Paragraph::new(with_cursor(&s.step_buf, s.focused == 3))
+            .block(field_block(answer_title, s.focused == 3))
+            .wrap(Wrap { trim: false })
+            .style(text_style(s.focused == 3)),
+        v[5],
+    );
+
+    // Steps list focused == 4
     let step_items: Vec<ListItem> = if s.steps.is_empty() {
         vec![ListItem::new(Span::styled(
             "  (no steps yet)",
@@ -1693,53 +1771,44 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
         s.steps
             .iter()
             .enumerate()
-            .map(|(i, step)| {
+            .map(|(i, (name, answer))| {
                 let prefix = if Some(i) == s.editing_step_idx { " ✎ " } else { "  " };
+                let label = if name.trim().is_empty() {
+                    format!("{prefix}{}. {}", i + 1, answer)
+                } else {
+                    format!("{prefix}{}. [{}]  {}", i + 1, name, answer)
+                };
                 ListItem::new(Line::from(Span::styled(
-                    format!("{prefix}{}. {}", i + 1, step),
-                    if Some(i) == s.editing_step_idx { 
-                        Style::default().fg(Color::Yellow) 
-                    } else { 
-                        Style::default().fg(Color::Green) 
+                    label,
+                    if Some(i) == s.editing_step_idx {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Green)
                     },
                 )))
             })
             .collect()
     };
 
-    let title = if s.focused == 2 {
+    let list_title = if s.focused == 4 {
         format!(" Steps ({})  [Enter] edit  [i] insert after  [d] delete ", s.steps.len())
     } else {
         format!(" Steps ({}) ", s.steps.len())
     };
 
     let mut list = List::new(step_items)
-        .block(field_block(&title, s.focused == 2));
-        
-    if s.focused == 2 {
+        .block(field_block(&list_title, s.focused == 4));
+
+    if s.focused == 4 {
         list = list
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
             .highlight_symbol(">> ");
     }
 
-    f.render_stateful_widget(list, v[4], &mut s.step_list_state);
+    f.render_stateful_widget(list, v[6], &mut s.step_list_state);
 
-    let input_title = if s.editing_step_idx.is_some() {
-        " Edit Step  [Enter to save] "
-    } else {
-        " New Step  [Enter to add] "
-    };
-
-    f.render_widget(
-        Paragraph::new(with_cursor(&s.step_buf, s.focused == 3))
-            .block(field_block(input_title, s.focused == 3))
-            .wrap(Wrap { trim: false })
-            .style(text_style(s.focused == 3)),
-        v[5],
-    );
-
-    render_save_btn(f, s.focused == 4, v[6]);
-    render_form_hint(f, s.error.as_deref(), v[7]);
+    render_save_btn(f, s.focused == 5, v[7]);
+    render_form_hint(f, s.error.as_deref(), v[8]);
 }
 
 fn render_save_btn(f: &mut Frame, focused: bool, area: Rect) {

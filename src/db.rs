@@ -123,7 +123,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn add_multi_card(&self, deck: &str, question: &str, steps: &[String]) -> Result<()> {
+    pub fn add_multi_card(&self, deck: &str, question: &str, steps: &[(String, String)]) -> Result<()> {
         if steps.is_empty() {
             anyhow::bail!("multi-step cards need at least one step");
         }
@@ -138,13 +138,15 @@ impl Store {
             )
             .context("insert multi card")?;
 
-        for (i, step) in steps
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| !s.trim().is_empty())
-        {
-            let label = format!("Step {}", i + 1);
-            self.insert_item(&card_id, (i + 1) as i32, "step", &label, step, now)?;
+        let mut pos = 0usize;
+        for (name, answer) in steps.iter().filter(|(_, a)| !a.trim().is_empty()) {
+            pos += 1;
+            let label = if name.trim().is_empty() {
+                format!("Step {pos}")
+            } else {
+                name.trim().to_string()
+            };
+            self.insert_item(&card_id, pos as i32, "step", &label, answer, now)?;
         }
         Ok(())
     }
@@ -585,7 +587,7 @@ impl Store {
         card_id: &str,
         deck: &str,
         question: &str,
-        steps: &[String],
+        steps: &[(String, String)],
     ) -> Result<()> {
         let now = Utc::now();
         let ts  = now.to_rfc3339();
@@ -605,22 +607,28 @@ impl Store {
             )
             .context("count step items")?;
 
-        let valid: Vec<&String> = steps.iter().filter(|s| !s.trim().is_empty()).collect();
+        let valid: Vec<&(String, String)> = steps
+            .iter()
+            .filter(|(_, a)| !a.trim().is_empty())
+            .collect();
 
-        for (i, step) in valid.iter().enumerate() {
-            let pos   = (i + 1) as i32;
-            let label = format!("Step {}", i + 1);
+        for (i, (name, answer)) in valid.iter().enumerate() {
+            let pos = (i + 1) as i32;
+            let label = if name.trim().is_empty() {
+                format!("Step {}", i + 1)
+            } else {
+                name.trim().to_string()
+            };
             if (i as i64) < existing_count {
-                // Update prompt/answer but keep all SRS fields intact.
                 self.conn
                     .execute(
                         "UPDATE items SET prompt=?1, answer=?2
                          WHERE card_id=?3 AND position=?4 AND kind='step'",
-                        params![label, step, card_id, pos],
+                        params![label, answer, card_id, pos],
                     )
                     .context("update step item")?;
             } else {
-                self.insert_item(card_id, pos, "step", &label, step, now)?;
+                self.insert_item(card_id, pos, "step", &label, answer, now)?;
             }
         }
 
