@@ -130,3 +130,10 @@ pub struct Stats {
     pub due_items: i64,
     pub review_logs: i64,
 }
+
+#[derive(Debug, Default)]
+pub struct ImportSummary {
+    pub cards_imported: usize,
+    pub items_imported: usize,
+    pub cards_replaced: usize,  // cards whose ID already existed
+}

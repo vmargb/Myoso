@@ -1,6 +1,6 @@
 [package]
 name = "myoso"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Multi-step spaced-repetition flashcards in the terminal"
 
@@ -10,23 +10,18 @@ path = "src/main.rs"
 
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
-
 # TUI
 ratatui    = "0.28"
 crossterm  = "0.28"
-
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
-
 # Serialisation (JSON export)
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-
 # Timestamps
 chrono = { version = "0.4", features = ["serde"] }
-
 # UUID v4 for record IDs (replaces the racy UnixNano approach in the Go version)
 uuid = { version = "1", features = ["v4"] }
-
 # Ergonomic error handling
 anyhow = "1"
+rfd = "0.14"

@@ -26,6 +26,7 @@ use ratatui::{
 
 use crate::db::Store;
 use crate::models::{Card, CardKind, CardSummary, Item, ItemKind, ReviewCard, Stats};
+use rfd::FileDialog;
 
 // ~~~ Screens ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -38,6 +39,7 @@ enum Screen {
     ListDecks,
     ListCards,
     Export,
+    Import,
 }
 
 // ~~~ Review state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -471,15 +473,18 @@ impl ListDecksState {
 enum ExportFocus {
     DeckList,
     ResetToggle,
+    PathField,
     ConfirmBtn,
 }
 
 struct ExportState {
-    decks:          Vec<String>,   // All decks is implicit index 0
+    decks:          Vec<String>,
     list_state:     ListState,
     reset_metadata: bool,
     focus:          ExportFocus,
-    status:         Option<String>, // success / error message after export
+    path:           String,
+    path_edited:    bool,
+    status:         Option<String>,
 }
 
 impl ExportState {
@@ -488,37 +493,80 @@ impl ExportState {
         ls.select(Some(0));
         Self {
             decks,
-            list_state: ls,
+            list_state:     ls,
             reset_metadata: false,
-            focus: ExportFocus::DeckList,
-            status: None,
+            focus:          ExportFocus::DeckList,
+            path:           "export.json".to_string(),
+            path_edited:    false,
+            status:         None,
         }
     }
 
-    /// None means "All decks", Some(name) means a specific deck.
     fn selected_deck(&self) -> Option<&str> {
         self.list_state
             .selected()
             .and_then(|i| if i == 0 { None } else { self.decks.get(i - 1).map(|s| s.as_str()) })
     }
 
-    fn list_len(&self) -> usize { self.decks.len() + 1 } // +1 for "All decks"
+    fn list_len(&self) -> usize { self.decks.len() + 1 }
 
     fn list_next(&mut self) {
         let n = self.list_len();
         let i = self.list_state.selected().map_or(0, |i| (i + 1).min(n - 1));
         self.list_state.select(Some(i));
+        self.refresh_default_path();
     }
 
     fn list_prev(&mut self) {
         let i = self.list_state.selected().map_or(0, |i| i.saturating_sub(1));
         self.list_state.select(Some(i));
+        self.refresh_default_path();
+    }
+
+    /// keeps the path in sync with the selected deck unless the user has
+    /// already typed a custom path.
+    fn refresh_default_path(&mut self) {
+        if !self.path_edited {
+            self.path = match self.selected_deck() {
+                None    => "export.json".to_string(),
+                Some(d) => {
+                    let slug: String = d.chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                        .collect();
+                    format!("export_{slug}.json")
+                }
+            };
+        }
+    }
+}
+
+// ~~~ Import state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportFocus {
+    PathField,
+    ConfirmBtn,
+}
+
+struct ImportState {
+    path:   String,
+    focus:  ImportFocus,
+    status: Option<String>,
+}
+
+impl ImportState {
+    fn new() -> Self {
+        Self {
+            path:   String::new(),
+            focus:  ImportFocus::PathField,
+            status: None,
+        }
     }
 }
 
 // ~~~ Application state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-const MENU_ITEMS: usize = 7;
+const MENU_ITEMS: usize = 8;
 
 struct AppState<'a> {
     store:       &'a Store,
@@ -533,6 +581,7 @@ struct AppState<'a> {
     flash:       Option<String>,
     should_quit: bool,
     export: Option<ExportState>,
+    import: Option<ImportState>,
 }
 
 impl<'a> AppState<'a> {
@@ -552,6 +601,7 @@ impl<'a> AppState<'a> {
             flash: None,
             should_quit: false,
             export: None,
+            import: None,
         }
     }
 
@@ -613,6 +663,10 @@ impl<'a> AppState<'a> {
                 self.export = Some(ExportState::new(decks));
                 self.go_to(Screen::Export);
             }
+            Some(6) => {
+                self.import = Some(ImportState::new());
+                self.go_to(Screen::Import);
+            }
             _ => self.should_quit = true,
         }
         Ok(())
@@ -654,6 +708,7 @@ fn event_loop(
                 Screen::ListDecks => render_list_decks(f, app),
                 Screen::ListCards => render_list_cards(f, app),
                 Screen::Export    => render_export(f, app),
+                Screen::Import    => render_import(f, app),
             }
         })?;
 
@@ -668,6 +723,7 @@ fn event_loop(
                     Screen::ListDecks => on_list_decks(app, key.code)?,
                     Screen::ListCards => on_list_cards(app, key.code)?,
                     Screen::Export    => on_export(app, key.code)?,
+                    Screen::Import    => on_import(app, key.code)?,
                 }
             }
         }
@@ -1043,53 +1099,160 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
 fn on_export(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
     let ex = match app.export.as_mut() { Some(e) => e, None => return Ok(()) };
 
-    match code {
-        KeyCode::Char('q') | KeyCode::Esc => {
-            app.go_back();
-            return Ok(());
+    // [b] browse open native save dialog regardless of focus
+    if code == KeyCode::Char('b') {
+        let default = ex.path.clone();
+        // Temporarily leave raw mode so the OS dialog renders cleanly.
+        let _ = disable_raw_mode();
+        let picked = FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .set_file_name(&default)
+            .save_file();
+        let _ = enable_raw_mode();
+        if let Some(p) = picked {
+            ex.path        = p.to_string_lossy().into_owned();
+            ex.path_edited = true;
+            ex.status      = None;
         }
+        return Ok(());
+    }
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => { app.go_back(); return Ok(()); }
+
         KeyCode::Tab | KeyCode::BackTab => {
             let ex = app.export.as_mut().unwrap();
             ex.focus = match (ex.focus, code) {
-                (ExportFocus::DeckList,    KeyCode::Tab)     => ExportFocus::ResetToggle,
-                (ExportFocus::ResetToggle, KeyCode::Tab)     => ExportFocus::ConfirmBtn,
-                (ExportFocus::ConfirmBtn,  KeyCode::Tab)     => ExportFocus::DeckList,
-                (ExportFocus::DeckList,    _)                => ExportFocus::ConfirmBtn,
-                (ExportFocus::ResetToggle, _)                => ExportFocus::DeckList,
-                (ExportFocus::ConfirmBtn,  _)                => ExportFocus::ResetToggle,
-                // _                                            => ExportFocus::DeckList,
+                (ExportFocus::DeckList,    KeyCode::Tab)    => ExportFocus::ResetToggle,
+                (ExportFocus::ResetToggle, KeyCode::Tab)    => ExportFocus::PathField,
+                (ExportFocus::PathField,   KeyCode::Tab)    => ExportFocus::ConfirmBtn,
+                (ExportFocus::ConfirmBtn,  KeyCode::Tab)    => ExportFocus::DeckList,
+                (ExportFocus::DeckList,    _)               => ExportFocus::ConfirmBtn,
+                (ExportFocus::ResetToggle, _)               => ExportFocus::DeckList,
+                (ExportFocus::PathField,   _)               => ExportFocus::ResetToggle,
+                (ExportFocus::ConfirmBtn,  _)               => ExportFocus::PathField,
             };
         }
+
         KeyCode::Down | KeyCode::Char('j') if ex.focus == ExportFocus::DeckList => {
             app.export.as_mut().unwrap().list_next();
         }
         KeyCode::Up | KeyCode::Char('k') if ex.focus == ExportFocus::DeckList => {
             app.export.as_mut().unwrap().list_prev();
         }
+
         KeyCode::Char(' ') if ex.focus == ExportFocus::ResetToggle => {
             let ex = app.export.as_mut().unwrap();
             ex.reset_metadata = !ex.reset_metadata;
         }
+
+        // Path field text editing
+        KeyCode::Char(c) if ex.focus == ExportFocus::PathField => {
+            let ex = app.export.as_mut().unwrap();
+            ex.path.push(c);
+            ex.path_edited = true;
+            ex.status = None;
+        }
+        KeyCode::Backspace if ex.focus == ExportFocus::PathField => {
+            let ex = app.export.as_mut().unwrap();
+            ex.path.pop();
+            ex.path_edited = !ex.path.is_empty();
+            ex.status = None;
+        }
+
         KeyCode::Enter if ex.focus == ExportFocus::ConfirmBtn => {
             let ex    = app.export.as_ref().unwrap();
             let deck  = ex.selected_deck().map(|s| s.to_string());
             let reset = ex.reset_metadata;
-            let bytes = app.store.export_json(deck.as_deref(), reset)?;
-            let fname = match deck.as_deref() {
-                None    => "export.json".to_string(),
-                Some(d) => {
-                    let slug: String = d.chars()
-                        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-                        .collect();
-                    format!("export_{slug}.json")
+            let path  = ex.path.trim().to_string();
+            let path  = if path.is_empty() { "export.json".to_string() } else { path };
+
+            match app.store.export_json(deck.as_deref(), reset) {
+                Ok(bytes) => {
+                    match std::fs::write(&path, &bytes) {
+                        Ok(()) => {
+                            let label = deck.as_deref().unwrap_or("all decks");
+                            app.export.as_mut().unwrap().status =
+                                Some(format!("✓  Exported {label}  →  {path}"));
+                        }
+                        Err(e) => {
+                            app.export.as_mut().unwrap().status =
+                                Some(format!("✗  {e}"));
+                        }
+                    }
                 }
-            };
-            std::fs::write(&fname, &bytes)?;
-            let label = deck.as_deref().unwrap_or("all decks");
-            app.export.as_mut().unwrap().status = Some(
-                format!("✓ Exported {label} → {fname}")
-            );
+                Err(e) => {
+                    app.export.as_mut().unwrap().status = Some(format!("✗  {e}"));
+                }
+            }
         }
+
+        _ => {}
+    }
+    Ok(())
+}
+
+fn on_import(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
+    let im = match app.import.as_mut() { Some(i) => i, None => return Ok(()) };
+
+    // [b] browse open native open-file dialog regardless of focus
+    if code == KeyCode::Char('b') {
+        let _ = disable_raw_mode();
+        let picked = FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .pick_file();
+        let _ = enable_raw_mode();
+        if let Some(p) = picked {
+            im.path   = p.to_string_lossy().into_owned();
+            im.status = None;
+        }
+        return Ok(());
+    }
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => { app.go_back(); return Ok(()); }
+
+        KeyCode::Tab | KeyCode::BackTab => {
+            let im = app.import.as_mut().unwrap();
+            im.focus = match im.focus {
+                ImportFocus::PathField  => ImportFocus::ConfirmBtn,
+                ImportFocus::ConfirmBtn => ImportFocus::PathField,
+            };
+        }
+
+        KeyCode::Char(c) if im.focus == ImportFocus::PathField => {
+            let im = app.import.as_mut().unwrap();
+            im.path.push(c);
+            im.status = None;
+        }
+        KeyCode::Backspace if im.focus == ImportFocus::PathField => {
+            let im = app.import.as_mut().unwrap();
+            im.path.pop();
+            im.status = None;
+        }
+
+        KeyCode::Enter if im.focus == ImportFocus::ConfirmBtn => {
+            let path = app.import.as_ref().unwrap().path.trim().to_string();
+            match std::fs::read(&path) {
+                Err(e) => {
+                    app.import.as_mut().unwrap().status = Some(format!("✗  {e}"));
+                }
+                Ok(bytes) => match app.store.import_json(&bytes) {
+                    Err(e) => {
+                        app.import.as_mut().unwrap().status = Some(format!("✗  {e}"));
+                    }
+                    Ok(summary) => {
+                        app.import.as_mut().unwrap().status = Some(format!(
+                            "✓  {} card(s) added, {} replaced, {} item(s) total",
+                            summary.cards_imported,
+                            summary.cards_replaced,
+                            summary.items_imported,
+                        ));
+                    }
+                },
+            }
+        }
+
         _ => {}
     }
     Ok(())
@@ -1254,7 +1417,8 @@ fn render_menu(f: &mut Frame, app: &mut AppState) {
         " *  Browse Decks",
         " =  All Cards",
         " @  Statistics",
-        " ~  Export to JSON",
+        " ~  Export",
+        " ^  Import",
         " x  Quit",
     ]
     .iter()
@@ -2231,90 +2395,140 @@ fn render_export(f: &mut Frame, app: &mut AppState) {
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),      // deck list
-            Constraint::Length(3),   // reset toggle
-            Constraint::Length(3),   // export button
-            Constraint::Length(2),   // hint / status
+            Constraint::Min(0),     // deck list
+            Constraint::Length(3),  // reset toggle
+            Constraint::Length(3),  // path field
+            Constraint::Length(3),  // export button
+            Constraint::Length(2),  // hint / status
         ])
         .split(size);
 
     // ~~ Deck list ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    let focused_list = ex.focus == ExportFocus::DeckList;
+    let fl = ex.focus == ExportFocus::DeckList;
     let items: Vec<ListItem> = std::iter::once(ListItem::new(Line::from(vec![
         Span::raw("  "),
         Span::styled("All decks", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
     ])))
-    .chain(ex.decks.iter().map(|d| {
-        ListItem::new(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(d.as_str(), Style::default().fg(Color::Yellow)),
-        ]))
-    }))
+    .chain(ex.decks.iter().map(|d| ListItem::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(d.as_str(), Style::default().fg(Color::Yellow)),
+    ]))))
     .collect();
 
     f.render_stateful_widget(
         List::new(items)
-            .block(Block::default()
-                .borders(Borders::ALL)
-                .border_type(if focused_list { BorderType::Thick } else { BorderType::Rounded })
-                .border_style(if focused_list { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) })
-                .title(" Select deck to export "))
+            .block(field_block(" Select deck to export ", fl))
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
             .highlight_symbol("> "),
         v[0],
         &mut ex.list_state,
     );
 
-    // ~~ Reset metadata toggle ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    let focused_reset = ex.focus == ExportFocus::ResetToggle;
-    let (check, check_style) = if ex.reset_metadata {
-        ("[✓ ] Reset metadata  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    // ~~ Reset toggle ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let fr = ex.focus == ExportFocus::ResetToggle;
+    let (check, check_col) = if ex.reset_metadata {
+        ("[✓ ] Reset SRS metadata  ", Color::Yellow)
     } else {
-        ("[ ] Reset metadata  ", Style::default().fg(Color::White))
+        ("[ ] Reset SRS metadata  ", Color::White)
     };
     let desc = if ex.reset_metadata {
-        "SRS state wiped, good for sharing with a friend"
+        "state wiped: share with a friend or start over"
     } else {
-        "SRS state preserved, good for moving between devices"
+        "state preserved, continue where you left off"
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(check, check_style),
+            Span::styled(check, Style::default().fg(check_col).add_modifier(Modifier::BOLD)),
             Span::styled(desc, Style::default().fg(Color::DarkGray)),
         ]))
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_type(if focused_reset { BorderType::Thick } else { BorderType::Rounded })
-            .border_style(if focused_reset { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) })),
+        .block(field_block("", fr)),
         v[1],
     );
 
-    // ~~ Export button ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    let focused_btn   = ex.focus == ExportFocus::ConfirmBtn;
-    let deck_label    = ex.selected_deck().unwrap_or("all decks");
-    let btn_text      = format!("  ►  Export  \"{deck_label}\"  as JSON");
+    // ~~ Path field ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let fp = ex.focus == ExportFocus::PathField;
     f.render_widget(
-        Paragraph::new(Span::styled(
-            btn_text,
-            if focused_btn {
-                Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
-        ))
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_type(if focused_btn { BorderType::Thick } else { BorderType::Rounded })
-            .border_style(if focused_btn { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) })),
+        Paragraph::new(with_cursor(&ex.path, fp))
+            .block(field_block(" Save path  ([b] browse) ", fp))
+            .style(text_style(fp)),
         v[2],
     );
 
-    // ~~ Hint / status line ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    // ~~ Export button ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let fb  = ex.focus == ExportFocus::ConfirmBtn;
+    let lbl = ex.selected_deck().unwrap_or("all decks");
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!("  ►  Export  \"{lbl}\""),
+            if fb { Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD) }
+            else  { Style::default().fg(Color::DarkGray) },
+        ))
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_type(if fb { BorderType::Thick } else { BorderType::Rounded })
+            .border_style(if fb { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) })),
+        v[3],
+    );
+
+    // ~~ Hint / status ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     let hint = if let Some(ref msg) = ex.status {
-        Span::styled(msg.as_str(), Style::default().fg(Color::Green))
+        let col = if msg.starts_with('✓') { Color::Green } else { Color::Red };
+        Span::styled(msg.as_str(), Style::default().fg(col))
     } else {
         Span::styled(
-            "  [j/k] choose deck  │  [Tab] cycle focus  │  [Space] toggle reset  │  [Enter] export  │  [Esc] back",
+            "  [j/k] deck  │  [Tab] focus  │  [Space] toggle  │  [b] browse  │  [Enter] export  │  [Esc] back",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), v[4]);
+}
+
+fn render_import(f: &mut Frame, app: &mut AppState) {
+    let size = f.area();
+    let im   = match app.import.as_mut() { Some(i) => i, None => return };
+
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(30), // top padding
+            Constraint::Length(3),      // path field
+            Constraint::Length(3),      // import button
+            Constraint::Length(2),      // hint / status
+            Constraint::Min(0),
+        ])
+        .split(size);
+
+    // ~~ Path field ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let fp = im.focus == ImportFocus::PathField;
+    f.render_widget(
+        Paragraph::new(with_cursor(&im.path, fp))
+            .block(field_block(" Path to JSON file  ([b] browse) ", fp))
+            .style(text_style(fp)),
+        v[1],
+    );
+
+    // ~~ Import button ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let fb = im.focus == ImportFocus::ConfirmBtn;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "  ►  Import",
+            if fb { Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD) }
+            else  { Style::default().fg(Color::DarkGray) },
+        ))
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_type(if fb { BorderType::Thick } else { BorderType::Rounded })
+            .border_style(if fb { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) })),
+        v[2],
+    );
+
+    // ~~ Hint / status ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let hint = if let Some(ref msg) = im.status {
+        let col = if msg.starts_with('✓') { Color::Green } else { Color::Red };
+        Span::styled(msg.as_str(), Style::default().fg(col))
+    } else {
+        Span::styled(
+            "  [b] browse  │  [Tab] focus  │  [Enter] import  │  [Esc] back",
             Style::default().fg(Color::DarkGray),
         )
     };

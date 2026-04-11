@@ -570,6 +570,90 @@ impl Store {
         .context("serialize export")
     }
 
+
+    // ~~ Import ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    /// works for both full exports and single-deck exports
+    /// cards/items where ID already exists in the DB are replaced
+    pub fn import_json(&self, data: &[u8]) -> Result<ImportSummary> {
+        #[derive(serde::Deserialize)]
+        struct ImportFile {
+            cards: Vec<ImportCard>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ImportCard {
+            card:  Card,
+            items: Vec<Item>,
+        }
+
+        let file: ImportFile =
+            serde_json::from_slice(data).context("parse import JSON")?;
+
+        let mut summary = ImportSummary::default();
+
+        for ic in file.cards {
+            // check if this card ID is already in the DB.
+            let exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cards WHERE id=?1",
+                    params![ic.card.id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO cards
+                        (id, deck, kind, question, reversible, created_at, updated_at)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        ic.card.id,
+                        ic.card.deck,
+                        ic.card.kind.as_str(),
+                        ic.card.question,
+                        ic.card.reversible as i32,
+                        ic.card.created_at.to_rfc3339(),
+                        ic.card.updated_at.to_rfc3339(),
+                    ],
+                )
+                .context("upsert card")?;
+
+            if exists { summary.cards_replaced += 1; } else { summary.cards_imported += 1; }
+
+            for item in ic.items {
+                self.conn
+                    .execute(
+                        "INSERT OR REPLACE INTO items
+                            (id, card_id, position, kind, prompt, answer, due_at,
+                            interval_days, ease, last_reviewed_at,
+                            lapses, review_count, confidence_avg)
+                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                        params![
+                            item.id,
+                            item.card_id,
+                            item.position,
+                            item.kind.as_str(),
+                            item.prompt,
+                            item.answer,
+                            item.due_at.to_rfc3339(),
+                            item.interval_days,
+                            item.ease,
+                            item.last_reviewed_at.map(|t| t.to_rfc3339()),
+                            item.lapses,
+                            item.review_count,
+                            item.confidence_avg,
+                        ],
+                    )
+                    .context("upsert item")?;
+                summary.items_imported += 1;
+            }
+        }
+
+        Ok(summary)
+    }
+
     // ~~ Editing ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     /// Update an existing simple card's content in-place.
