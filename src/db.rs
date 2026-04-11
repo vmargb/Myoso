@@ -526,10 +526,12 @@ impl Store {
         }
     }
 
-    pub fn export_json(&self) -> Result<Vec<u8>> {
+    pub fn export_json(&self, deck: Option<&str>, reset_metadata: bool) -> Result<Vec<u8>> {
         #[derive(Serialize)]
         struct Export {
             exported_at: DateTime<Utc>,
+            reset_metadata: bool,
+            deck: Option<String>,
             cards: Vec<ExportCard>,
         }
         #[derive(Serialize)]
@@ -538,16 +540,31 @@ impl Store {
             items: Vec<Item>,
         }
 
-        let summaries = self.list_cards(None)?;
+        let summaries = self.list_cards(deck)?;
         let mut export_cards = Vec::with_capacity(summaries.len());
+        let now = Utc::now();
+
         for s in &summaries {
             let card = self.load_card(&s.card_id)?;
-            let items = self.load_items(&s.card_id)?;
+            let mut items = self.load_items(&s.card_id)?;
+            if reset_metadata {
+                for item in &mut items {
+                    item.due_at           = now - chrono::Duration::seconds(1);
+                    item.interval_days    = 1.0;
+                    item.ease             = 2.5;
+                    item.last_reviewed_at = None;
+                    item.lapses           = 0;
+                    item.review_count     = 0;
+                    item.confidence_avg   = 0.0;
+                }
+            }
             export_cards.push(ExportCard { card, items });
         }
 
         serde_json::to_vec_pretty(&Export {
-            exported_at: Utc::now(),
+            exported_at: now,
+            reset_metadata,
+            deck: deck.map(|s| s.to_string()),
             cards: export_cards,
         })
         .context("serialize export")

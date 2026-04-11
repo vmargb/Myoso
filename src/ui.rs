@@ -37,6 +37,7 @@ enum Screen {
     AddCard,
     ListDecks,
     ListCards,
+    Export,
 }
 
 // ~~~ Review state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -464,6 +465,57 @@ impl ListDecksState {
     }
 }
 
+// ~~~ Export state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFocus {
+    DeckList,
+    ResetToggle,
+    ConfirmBtn,
+}
+
+struct ExportState {
+    decks:          Vec<String>,   // All decks is implicit index 0
+    list_state:     ListState,
+    reset_metadata: bool,
+    focus:          ExportFocus,
+    status:         Option<String>, // success / error message after export
+}
+
+impl ExportState {
+    fn new(decks: Vec<String>) -> Self {
+        let mut ls = ListState::default();
+        ls.select(Some(0));
+        Self {
+            decks,
+            list_state: ls,
+            reset_metadata: false,
+            focus: ExportFocus::DeckList,
+            status: None,
+        }
+    }
+
+    /// None means "All decks", Some(name) means a specific deck.
+    fn selected_deck(&self) -> Option<&str> {
+        self.list_state
+            .selected()
+            .and_then(|i| if i == 0 { None } else { self.decks.get(i - 1).map(|s| s.as_str()) })
+    }
+
+    fn list_len(&self) -> usize { self.decks.len() + 1 } // +1 for "All decks"
+
+    fn list_next(&mut self) {
+        let n = self.list_len();
+        let i = self.list_state.selected().map_or(0, |i| (i + 1).min(n - 1));
+        self.list_state.select(Some(i));
+    }
+
+    fn list_prev(&mut self) {
+        let i = self.list_state.selected().map_or(0, |i| i.saturating_sub(1));
+        self.list_state.select(Some(i));
+    }
+}
+
 // ~~~ Application state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 const MENU_ITEMS: usize = 7;
@@ -480,6 +532,7 @@ struct AppState<'a> {
     list_cards:  Option<ListCardsState>,
     flash:       Option<String>,
     should_quit: bool,
+    export: Option<ExportState>,
 }
 
 impl<'a> AppState<'a> {
@@ -498,6 +551,7 @@ impl<'a> AppState<'a> {
             list_cards: None,
             flash: None,
             should_quit: false,
+            export: None,
         }
     }
 
@@ -555,9 +609,9 @@ impl<'a> AppState<'a> {
                 self.go_to(Screen::Stats);
             }
             Some(5) => {
-                let bytes = self.store.export_json()?;
-                std::fs::write("export.json", &bytes)?;
-                self.flash = Some("✓ Exported to export.json".into());
+                let decks = self.store.list_decks().unwrap_or_default();
+                self.export = Some(ExportState::new(decks));
+                self.go_to(Screen::Export);
             }
             _ => self.should_quit = true,
         }
@@ -599,6 +653,7 @@ fn event_loop(
                 Screen::AddCard   => render_add_card(f, app),
                 Screen::ListDecks => render_list_decks(f, app),
                 Screen::ListCards => render_list_cards(f, app),
+                Screen::Export    => render_export(f, app),
             }
         })?;
 
@@ -612,6 +667,7 @@ fn event_loop(
                     Screen::AddCard   => on_add_card(app, key.code)?,
                     Screen::ListDecks => on_list_decks(app, key.code)?,
                     Screen::ListCards => on_list_cards(app, key.code)?,
+                    Screen::Export    => on_export(app, key.code)?,
                 }
             }
         }
@@ -984,6 +1040,61 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn on_export(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
+    let ex = match app.export.as_mut() { Some(e) => e, None => return Ok(()) };
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.go_back();
+            return Ok(());
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            let ex = app.export.as_mut().unwrap();
+            ex.focus = match (ex.focus, code) {
+                (ExportFocus::DeckList,    KeyCode::Tab)     => ExportFocus::ResetToggle,
+                (ExportFocus::ResetToggle, KeyCode::Tab)     => ExportFocus::ConfirmBtn,
+                (ExportFocus::ConfirmBtn,  KeyCode::Tab)     => ExportFocus::DeckList,
+                (ExportFocus::DeckList,    _)                => ExportFocus::ConfirmBtn,
+                (ExportFocus::ResetToggle, _)                => ExportFocus::DeckList,
+                (ExportFocus::ConfirmBtn,  _)                => ExportFocus::ResetToggle,
+                // _                                            => ExportFocus::DeckList,
+            };
+        }
+        KeyCode::Down | KeyCode::Char('j') if ex.focus == ExportFocus::DeckList => {
+            app.export.as_mut().unwrap().list_next();
+        }
+        KeyCode::Up | KeyCode::Char('k') if ex.focus == ExportFocus::DeckList => {
+            app.export.as_mut().unwrap().list_prev();
+        }
+        KeyCode::Char(' ') if ex.focus == ExportFocus::ResetToggle => {
+            let ex = app.export.as_mut().unwrap();
+            ex.reset_metadata = !ex.reset_metadata;
+        }
+        KeyCode::Enter if ex.focus == ExportFocus::ConfirmBtn => {
+            let ex    = app.export.as_ref().unwrap();
+            let deck  = ex.selected_deck().map(|s| s.to_string());
+            let reset = ex.reset_metadata;
+            let bytes = app.store.export_json(deck.as_deref(), reset)?;
+            let fname = match deck.as_deref() {
+                None    => "export.json".to_string(),
+                Some(d) => {
+                    let slug: String = d.chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                        .collect();
+                    format!("export_{slug}.json")
+                }
+            };
+            std::fs::write(&fname, &bytes)?;
+            let label = deck.as_deref().unwrap_or("all decks");
+            app.export.as_mut().unwrap().status = Some(
+                format!("✓ Exported {label} → {fname}")
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 // ~~~ Save helper ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
@@ -1177,6 +1288,7 @@ fn render_menu(f: &mut Frame, app: &mut AppState) {
         );
     }
 }
+
 
 // ~~ Stats ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -2110,4 +2222,101 @@ fn render_list_decks(f: &mut Frame, app: &mut AppState) {
     if ld.confirm_delete {
         render_confirm_dialog(f, "  Delete this deck and ALL its cards?", size);
     }
+}
+
+fn render_export(f: &mut Frame, app: &mut AppState) {
+    let size = f.area();
+    let ex   = match app.export.as_mut() { Some(e) => e, None => return };
+
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),      // deck list
+            Constraint::Length(3),   // reset toggle
+            Constraint::Length(3),   // export button
+            Constraint::Length(2),   // hint / status
+        ])
+        .split(size);
+
+    // ~~ Deck list ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let focused_list = ex.focus == ExportFocus::DeckList;
+    let items: Vec<ListItem> = std::iter::once(ListItem::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("All decks", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+    ])))
+    .chain(ex.decks.iter().map(|d| {
+        ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(d.as_str(), Style::default().fg(Color::Yellow)),
+        ]))
+    }))
+    .collect();
+
+    f.render_stateful_widget(
+        List::new(items)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_type(if focused_list { BorderType::Thick } else { BorderType::Rounded })
+                .border_style(if focused_list { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) })
+                .title(" Select deck to export "))
+            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_symbol("> "),
+        v[0],
+        &mut ex.list_state,
+    );
+
+    // ~~ Reset metadata toggle ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let focused_reset = ex.focus == ExportFocus::ResetToggle;
+    let (check, check_style) = if ex.reset_metadata {
+        ("[✓ ] Reset metadata  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        ("[ ] Reset metadata  ", Style::default().fg(Color::White))
+    };
+    let desc = if ex.reset_metadata {
+        "SRS state wiped, good for sharing with a friend"
+    } else {
+        "SRS state preserved, good for moving between devices"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(check, check_style),
+            Span::styled(desc, Style::default().fg(Color::DarkGray)),
+        ]))
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_type(if focused_reset { BorderType::Thick } else { BorderType::Rounded })
+            .border_style(if focused_reset { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) })),
+        v[1],
+    );
+
+    // ~~ Export button ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let focused_btn   = ex.focus == ExportFocus::ConfirmBtn;
+    let deck_label    = ex.selected_deck().unwrap_or("all decks");
+    let btn_text      = format!("  ►  Export  \"{deck_label}\"  as JSON");
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            btn_text,
+            if focused_btn {
+                Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ))
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_type(if focused_btn { BorderType::Thick } else { BorderType::Rounded })
+            .border_style(if focused_btn { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) })),
+        v[2],
+    );
+
+    // ~~ Hint / status line ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let hint = if let Some(ref msg) = ex.status {
+        Span::styled(msg.as_str(), Style::default().fg(Color::Green))
+    } else {
+        Span::styled(
+            "  [j/k] choose deck  │  [Tab] cycle focus  │  [Space] toggle reset  │  [Enter] export  │  [Esc] back",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), v[3]);
 }
