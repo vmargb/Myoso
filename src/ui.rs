@@ -8,6 +8,7 @@ use std::io;
 use std::time::Instant;
 
 use chrono::Utc;
+use chrono::DateTime;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -82,40 +83,66 @@ impl ReviewState {
         self.phase = ReviewPhase::Revealed;
     }
 
+    // appends card_id to the end of the session if it now has due items
+    // but only if it isn't already in the not-yet-reviewed portion (avoid duplicates)
+    fn requeue_if_due(&mut self, store: &Store, card_id: &str) -> anyhow::Result<()> {
+        let already_queued = self.session[self.card_idx..]
+            .iter()
+            .any(|rc| rc.card.id == card_id);
+        if already_queued {
+            return Ok(());
+        }
+
+        if let Some(review_card) = store.review_card_if_due(card_id)? {
+            self.total_items += review_card.items.len();
+            self.session.push(review_card);
+        }
+
+        Ok(())
+    }
+
     fn rate(&mut self, store: &Store, confidence: u8) -> anyhow::Result<()> {
         if self.is_done() {
             return Ok(());
         }
 
-        // Grab the current item to check its kind
-        let item = &self.session[self.card_idx].items[self.item_idx];
-        let item_id = item.id.clone();
-        let is_step = item.kind == ItemKind::Step;
+        // Snapshot what we need before state mutation
+        let item         = &self.session[self.card_idx].items[self.item_idx];
+        let item_id      = item.id.clone();
+        let is_step      = item.kind == ItemKind::Step;
+        let is_last_item = self.item_idx == self.session[self.card_idx].items.len() - 1;
+        let card_id      = self.session[self.card_idx].card.id.clone();
+
         store.record_review(&item_id, confidence, self.item_started_at.elapsed())?;
         self.done_items += 1;
 
-        // intercept failures on multi-step cards
-        if is_step && confidence <= 2 { // fail
-            // calculate how many subsequent steps we are skipping
+        if is_step && confidence <= 2 {
+            // Failure: skip remaining steps, jump to next card
             let skipped_items = self.session[self.card_idx].items.len() - self.item_idx - 1;
-            // deduct them from the total so the progress bar hits 100% correctly
-            self.total_items -= skipped_items; 
-            
-            // manually jump to the next card
+            self.total_items -= skipped_items;
             self.card_idx += 1;
             self.item_idx = 0;
             self.phase = ReviewPhase::Thinking;
             self.item_started_at = Instant::now();
-            
-            // check if skipping those items ended the whole session
-            if self.is_done() && self.finished_duration.is_none() {
-                self.finished_duration = Some(self.started_at.elapsed());
-            }
+
+            // db just set all subsequent steps' due_at = now, so re-add this
+            // card at the tail of the session if it now has due items.
+            self.requeue_if_due(store, &card_id)?;
         } else {
-            // normal progression for passes or simple cards
             self.advance();
+
+            // After completing the last step of a multi card, the next step in
+            // the chain may already be due (all brand-new steps start past-due).
+            if is_last_item && is_step {
+                self.requeue_if_due(store, &card_id)?;
+            }
         }
-        
+
+        // Snapshot only after all re-queuing so we don't falsely end early.
+        if self.is_done() && self.finished_duration.is_none() {
+            self.finished_duration = Some(self.started_at.elapsed());
+        }
+
         Ok(())
     }
 
@@ -1049,6 +1076,24 @@ fn text_style(focused: bool) -> Style {
     }
 }
 
+/// readable countdown: "4d 2h", "3h 15m", "45m", "now"
+fn format_time_until(due: DateTime<Utc>) -> String {
+    let secs = (due - Utc::now()).num_seconds();
+    if secs <= 0 {
+        return "now".to_string();
+    }
+    let days  = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins  = (secs % 3_600) / 60;
+    match (days, hours, mins) {
+        (d, h, _) if d >= 1 && h > 0 => format!("{d}d {h}h"),
+        (d, _, _) if d >= 1           => format!("{d}d"),
+        (_, h, m) if h >= 1 && m > 0 => format!("{h}h {m}m"),
+        (_, h, _) if h >= 1           => format!("{h}h"),
+        _                             => format!("{}m", mins.max(1)),
+    }
+}
+
 // ~~~ Renderers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 fn render_menu(f: &mut Frame, app: &mut AppState) {
@@ -1186,7 +1231,7 @@ fn render_review(f: &mut Frame, app: &AppState) {
 
     if rs.is_done() {
         if rs.total_items == 0 {
-            render_nothing_due(f, size);
+            render_nothing_due(f, app, size);
         } else {
             render_review_done(f, rs, size);
         }
@@ -1431,26 +1476,59 @@ fn render_review(f: &mut Frame, app: &AppState) {
     );
 }
 
-fn render_nothing_due(f: &mut Frame, size: Rect) {
-    let area = centered_rect(50, 7, size);
+fn render_nothing_due(f: &mut Frame, app: &AppState, size: Rect) {
+    let next  = app.store.next_due().ok().flatten();
+    let h     = if next.is_some() { 11 } else { 7 };
+    let area  = centered_rect(64, h, size);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Nothing due right now!",
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::raw(" All caught up. Come back later.")),
+        Line::from(""),
+    ];
+
+    if let Some((due_at, question, deck)) = next {
+        let q: String = question.chars().take(42).collect();
+        let ellipsis  = if question.chars().count() > 42 { "…" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(" Next   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("\"{q}{ellipsis}\""),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!("  [{}]", deck),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" Due in ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_time_until(due_at),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        " [q] / [Esc] to return",
+        Style::default().fg(Color::DarkGray),
+    )));
+
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                " Nothing due right now!",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(" All caught up, come back later."),
-            Line::from(""),
-            Line::from(Span::styled(
-                " [q] / [Esc] to return",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ])
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(" Review ")),
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Review "),
+            )
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -1923,6 +2001,14 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
                     ),
                     Style::default().fg(Color::DarkGray),
                 );
+                let time_tag = if c.due_at > now {
+                    Span::styled(
+                        format!("  in {}", format_time_until(c.due_at)),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                } else {
+                    Span::raw("")
+                };
                 ListItem::new(Line::from(vec![
                     Span::raw(" "),
                     due_tag,
@@ -1930,6 +2016,7 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
                     deck_tag,
                     q_tag,
                     n_tag,
+                    time_tag,
                 ]))
             })
             .collect()

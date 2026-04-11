@@ -259,6 +259,21 @@ impl Store {
         Ok(session)
     }
 
+    // Re-check a single card after a rating: returns an updated ReviewCard if the
+    // card now has due items, or None if nothing is due. UI then dynamically
+    // extends the running session queue
+    pub fn review_card_if_due(&self, card_id: &str) -> Result<Option<ReviewCard>> {
+        let now   = Utc::now();
+        let card  = self.load_card(card_id)?;
+        let items = self.load_items(card_id)?;
+        let selected = due_items_for_card(&card.kind, &items, now);
+        if selected.is_empty() {
+            Ok(None) // if nothing is due make no changes
+        } else {
+            Ok(Some(ReviewCard { card, items: selected }))
+        }
+    }
+
     pub fn load_items(&self, card_id: &str) -> Result<Vec<Item>> {
         let mut stmt = self
             .conn
@@ -481,6 +496,34 @@ impl Store {
                 .query_row("SELECT COUNT(*) FROM review_log", [], |r| r.get(0))
                 .context("count review_log")?,
         })
+    }
+
+    // returns the (due_at, question, deck) of the item due soonest
+    pub fn next_due(&self) -> Result<Option<(DateTime<Utc>, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.due_at, c.question, c.deck
+                FROM items i
+                JOIN cards c ON c.id = i.card_id
+                ORDER BY i.due_at ASC
+                LIMIT 1",
+            )
+            .context("prepare next_due")?;
+
+        match stmt.query_row([], |row| {
+            let due: String      = row.get(0)?;
+            let question: String = row.get(1)?;
+            let deck: String     = row.get(2)?;
+            Ok((due, question, deck))
+        }) {
+            Ok((due, question, deck)) => {
+                let due_at = due.parse().unwrap_or_else(|_| Utc::now());
+                Ok(Some((due_at, question, deck)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("query next_due"),
+        }
     }
 
     pub fn export_json(&self) -> Result<Vec<u8>> {
