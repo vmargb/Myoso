@@ -45,8 +45,8 @@ cargo run
 |-----|--------|
 | `Space` / `Enter` | Reveal the answer for the current step |
 | `1` | Rate: **Again** - total blank, short reset |
-| `2` | Rate: **Hard** - recalled with significant effort |
-| `3` | Rate: **Good** - recalled correctly |
+| `2` | Rate: **Hard** - recalled incorrectly |
+| `3` | Rate: **Good** - recalled correctly but with effort |
 | `4` | Rate: **Great** - recalled correctly & quickly |
 | `5` | Rate: **Easy** - instant/effortless |
 | `q` / `Esc` | Quit the session |
