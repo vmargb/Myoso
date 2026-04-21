@@ -1,9 +1,8 @@
-Step-by-step flashcards for the terminal.
-
-Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.org/) for storage.
+## arrow.el
+*Step-by-step flashcards for the terminal*
+*Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.org/)*
 
 ---
-
 
 <p align="center">
     <img src="screenshots/menu.png" alt="menu" width="45%" />

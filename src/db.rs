@@ -38,6 +38,7 @@ impl Store {
                 kind        TEXT NOT NULL,
                 question    TEXT NOT NULL,
                 reversible  INTEGER NOT NULL DEFAULT 0,
+                show_chain  INTEGER NOT NULL DEFAULT 1,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
@@ -74,6 +75,12 @@ impl Store {
             ",
             )
             .context("schema migration")?;
+        // Safe migration for existing databases: add show_chain if absent.
+        // SQLite returns "duplicate column name" if it already exists; ignore that.
+        let _ = self.conn.execute(
+            "ALTER TABLE cards ADD COLUMN show_chain INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
         Ok(())
     }
 
@@ -123,7 +130,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn add_multi_card(&self, deck: &str, question: &str, steps: &[(String, String)]) -> Result<()> {
+    pub fn add_multi_card(&self, deck: &str, question: &str, steps: &[(String, String)], show_chain: bool) -> Result<()> {
         if steps.is_empty() {
             anyhow::bail!("multi-step cards need at least one step");
         }
@@ -132,9 +139,9 @@ impl Store {
         let ts = now.to_rfc3339();
         self.conn
             .execute(
-                "INSERT INTO cards(id,deck,kind,question,reversible,created_at,updated_at)
-                 VALUES(?1,?2,'multi',?3,0,?4,?5)",
-                params![card_id, deck, question, ts, ts],
+                "INSERT INTO cards(id,deck,kind,question,reversible,show_chain,created_at,updated_at)
+                 VALUES(?1,?2,'multi',?3,0,?4,?5,?6)",
+                params![card_id, deck, question, show_chain as i32, ts, ts],
             )
             .context("insert multi card")?;
 
@@ -220,7 +227,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id,kind,deck,question,reversible,created_at,updated_at
+                "SELECT id,kind,deck,question,reversible,show_chain,created_at,updated_at
                  FROM cards WHERE (?1='' OR deck=?1) ORDER BY created_at ASC",
             )
             .context("prepare due_session")?;
@@ -228,15 +235,17 @@ impl Store {
         let cards: Vec<Card> = stmt
             .query_map(params![filter], |row| {
                 let kind: String = row.get(1)?;
-                let rev: i32 = row.get(4)?;
-                let ca: String = row.get(5)?;
-                let ua: String = row.get(6)?;
+                let rev: i32  = row.get(4)?;
+                let sc: i32   = row.get(5)?;
+                let ca: String = row.get(6)?;
+                let ua: String = row.get(7)?;
                 Ok(Card {
                     id: row.get(0)?,
                     kind: kind.parse().unwrap_or(CardKind::Simple),
                     deck: row.get(2)?,
                     question: row.get(3)?,
                     reversible: rev != 0,
+                    show_chain: sc != 0,
                     created_at: ca.parse().unwrap_or_else(|_| Utc::now()),
                     updated_at: ua.parse().unwrap_or_else(|_| Utc::now()),
                 })
@@ -314,20 +323,22 @@ impl Store {
     pub fn load_card(&self, card_id: &str) -> Result<Card> {
         self.conn
             .query_row(
-                "SELECT id,deck,kind,question,reversible,created_at,updated_at
+                "SELECT id,deck,kind,question,reversible,show_chain,created_at,updated_at
                  FROM cards WHERE id=?1",
                 params![card_id],
                 |row| {
                     let kind: String = row.get(2)?;
-                    let rev: i32 = row.get(4)?;
-                    let ca: String = row.get(5)?;
-                    let ua: String = row.get(6)?;
+                    let rev: i32  = row.get(4)?;
+                    let sc: i32   = row.get(5)?;
+                    let ca: String = row.get(6)?;
+                    let ua: String = row.get(7)?;
                     Ok(Card {
                         id: row.get(0)?,
                         deck: row.get(1)?,
                         kind: kind.parse().unwrap_or(CardKind::Simple),
                         question: row.get(3)?,
                         reversible: rev != 0,
+                        show_chain: sc != 0,
                         created_at: ca.parse().unwrap_or_else(|_| Utc::now()),
                         updated_at: ua.parse().unwrap_or_else(|_| Utc::now()),
                     })
@@ -606,14 +617,15 @@ impl Store {
             self.conn
                 .execute(
                     "INSERT OR REPLACE INTO cards
-                        (id, deck, kind, question, reversible, created_at, updated_at)
-                    VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        (id, deck, kind, question, reversible, show_chain, created_at, updated_at)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         ic.card.id,
                         ic.card.deck,
                         ic.card.kind.as_str(),
                         ic.card.question,
                         ic.card.reversible as i32,
+                        ic.card.show_chain as i32,
                         ic.card.created_at.to_rfc3339(),
                         ic.card.updated_at.to_rfc3339(),
                     ],
@@ -732,13 +744,14 @@ impl Store {
         deck: &str,
         question: &str,
         steps: &[(String, String)],
+        show_chain: bool,
     ) -> Result<()> {
         let now = Utc::now();
         let ts  = now.to_rfc3339();
         self.conn
             .execute(
-                "UPDATE cards SET deck=?1, question=?2, updated_at=?3 WHERE id=?4",
-                params![deck, question, ts, card_id],
+                "UPDATE cards SET deck=?1, question=?2, show_chain=?3, updated_at=?4 WHERE id=?5",
+                params![deck, question, show_chain as i32, ts, card_id],
             )
             .context("update multi card")?;
 

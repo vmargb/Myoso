@@ -80,9 +80,13 @@ pub struct Card {
     pub kind: CardKind,
     pub question: String,
     pub reversible: bool,
+    #[serde(default = "default_show_chain")]
+    pub show_chain: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+fn default_show_chain() -> bool { true }
 
 /// A single reviewable unit within a card.
 #[derive(Debug, Clone, Serialize, Deserialize)]

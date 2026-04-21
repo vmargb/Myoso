@@ -200,6 +200,7 @@ struct AddCardState {
     multi_question:   String,
     answer:           String,
     reversible:       bool,
+    show_chain:       bool,   // multi only: show preceding step answers during review
     // multi-only, each step is (optional_name, answer)
     steps:            Vec<(String, String)>,
     step_name_buf:    String,
@@ -225,6 +226,7 @@ impl AddCardState {
             multi_question:   String::new(),
             answer:           String::new(),
             reversible:       false,
+            show_chain:       true,
             steps:            Vec::new(),
             step_name_buf:    String::new(),
             step_buf:         String::new(),
@@ -254,11 +256,11 @@ impl AddCardState {
 
     /// Field layout
     ///   Simple: deck(0)  question(1)  answer(2)         reversible(3)  [Save](4)
-    ///   Multi:  deck(0)  question(1)  step_name(2)  step_answer(3)  [Add step](4)  steps_list(5)  [Save](6)
+    ///   Multi:  deck(0)  question(1)  step_name(2)  step_answer(3)  [Add step](4)  steps_list(5)  show_chain(6)  [Save](7)
     fn field_count(&self) -> usize {
         match self.kind {
             AddKind::Simple => 5,
-            AddKind::Multi  => 7,
+            AddKind::Multi  => 8,
         }
     }
 
@@ -276,6 +278,7 @@ impl AddCardState {
     fn is_step_name(&self)  -> bool { self.kind == AddKind::Multi  && self.focused == 2 }
     fn is_add_step_button(&self) -> bool { self.kind == AddKind::Multi && self.focused == 4 }
     fn is_steps_list(&self) -> bool { self.kind == AddKind::Multi  && self.focused == 5 }
+    fn is_show_chain(&self) -> bool { self.kind == AddKind::Multi  && self.focused == 6 }
 
     fn active_buf_mut(&mut self) -> Option<&mut String> {
         match self.kind {
@@ -372,6 +375,7 @@ impl AddCardState {
             CardKind::Multi => { // handle question & answer for multi kind
                 s.kind  = AddKind::Multi;
                 s.multi_question = card.question.clone();
+                s.show_chain = card.show_chain;
                 s.steps = items
                     .iter()
                     .filter(|i| i.kind == ItemKind::Step)
@@ -800,6 +804,7 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
     let has_deck_sel  = app.add_card.as_ref().unwrap().deck_list_idx.is_some();
     let sugg_count    = app.add_card.as_ref().unwrap().filtered_decks().len();
     let is_editing    = app.add_card.as_ref().unwrap().editing_card_id.is_some();
+    let is_show_chain = app.add_card.as_ref().unwrap().is_show_chain();
 
     // ~~ Pick-type phase ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if phase == AddPhase::PickType {
@@ -901,6 +906,25 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
             s.reversible = !s.reversible;
         }
 
+        KeyCode::Char(' ') if is_show_chain => {
+            let s = app.add_card.as_mut().unwrap();
+            s.show_chain = !s.show_chain;
+        }
+
+        // === Edit selected step (Enter on steps list) ===
+        KeyCode::Enter if is_steps_list => {
+            let s = app.add_card.as_mut().unwrap();
+            if let Some(idx) = s.step_list_state.selected() {
+                if idx < s.steps.len() {
+                    let (name, answer) = s.steps[idx].clone();
+                    s.step_name_buf    = name;
+                    s.step_buf         = answer;
+                    s.editing_step_idx = Some(idx);
+                    s.focused          = 2; // jump to Step Name field
+                }
+            }
+        }
+
         // === Deck suggestion selection ===
         KeyCode::Enter if is_deck_field && has_deck_sel => {
             let selected = app.add_card.as_ref().unwrap().selected_suggestion();
@@ -988,7 +1012,7 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
             s.pop_char();
         }
 
-        KeyCode::Char(c) if !is_rev && !is_save => {
+        KeyCode::Char(c) if !is_rev && !is_show_chain && !is_save => {
             let s = app.add_card.as_mut().unwrap();
             if s.focused == 0 { s.deck_list_idx = None; }
             s.error = None;
@@ -1294,6 +1318,7 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.deck.trim(),
                 s.multi_question.trim(),
                 &s.steps,
+                s.show_chain,
             )?,
         }
     } else {
@@ -1309,6 +1334,7 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.deck.trim(),
                 s.multi_question.trim(),
                 &s.steps,
+                s.show_chain,
             )?,
         }
     }
@@ -1620,31 +1646,27 @@ fn render_review(f: &mut Frame, app: &AppState) {
         lines.push(Line::from(""));
 
         // ~~ Preceding steps, rebuild context ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        // if rs.item_idx > 0 {
-        //     lines.push(Line::from(Span::styled(
-        //         "  ─ chain context (steps you've already recalled) ─",
-        //         Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        //     )));
-        // }
-        for (i, prev) in rc.items[..rs.item_idx].iter().enumerate() {
-            let step_label = format!("  {} ✓", prev.prompt);
-            // If the prompt is just the auto "Step N" we already have the number, otherwise show it
-            let display_label = if prev.prompt == format!("Step {}", i + 1) {
-                step_label
-            } else {
-                format!("  {}. {} ✓", i + 1, prev.prompt)
-            };
-            lines.push(Line::from(Span::styled(
-                display_label,
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-            )));
-            for l in prev.answer.lines() {
+        if rc.card.show_chain {
+            for (i, prev) in rc.items[..rs.item_idx].iter().enumerate() {
+                let step_label = format!("  {} ✓", prev.prompt);
+                // If the prompt is just the auto "Step N" we already have the number, otherwise show it
+                let display_label = if prev.prompt == format!("Step {}", i + 1) {
+                    step_label
+                } else {
+                    format!("  {}. {} ✓", i + 1, prev.prompt)
+                };
                 lines.push(Line::from(Span::styled(
-                    format!("    {l}"),
-                    Style::default().fg(Color::DarkGray),
+                    display_label,
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
                 )));
+                for l in prev.answer.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {l}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(""));
             }
-            lines.push(Line::from(""));
         }
 
         // ~~ Current step label ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2057,7 +2079,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
 
     let steps_h = 6;
     // 3 visible lines in question/step answer
-    let total_h = 1 + 3 + sugg_h + 5 + 3 + 5 + steps_h + 3 + 3 + 1;
+    let total_h = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + steps_h + 3 + 3 + 3 + 1;
 
     let area = centered_rect(72, total_h, size);
     let v = Layout::default()
@@ -2071,7 +2093,8 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
             Constraint::Length(5),       // step answer input (focused == 3)
             Constraint::Length(3),       // add step button  (focused == 4)
             Constraint::Length(steps_h), // steps list       (focused == 5)
-            Constraint::Length(3),       // save button      (focused == 6)
+            Constraint::Length(3),       // show_chain toggle (focused == 6)
+            Constraint::Length(3),       // save button      (focused == 7)
             Constraint::Min(1),          // error / help
         ])
         .split(area);
@@ -2200,8 +2223,27 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
 
     f.render_stateful_widget(list, v[7], &mut s.step_list_state);
 
-    render_save_btn(f, s.focused == 6, v[8]);
-    render_form_hint(f, s.error.as_deref(), v[9]);
+    // Show chain toggle (focused == 6)
+    let sc_text = if s.show_chain {
+        "  y  Show preceding step answers during review"
+    } else {
+        "  n  Hide preceding step answers during review (harder, no context)"
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            sc_text,
+            if s.focused == 6 {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ))
+        .block(field_block(" Show chain  [Space to toggle] ", s.focused == 6)),
+        v[8],
+    );
+
+    render_save_btn(f, s.focused == 7, v[9]);
+    render_form_hint(f, s.error.as_deref(), v[10]);
 }
 
 fn render_add_step_btn(f: &mut Frame, focused: bool, editing: bool, area: Rect) {
