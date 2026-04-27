@@ -60,6 +60,7 @@ struct ReviewState {
     total_items:       usize,
     done_items:        usize,
     finished_duration: Option<std::time::Duration>,
+    answer_scroll: u16,
 }
 
 impl ReviewState {
@@ -75,6 +76,7 @@ impl ReviewState {
             total_items: total,
             done_items: 0,
             finished_duration: None,
+            answer_scroll: 0,
         }
     }
 
@@ -84,6 +86,7 @@ impl ReviewState {
 
     fn reveal(&mut self) {
         self.phase = ReviewPhase::Revealed;
+        self.answer_scroll = 0; // reset scroll on new reveal
     }
 
     // appends card_id to the end of the session if it now has due items
@@ -153,6 +156,7 @@ impl ReviewState {
         self.item_idx += 1;
         self.phase = ReviewPhase::Thinking;
         self.item_started_at = Instant::now();
+        self.answer_scroll = 0; // reset scroll on advance
         if let Some(card) = self.session.get(self.card_idx) {
             if self.item_idx >= card.items.len() {
                 self.card_idx += 1;
@@ -784,6 +788,16 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         KeyCode::Char(c @ '1'..='5') if !is_done && phase == Some(ReviewPhase::Revealed) => {
             if let Some(r) = app.review.as_mut() {
                 r.rate(store, c as u8 - b'0')?;
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let Some(rs) = app.review.as_mut() {
+                rs.answer_scroll = rs.answer_scroll.saturating_add(1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some(rs) = app.review.as_mut() {
+                rs.answer_scroll = rs.answer_scroll.saturating_sub(1);
             }
         }
         _ => {}
@@ -1732,20 +1746,30 @@ fn render_review(f: &mut Frame, app: &AppState) {
     };
     f.render_widget(
         Paragraph::new(lines)
-            .block(Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(ans_title))
-            .wrap(Wrap { trim: false }),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(ans_title),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((rs.answer_scroll, 0)),
         content[1],
     );
 
     let footer = if rs.phase == ReviewPhase::Thinking {
         Line::from(vec![
-            Span::styled(" [Space] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Reveal    "),
+            Span::styled(
+                " [Space] ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Reveal   "),
             Span::styled(" [q] ", Style::default().fg(Color::DarkGray)),
             Span::raw("Quit session"),
+            Span::styled("   [↑ /↓ ] ", Style::default().fg(Color::DarkGray)),
+            Span::raw("Scroll"),
         ])
     } else if item.kind == ItemKind::Step {
         // Rate footer for steps: make the chain-reset consequence explicit
