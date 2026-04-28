@@ -10,7 +10,7 @@ use std::time::Instant;
 use chrono::Utc;
 use chrono::DateTime;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -737,6 +737,36 @@ fn event_loop(
 
         if event::poll(std::time::Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                // Ctrl+E on any multiline field opens external editor
+                if key.code == KeyCode::Char('e')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.screen == Screen::AddCard
+                {
+                    if app.add_card.as_ref().map_or(false, |s| s.is_multiline_field()) {
+                        let content = app.add_card.as_ref().and_then(|s| {
+                            match (s.kind, s.focused) {
+                                (AddKind::Simple, 1) => Some(s.simple_question.clone()),
+                                (AddKind::Simple, 2) => Some(s.answer.clone()),
+                                (AddKind::Multi,  1) => Some(s.multi_question.clone()),
+                                (AddKind::Multi,  3) => Some(s.step_buf.clone()),
+                                _ => None,
+                            }
+                        });
+                        if let Some(text) = content {
+                            let edited = open_in_editor(terminal, &text)?;
+                            if let Some(s) = app.add_card.as_mut() {
+                                match (s.kind, s.focused) {
+                                    (AddKind::Simple, 1) => s.simple_question = edited,
+                                    (AddKind::Simple, 2) => s.answer = edited,
+                                    (AddKind::Multi,  1) => s.multi_question = edited,
+                                    (AddKind::Multi,  3) => s.step_buf = edited,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if key.kind != KeyEventKind::Press { continue; }
                 match app.screen {
                     Screen::MainMenu  => on_menu(app, key.code)?,
@@ -2051,7 +2081,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
     let q_scroll = q_lines.saturating_sub(q_visible);
     f.render_widget(
         Paragraph::new(q_text)
-            .block(field_block(" Question ", s.focused == 1))
+            .block(field_block(if s.focused == 1 { " Question  │  [^E] editor " } else { " Question " }, s.focused == 1))
             .wrap(Wrap { trim: false })
             .scroll((q_scroll, 0))
             .style(text_style(s.focused == 1)),
@@ -2065,7 +2095,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
     let a_scroll = a_lines.saturating_sub(a_visible);
     f.render_widget(
         Paragraph::new(a_text)
-            .block(field_block(" Answer ", s.focused == 2))
+            .block(field_block(if s.focused == 2 { " Answer  │  [^E] editor " } else { " Answer " }, s.focused == 2))
             .wrap(Wrap { trim: false })
             .scroll((a_scroll, 0))
             .style(text_style(s.focused == 2)),
@@ -2184,8 +2214,11 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
         v[4],
     );
 
-    // Step answer focused == 3 - scroll to bottom
-    let answer_title = " Step Answer [Enter] newline ";
+    let answer_title = if s.focused == 3 {
+        " Step Answer  [Enter] newline  │  [^E] editor "
+    } else {
+        " Step Answer "
+    };
     let step_text = with_cursor(&s.step_buf, s.focused == 3);
     let step_lines = step_text.lines().count() as u16;
     let step_visible = v[5].height.saturating_sub(2);
@@ -2320,6 +2353,27 @@ fn render_form_hint(f: &mut Frame, error: Option<&str>, area: Rect) {
         ))
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+// suspend the TUI, open content in the default $EDITOR then return the result
+fn open_in_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    content: &str,
+) -> anyhow::Result<String> {
+    // give the terminal back to the OS so the editor gets a clean screen
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let result = edit::edit(content).unwrap_or_else(|_| content.to_string());
+
+    // reclaim the terminal for ratatui
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    let _ = enable_raw_mode();
+    terminal.clear()?; // force a full redraw
+
+    // trim the trailing newline that most editors append on save, since the
+    // user's original content wont have had one
+    let trimmed = result.trim_end_matches('\n').to_string();
+    Ok(if trimmed.is_empty() { content.to_string() } else { trimmed })
 }
 
 fn render_confirm_dialog(f: &mut Frame, msg: &str, size: Rect) {
