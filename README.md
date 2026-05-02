@@ -1,4 +1,4 @@
-## arrow.el
+## Myoso
 *Step-by-step flashcards for the terminal*
 *Built in Rust with [Ratatui](https://ratatui.rs/) and [SQLite](https://sqlite.org/)*
 
@@ -38,6 +38,21 @@ cargo run
 
 ---
 
+## Features
+
+- **Analytics**: Simple statistics of deck/card data, current progress and currently due sessions.
+- **Reversible cards**: Support for making cards reversible, where q->a becomes a->q.
+- **Step-by-step cards**: Cards that require multiple steps towards the answers, where each step is rated individually.
+- **Multi-line support**: Add or edit multiple lines within question and answer textboxes.
+- **Import/Export**: Export a specific deck or all decks into `JSON` format, which can be imported by anyone else.
+- **External Editor Support**: Open any textbox in your default editor (e.g., Neovim, VS Code, Notepad) directly from the TUI. Works seamlessly across all operating systems. Save and close the editor to automatically return to the TUI with your updated text.
+- **Markdown Rendering**: All markdown formatting (e.g., bold, italics, lists) is now rendered during review sessions.
+- **Syntax Highlighting**: Code blocks in markdown are syntax-highlighted for any programming language.
+- **Image preview**: Insert path to images locally into an answer/step (handwritten work or screenshot)
+- **Tag filtering**: Organise decks into 'sub-decks' by adding tags, allowing easy filtering (e.g., vocabulary, grammar)
+
+---
+
 ## Review TUI controls
 
 | Key | Action |
@@ -54,7 +69,7 @@ cargo run
 
 ## Scheduling algorithm
 
-Uses a simplified SM-2 variant. Each **item** (step) is tracked independently:
+Uses a dynamic SM-2 variant where each **item** (step) is tracked independently:
 Ease is clamped to `[1.3, 3.0]`. The first interval is always 1 day.
 
 For **multi-step** cards the session logic is:

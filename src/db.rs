@@ -75,8 +75,7 @@ impl Store {
             ",
             )
             .context("schema migration")?;
-        // Safe migration for existing databases: add show_chain if absent.
-        // SQLite returns "duplicate column name" if it already exists; ignore that.
+        // Safe migration for existing databases, add show_chain and markdown if absent
         let _ = self.conn.execute(
             "ALTER TABLE cards ADD COLUMN show_chain INTEGER NOT NULL DEFAULT 1",
             [],
@@ -97,7 +96,7 @@ impl Store {
                 "default",
                 "What is a closure?",
                 "A function that captures variables from its surrounding lexical scope.",
-                true,
+                true
             )?;
         }
         Ok(())
@@ -130,6 +129,7 @@ impl Store {
         Ok(())
     }
 
+    // steps: (string, string, bool) -> (step name, answer, is_markdown)
     pub fn add_multi_card(&self, deck: &str, question: &str, steps: &[(String, String)], show_chain: bool) -> Result<()> {
         if steps.is_empty() {
             anyhow::bail!("multi-step cards need at least one step");
@@ -640,8 +640,8 @@ impl Store {
                         "INSERT OR REPLACE INTO items
                             (id, card_id, position, kind, prompt, answer, due_at,
                             interval_days, ease, last_reviewed_at,
-                            lapses, review_count, confidence_avg)
-                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                            lapses, review_count, confidence_avg, is_markdown)
+                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                         params![
                             item.id,
                             item.card_id,
@@ -655,7 +655,7 @@ impl Store {
                             item.last_reviewed_at.map(|t| t.to_rfc3339()),
                             item.lapses,
                             item.review_count,
-                            item.confidence_avg,
+                            item.confidence_avg
                         ],
                     )
                     .context("upsert item")?;

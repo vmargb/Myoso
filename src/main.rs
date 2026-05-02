@@ -2,6 +2,7 @@ mod db;
 mod models;
 mod scheduler;
 mod ui;
+mod markdown;
 
 use anyhow::Result;
 use clap::Parser;

@@ -325,6 +325,7 @@ impl AddCardState {
                 self.step_list_state.select(Some(self.steps.len() - 1));
                 self.focused = 3; // Keep the cursor in the step editor for the next entry
             }
+            // resets after commit
             self.step_name_buf.clear();
             self.step_buf.clear();
         } else if let Some(idx) = self.editing_step_idx {
@@ -737,8 +738,10 @@ fn event_loop(
 
         if event::poll(std::time::Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press { continue; }
+
                 // Ctrl+E on any multiline field opens external editor
-                if key.code == KeyCode::Char('e')
+                if key.code == KeyCode::Char('e') // EDITOR
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                     && app.screen == Screen::AddCard
                 {
@@ -767,7 +770,6 @@ fn event_loop(
                     }
                     continue;
                 }
-                if key.kind != KeyEventKind::Press { continue; }
                 match app.screen {
                     Screen::MainMenu  => on_menu(app, key.code)?,
                     Screen::Stats     => on_stats(app, key.code),
@@ -1355,7 +1357,7 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.deck.trim(),
                 s.simple_question.trim(),
                 s.answer.trim(),
-                s.reversible,
+                s.reversible
             )?,
             AddKind::Multi => store.update_multi_card(
                 card_id,
@@ -1372,7 +1374,7 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.deck.trim(),
                 s.simple_question.trim(),
                 s.answer.trim(),
-                s.reversible,
+                s.reversible
             )?,
             AddKind::Multi => store.add_multi_card(
                 s.deck.trim(),
@@ -1760,12 +1762,8 @@ fn render_review(f: &mut Frame, app: &AppState) {
             )));
         }
         ReviewPhase::Revealed => {
-            for l in item.answer.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("  {l}"),
-                    Style::default().fg(Color::Green),
-                )));
-            }
+            let rendered = crate::markdown::render(&item.answer);
+            lines.extend(rendered.lines);
         }
     }
 
@@ -2088,6 +2086,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
         v[3],
     );
 
+    let answer_title = if s.focused == 2 { " Answer  [Enter] newline  │  [^E] editor " } else { " Answer " };
     // answer same scrolling
     let a_text = with_cursor(&s.answer, s.focused == 2);
     let a_lines = a_text.lines().count() as u16;
@@ -2095,7 +2094,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
     let a_scroll = a_lines.saturating_sub(a_visible);
     f.render_widget(
         Paragraph::new(a_text)
-            .block(field_block(if s.focused == 2 { " Answer  │  [^E] editor " } else { " Answer " }, s.focused == 2))
+            .block(field_block(answer_title, s.focused == 2))
             .wrap(Wrap { trim: false })
             .scroll((a_scroll, 0))
             .style(text_style(s.focused == 2)),
