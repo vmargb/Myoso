@@ -206,7 +206,9 @@ struct AddCardState {
     reversible:       bool,
     show_chain:       bool,   // multi only: show preceding step answers during review
     // multi-only, each step is (optional_name, answer)
-    steps:            Vec<(String, String)>,
+    answer_image_path: Option<String>,
+    step_image_path:   Option<String>,
+    steps:            Vec<(String, String, Option<String>)>, // (name, answer, img_path)
     step_name_buf:    String,
     step_buf:         String,
     step_list_state:  ListState,
@@ -231,6 +233,8 @@ impl AddCardState {
             answer:           String::new(),
             reversible:       false,
             show_chain:       true,
+            answer_image_path: None,
+            step_image_path:  None,
             steps:            Vec::new(),
             step_name_buf:    String::new(),
             step_buf:         String::new(),
@@ -313,15 +317,16 @@ impl AddCardState {
     fn commit_step(&mut self) {
         let answer = self.step_buf.trim().to_string();
         let name   = self.step_name_buf.trim().to_string();
+        let img = self.step_image_path.take();
         if !answer.is_empty() {
             if let Some(idx) = self.editing_step_idx {
                 if idx < self.steps.len() {
-                    self.steps[idx] = (name, answer);
+                    self.steps[idx] = (name, answer, img);
                 }
                 self.editing_step_idx = None;
                 self.focused = 5; // Jump back to the list after editing
             } else {
-                self.steps.push((name, answer));
+                self.steps.push((name, answer, img));
                 self.step_list_state.select(Some(self.steps.len() - 1));
                 self.focused = 3; // Keep the cursor in the step editor for the next entry
             }
@@ -355,7 +360,7 @@ impl AddCardState {
                 Err("Answer cannot be empty."),
             AddKind::Multi if self.steps.is_empty() =>
                 Err("Add at least one step (type in the step field, then press the Add step button)."),
-            AddKind::Multi if self.steps.iter().all(|(_, a)| a.trim().is_empty()) =>
+            AddKind::Multi if self.steps.iter().all(|(_, a, _)| a.trim().is_empty()) =>
                 Err("Add at least one step with content."),
             _ => Ok(()),
         }
@@ -375,6 +380,7 @@ impl AddCardState {
                 s.simple_question = card.question.clone();
                 if let Some(item) = items.iter().find(|i| i.kind == ItemKind::Forward) {
                     s.answer = item.answer.clone();
+                    s.answer_image_path = item.image_path.clone();
                 }
             }
             CardKind::Multi => { // handle question & answer for multi kind
@@ -390,7 +396,7 @@ impl AddCardState {
                         // name field starts blank and the user isn't forced to clear it.
                         let auto = format!("Step {}", idx + 1);
                         let name = if i.prompt == auto { String::new() } else { i.prompt.clone() };
-                        (name, i.answer.clone())
+                        (name, i.answer.clone(), i.image_path.clone())
                     })
                     .collect();
                 if !s.steps.is_empty() {
@@ -410,7 +416,7 @@ impl AddCardState {
             .selected()
             .map(|i| i + 1)
             .unwrap_or(self.steps.len());
-        self.steps.insert(insert_at, (String::new(), String::new()));
+        self.steps.insert(insert_at, (String::new(), String::new(), None));
         self.editing_step_idx = Some(insert_at);
         self.step_list_state.select(Some(insert_at));
         self.step_name_buf.clear();
@@ -770,6 +776,31 @@ fn event_loop(
                     }
                     continue;
                 }
+                if key.code == KeyCode::Char('o')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.screen == Screen::AddCard
+                {
+                    if let Some(s) = app.add_card.as_mut() {
+                        let eligible = matches!(
+                            (s.kind, s.focused),
+                            (AddKind::Simple, 2) | (AddKind::Multi, 3)
+                        );
+                        if eligible {
+                            let picked = FileDialog::new()
+                                .add_filter("Images", &["png","jpg","jpeg","gif","webp","bmp","svg"])
+                                .pick_file()
+                                .map(|p| p.to_string_lossy().to_string());
+                            if picked.is_some() {
+                                match (s.kind, s.focused) {
+                                    (AddKind::Simple, 2) => s.answer_image_path = picked,
+                                    (AddKind::Multi,  3) => s.step_image_path   = picked,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 match app.screen {
                     Screen::MainMenu  => on_menu(app, key.code)?,
                     Screen::Stats     => on_stats(app, key.code),
@@ -830,6 +861,16 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         KeyCode::Char('k') | KeyCode::Up => {
             if let Some(rs) = app.review.as_mut() {
                 rs.answer_scroll = rs.answer_scroll.saturating_sub(1);
+            }
+        }
+        KeyCode::Char('o') if phase == Some(ReviewPhase::Revealed) => {
+            if let Some(rs) = app.review.as_ref() {
+                if !rs.is_done() {
+                    let item = &rs.session[rs.card_idx].items[rs.item_idx];
+                    if let Some(path) = &item.image_path {
+                        let _ = open::that(path);
+                    }
+                }
             }
         }
         _ => {}
@@ -962,9 +1003,10 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
             let s = app.add_card.as_mut().unwrap();
             if let Some(idx) = s.step_list_state.selected() {
                 if idx < s.steps.len() {
-                    let (name, answer) = s.steps[idx].clone();
+                    let (name, answer, img ) = s.steps[idx].clone();
                     s.step_name_buf    = name;
                     s.step_buf         = answer;
+                    s.step_image_path  = img;
                     s.editing_step_idx = Some(idx);
                     s.focused          = 2; // jump to Step Name field
                 }
@@ -1357,7 +1399,8 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.deck.trim(),
                 s.simple_question.trim(),
                 s.answer.trim(),
-                s.reversible
+                s.reversible,
+                s.answer_image_path.as_deref()
             )?,
             AddKind::Multi => store.update_multi_card(
                 card_id,
@@ -1374,7 +1417,8 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.deck.trim(),
                 s.simple_question.trim(),
                 s.answer.trim(),
-                s.reversible
+                s.reversible,
+                s.answer_image_path.as_deref()
             )?,
             AddKind::Multi => store.add_multi_card(
                 s.deck.trim(),
@@ -1645,7 +1689,7 @@ fn render_review(f: &mut Frame, app: &AppState) {
         }
     };
     
-    // FIX: Show the overarching question for Multi cards instead of "Step X"
+    // show the overarching question for Multi cards instead of "Step X"
     let display_prompt = if rc.card.kind == CardKind::Multi {
         rc.card.question.as_str()
     } else {
@@ -1762,6 +1806,32 @@ fn render_review(f: &mut Frame, app: &AppState) {
             )));
         }
         ReviewPhase::Revealed => {
+            if item.image_path.is_some() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  Image attached  ",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "press ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        "[o]",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        " to open",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                lines.push(Line::from(""));
+            }
+
             let rendered = crate::markdown::render(&item.answer);
             lines.extend(rendered.lines);
         }
@@ -1769,9 +1839,12 @@ fn render_review(f: &mut Frame, app: &AppState) {
 
     let ans_title = if rs.phase == ReviewPhase::Thinking {
         " Answer (hidden) "
+    } else if item.image_path.is_some() {
+        " Answer • image attached "
     } else {
         " Answer "
     };
+
     f.render_widget(
         Paragraph::new(lines)
             .block(
@@ -1800,8 +1873,7 @@ fn render_review(f: &mut Frame, app: &AppState) {
             Span::raw("Scroll"),
         ])
     } else if item.kind == ItemKind::Step {
-        // Rate footer for steps: make the chain-reset consequence explicit
-        Line::from(vec![
+        let spans = vec![
             Span::styled(" [1] ", Style::default().fg(Color::Red)),
             Span::raw("Again  "),
             Span::styled(" [2] ", Style::default().fg(Color::Yellow)),
@@ -1813,21 +1885,23 @@ fn render_review(f: &mut Frame, app: &AppState) {
             Span::raw("Great  "),
             Span::styled(" [5] ", Style::default().fg(Color::Blue)),
             Span::raw("Easy"),
-        ])
+        ];
+        Line::from(spans)
     } else {
-        Line::from(vec![
-            Span::styled(" [1] ", Style::default().fg(Color::Red)),
-            Span::raw("Again  "),
-            Span::styled(" [2] ", Style::default().fg(Color::Yellow)),
-            Span::raw("Hard  "),
-            Span::styled(" [3] ", Style::default().fg(Color::Green)),
-            Span::raw("Good  "),
-            Span::styled(" [4] ", Style::default().fg(Color::Cyan)),
-            Span::raw("Great  "),
-            Span::styled(" [5] ", Style::default().fg(Color::Blue)),
-            Span::raw("Easy"),
-        ])
-    };
+            let spans = vec![
+                Span::styled(" [1] ", Style::default().fg(Color::Red)),
+                Span::raw("Again  "),
+                Span::styled(" [2] ", Style::default().fg(Color::Yellow)),
+                Span::raw("Hard  "),
+                Span::styled(" [3] ", Style::default().fg(Color::Green)),
+                Span::raw("Good  "),
+                Span::styled(" [4] ", Style::default().fg(Color::Cyan)),
+                Span::raw("Great  "),
+                Span::styled(" [5] ", Style::default().fg(Color::Blue)),
+                Span::raw("Easy"),
+            ];
+            Line::from(spans)
+        };
     f.render_widget(
         Paragraph::new(footer)
             .block(Block::default()
@@ -2086,7 +2160,12 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
         v[3],
     );
 
-    let answer_title = if s.focused == 2 { " Answer  [Enter] newline  │  [^E] editor " } else { " Answer " };
+    let answer_title = match (s.focused == 2, s.answer_image_path.is_some()) {
+        (true,  true)  => " Answer  │  [Ctrl+e] editor  │  [Ctrl+o] change image  [IMG ✓ ] ",
+        (true,  false) => " Answer  │  [Ctrl+e] editor  │  [Ctrl+o] open image ",
+        (false, true)  => " Answer  [IMG ✓ ] ",
+        (false, false) => " Answer ",
+    };
     // answer same scrolling
     let a_text = with_cursor(&s.answer, s.focused == 2);
     let a_lines = a_text.lines().count() as u16;
@@ -2213,10 +2292,11 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
         v[4],
     );
 
-    let answer_title = if s.focused == 3 {
-        " Step Answer  [Enter] newline  │  [^E] editor "
-    } else {
-        " Step Answer "
+    let answer_title = match (s.focused == 3, s.step_image_path.is_some()) {
+        (true,  true)  => " Step Answer  [Enter] newline  │  [Ctrl+e] editor  │  [Ctrl+o] change image  [IMG ✓ ] ",
+        (true,  false) => " Step Answer  [Enter] newline  │  [ctrl+e] editor  │  [Ctrl+o] open image ",
+        (false, true)  => " Step Answer  [IMG ✓ ] ",
+        (false, false) => " Step Answer ",
     };
     let step_text = with_cursor(&s.step_buf, s.focused == 3);
     let step_lines = step_text.lines().count() as u16;
@@ -2243,7 +2323,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
         s.steps
             .iter()
             .enumerate()
-            .map(|(i, (name, answer))| {
+            .map(|(i, (name, answer, _))| {
                 let prefix = if Some(i) == s.editing_step_idx { " ✎ " } else { "  " };
                 let label = if name.trim().is_empty() {
                     format!("{prefix}{}. {}", i + 1, answer)

@@ -80,6 +80,10 @@ impl Store {
             "ALTER TABLE cards ADD COLUMN show_chain INTEGER NOT NULL DEFAULT 1",
             [],
         );
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN image_path TEXT",
+            [],
+        );
         Ok(())
     }
 
@@ -96,7 +100,8 @@ impl Store {
                 "default",
                 "What is a closure?",
                 "A function that captures variables from its surrounding lexical scope.",
-                true
+                true,
+                None
             )?;
         }
         Ok(())
@@ -110,6 +115,7 @@ impl Store {
         question: &str,
         answer: &str,
         reversible: bool,
+        image_path: Option<&str>
     ) -> Result<()> {
         let card_id = new_id();
         let now = Utc::now();
@@ -122,15 +128,15 @@ impl Store {
             )
             .context("insert simple card")?;
 
-        self.insert_item(&card_id, 1, "forward", question, answer, now)?;
+        self.insert_item(&card_id, 1, "forward", question, answer, now, image_path)?;
         if reversible {
-            self.insert_item(&card_id, 2, "reverse", answer, question, now)?;
+            self.insert_item(&card_id, 2, "reverse", answer, question, now, None)?;
         }
         Ok(())
     }
 
     // steps: (string, string, bool) -> (step name, answer, is_markdown)
-    pub fn add_multi_card(&self, deck: &str, question: &str, steps: &[(String, String)], show_chain: bool) -> Result<()> {
+    pub fn add_multi_card(&self, deck: &str, question: &str, steps: &[(String, String, Option<String>)], show_chain: bool) -> Result<()> {
         if steps.is_empty() {
             anyhow::bail!("multi-step cards need at least one step");
         }
@@ -146,14 +152,14 @@ impl Store {
             .context("insert multi card")?;
 
         let mut pos = 0usize;
-        for (name, answer) in steps.iter().filter(|(_, a)| !a.trim().is_empty()) {
+        for (name, answer, img) in steps.iter().filter(|(_, a, _)| !a.trim().is_empty()) {
             pos += 1;
             let label = if name.trim().is_empty() {
                 format!("Step {pos}")
             } else {
                 name.trim().to_string()
             };
-            self.insert_item(&card_id, pos as i32, "step", &label, answer, now)?;
+            self.insert_item(&card_id, pos as i32, "step", &label, answer, now, img.as_deref())?;
         }
         Ok(())
     }
@@ -166,6 +172,7 @@ impl Store {
         prompt: &str,
         answer: &str,
         now: DateTime<Utc>,
+        image_path: Option<&str>
     ) -> Result<()> {
         let id = new_id();
         // set due_at just before now so every new item is immediately reviewable
@@ -173,9 +180,9 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO items(id,card_id,position,kind,prompt,answer,due_at,
-                                   interval_days,ease,lapses,review_count,confidence_avg)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7, 1.0,2.5,0,0,0.0)",
-                params![id, card_id, pos, kind, prompt, answer, due],
+                                   interval_days,ease,lapses,review_count,confidence_avg,image_path)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7, 1.0,2.5,0,0,0.0,?8)",
+                params![id, card_id, pos, kind, prompt, answer, due, image_path],
             )
             .context("insert item")?;
         Ok(())
@@ -288,7 +295,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id,card_id,position,kind,prompt,answer,due_at,
-                        interval_days,ease,last_reviewed_at,lapses,review_count,confidence_avg
+                        interval_days,ease,last_reviewed_at,lapses,review_count,confidence_avg,image_path
                  FROM items WHERE card_id=?1 ORDER BY position ASC",
             )
             .context("prepare load_items")?;
@@ -298,6 +305,7 @@ impl Store {
                 let kind: String = row.get(3)?;
                 let due: String = row.get(6)?;
                 let last: Option<String> = row.get(9)?;
+                let image_path: Option<String> = row.get(13)?;
                 Ok(Item {
                     id: row.get(0)?,
                     card_id: row.get(1)?,
@@ -312,6 +320,7 @@ impl Store {
                     lapses: row.get(10)?,
                     review_count: row.get(11)?,
                     confidence_avg: row.get(12)?,
+                    image_path
                 })
             })
             .context("query items")?;
@@ -355,13 +364,14 @@ impl Store {
             .conn
             .query_row(
                 "SELECT id,card_id,position,kind,prompt,answer,due_at,
-                        interval_days,ease,last_reviewed_at,lapses,review_count,confidence_avg
+                        interval_days,ease,last_reviewed_at,lapses,review_count,confidence_avg,image_path
                  FROM items WHERE id=?1",
                 params![item_id],
                 |row| {
                     let kind: String = row.get(3)?;
                     let due: String = row.get(6)?;
                     let last: Option<String> = row.get(9)?;
+                    let image_path: Option<String> = row.get(13)?;
                     Ok(Item {
                         id: row.get(0)?,
                         card_id: row.get(1)?,
@@ -376,6 +386,7 @@ impl Store {
                         lapses: row.get(10)?,
                         review_count: row.get(11)?,
                         confidence_avg: row.get(12)?,
+                        image_path
                     })
                 },
             )
@@ -640,7 +651,7 @@ impl Store {
                         "INSERT OR REPLACE INTO items
                             (id, card_id, position, kind, prompt, answer, due_at,
                             interval_days, ease, last_reviewed_at,
-                            lapses, review_count, confidence_avg, is_markdown)
+                            lapses, review_count, confidence_avg, image_path)
                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                         params![
                             item.id,
@@ -655,7 +666,8 @@ impl Store {
                             item.last_reviewed_at.map(|t| t.to_rfc3339()),
                             item.lapses,
                             item.review_count,
-                            item.confidence_avg
+                            item.confidence_avg,
+                            item.image_path
                         ],
                     )
                     .context("upsert item")?;
@@ -678,6 +690,7 @@ impl Store {
         question: &str,
         answer: &str,
         reversible: bool,
+        image_path: Option<&str>
     ) -> Result<()> {
         let now = Utc::now();
         let ts  = now.to_rfc3339();
@@ -692,9 +705,9 @@ impl Store {
 
         self.conn
             .execute(
-                "UPDATE items SET prompt=?1, answer=?2
-                 WHERE card_id=?3 AND kind='forward'",
-                params![question, answer, card_id],
+                "UPDATE items SET prompt=?1, answer=?2, image_path=?3
+                 WHERE card_id=?4 AND kind='forward'",
+                params![question, answer, image_path, card_id],
             )
             .context("update forward item")?;
 
@@ -719,7 +732,7 @@ impl Store {
                     .context("update reverse item")?;
             }
             (true, false) => {
-                self.insert_item(card_id, 2, "reverse", answer, question, now)?;
+                self.insert_item(card_id, 2, "reverse", answer, question, now, None)?;
             }
             (false, true) => {
                 self.conn
@@ -743,7 +756,7 @@ impl Store {
         card_id: &str,
         deck: &str,
         question: &str,
-        steps: &[(String, String)],
+        steps: &[(String, String, Option<String>)],
         show_chain: bool,
     ) -> Result<()> {
         let now = Utc::now();
@@ -764,12 +777,12 @@ impl Store {
             )
             .context("count step items")?;
 
-        let valid: Vec<&(String, String)> = steps
+        let valid: Vec<&(String, String, Option<String>)> = steps
             .iter()
-            .filter(|(_, a)| !a.trim().is_empty())
+            .filter(|(_, a, _)| !a.trim().is_empty())
             .collect();
 
-        for (i, (name, answer)) in valid.iter().enumerate() {
+        for (i, (name, answer, img)) in valid.iter().enumerate() {
             let pos = (i + 1) as i32;
             let label = if name.trim().is_empty() {
                 format!("Step {}", i + 1)
@@ -779,13 +792,13 @@ impl Store {
             if (i as i64) < existing_count {
                 self.conn
                     .execute(
-                        "UPDATE items SET prompt=?1, answer=?2
-                         WHERE card_id=?3 AND position=?4 AND kind='step'",
-                        params![label, answer, card_id, pos],
+                        "UPDATE items SET prompt=?1, answer=?2, image_path=?3
+                         WHERE card_id=?4 AND position=?5 AND kind='step'",
+                        params![label, answer, img, card_id, pos],
                     )
                     .context("update step item")?;
             } else {
-                self.insert_item(card_id, pos, "step", &label, answer, now)?;
+                self.insert_item(card_id, pos, "step", &label, answer, now, img.as_deref())?;
             }
         }
 

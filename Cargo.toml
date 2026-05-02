@@ -30,3 +30,5 @@ edit = "0.1"
 # markdown + code blocks support
 pulldown-cmark = "0.12"
 syntect = "5"
+# open image previews
+open = "5"

@@ -104,6 +104,8 @@ pub struct Item {
     pub lapses: i32,
     pub review_count: i32,
     pub confidence_avg: f64,
+    #[serde(default)]
+    pub image_path: Option<String>,
 }
 
 /// A card together with the subset of items that are due (or needed for context).
