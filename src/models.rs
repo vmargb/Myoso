@@ -143,3 +143,23 @@ pub struct ImportSummary {
     pub items_imported: usize,
     pub cards_replaced: usize,  // cards whose ID already existed
 }
+
+// ~~~ Sub-deck ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// deck names use '::' separators: "Math::Calculus::Integrals"
+// no schema changes since the deck column stores the full path as TEXT
+
+/// (0 = top-level, 1 = one sub-level, …)
+pub fn deck_depth(deck: &str) -> usize {
+    deck.split("::").count().saturating_sub(1)
+}
+
+/// ("Math::Calc::Limits" = "Limits")
+pub fn deck_leaf(deck: &str) -> &str {
+    deck.rsplit("::").next().unwrap_or(deck)
+}
+
+/// "Math::Calculus::Integrals" -> Some("Math::Calculus")
+/// "Math"                      -> None
+pub fn deck_parent(deck: &str) -> Option<&str> {
+    deck.rfind("::").map(|i| &deck[..i])
+}

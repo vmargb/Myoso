@@ -49,7 +49,7 @@ cargo run
 - **Markdown Rendering**: All markdown formatting (e.g., bold, italics, lists) is now rendered during review sessions.
 - **Syntax Highlighting**: Code blocks in markdown are syntax-highlighted for any programming language.
 - **Image preview**: Insert path to images locally into an answer/step (handwritten work or screenshot)
-- **Tag filtering**: Organise decks into 'sub-decks' by adding tags, allowing easy filtering (e.g., vocabulary, grammar)
+- **Subdecks**: Organise decks into 'sub-decks', allowing clear separation (e.g., vocabulary, grammar)
 
 ---
 
@@ -58,11 +58,11 @@ cargo run
 | Key | Action |
 |-----|--------|
 | `Space` / `Enter` | Reveal the answer for the current step |
-| `1` | Rate: **Again** - total blank, short reset |
-| `2` | Rate: **Hard** - recalled incorrectly |
-| `3` | Rate: **Good** - recalled correctly but with effort |
-| `4` | Rate: **Great** - recalled correctly & quickly |
-| `5` | Rate: **Easy** - instant/effortless |
+| `1` | **Again** - total blank, short reset |
+| `2` | **Hard** - recalled incorrectly |
+| `3` | **Good** - recalled correctly but with effort |
+| `4` | **Great** - recalled quickly(1-5s) |
+| `5` | **Easy** - instant/effortless |
 | `q` / `Esc` | Quit the session |
 
 ---

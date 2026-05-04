@@ -199,7 +199,7 @@ impl Store {
                         MIN(i.due_at) AS due_at, COUNT(i.id) AS item_count
                  FROM cards c
                  JOIN items i ON i.card_id = c.id
-                 WHERE (?1 = '' OR c.deck = ?1)
+                 WHERE (?1 = '' OR c.deck = ?1 OR c.deck LIKE ?1 || '::%')
                  GROUP BY c.id
                  ORDER BY due_at ASC, c.created_at ASC",
             )
@@ -235,7 +235,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id,kind,deck,question,reversible,show_chain,created_at,updated_at
-                 FROM cards WHERE (?1='' OR deck=?1) ORDER BY created_at ASC",
+                 FROM cards WHERE (?1='' OR deck=?1 OR deck LIKE ?1 || '::%') ORDER BY created_at ASC",
             )
             .context("prepare due_session")?;
 
@@ -484,10 +484,13 @@ impl Store {
         Ok(())
     }
 
-    /// Delete every card (and their items/logs) in a deck.
+    /// Delete every card (and their items/logs) in a deck and all its sub-decks.
     pub fn delete_deck(&self, deck: &str) -> Result<()> {
         self.conn
-            .execute("DELETE FROM cards WHERE deck=?1", params![deck])
+            .execute(
+                "DELETE FROM cards WHERE deck=?1 OR deck LIKE ?1 || '::%'",
+                params![deck],
+            )
             .context("delete deck")?;
         Ok(())
     }

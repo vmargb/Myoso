@@ -560,8 +560,10 @@ impl ExportState {
             self.path = match self.selected_deck() {
                 None    => "export.json".to_string(),
                 Some(d) => {
-                    let slug: String = d.chars()
-                        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    // Replace the :: separator first so Math::Calc -> Math-Calc,
+                    // then sanitise remaining non-alphanumeric chars to underscores
+                    let slug: String = d.replace("::", "-").chars()
+                        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
                         .collect();
                     format!("export_{slug}.json")
                 }
@@ -2516,7 +2518,7 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
                     Style::default().fg(Color::Cyan),
                 );
                 let deck_tag = Span::styled(
-                    format!("{:<14}", c.deck),
+                    format!("{:<20} ", c.deck),
                     Style::default().fg(Color::Yellow),
                 );
                 let q_tag = Span::styled(
@@ -2605,11 +2607,19 @@ fn render_list_decks(f: &mut Frame, app: &mut AppState) {
         ld.decks
             .iter()
             .map(|d| {
+                let depth = crate::models::deck_depth(d);
+                let leaf  = crate::models::deck_leaf(d);
+                // Indent sub-decks: two spaces per level, then a branch glyph.
+                let (indent, glyph, col) = if depth == 0 {
+                    (String::new(), "[D]  ", Color::Yellow)
+                } else {
+                    ("  ".repeat(depth), "╰─  ", Color::Cyan)
+                };
                 ListItem::new(Line::from(vec![
-                    Span::raw("  "),
+                    Span::raw(format!("  {indent}")),
                     Span::styled(
-                        format!("[D]  {}", d),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        format!("{glyph}{leaf}"),
+                        Style::default().fg(col).add_modifier(Modifier::BOLD),
                     ),
                 ]))
             })
@@ -2621,7 +2631,7 @@ fn render_list_decks(f: &mut Frame, app: &mut AppState) {
             .block(Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(format!(" Decks ({deck_count}) ")))
+                .title(format!(" Decks ({deck_count})  [:: = sub-deck] ")))
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
             .highlight_symbol("> "),
         v[0],
@@ -2638,7 +2648,7 @@ fn render_list_decks(f: &mut Frame, app: &mut AppState) {
     );
 
     if ld.confirm_delete {
-        render_confirm_dialog(f, "  Delete this deck and ALL its cards?", size);
+        render_confirm_dialog(f, "  Delete this deck, all sub-decks, and ALL their cards?", size);
     }
 }
 
