@@ -28,9 +28,41 @@ Standard flashcard *can* be used in this way, but end up adding too much mental 
 
 ## Installation
 
-If compiling from source, install Rust with your package-manager or from [rustup.rs](https://rustup.rs)
+### Quick install (recommended)
 
-```bash
+You can install the latest release with a single command:
+
+#### Linux / macOS
+```sh
+curl -sSf https://raw.githubusercontent.com/vmargb/Myoso/main/install.sh | sh
+```
+
+#### Windows
+```powershell
+irm https://raw.githubusercontent.com/vmargb/Myoso/main/install.ps1 | iex
+```
+
+After installation, run:
+```sh
+myoso
+```
+
+## Updating
+
+To update to the latest version:
+```sh
+myoso update
+```
+
+Check your current version with:
+```sh
+myoso --version
+```
+
+## Building from source (optional)
+If you want to compile it manually, install Rust from [rustup.rs](https://rustup.rs) (or with your package-manager) then:
+
+```sh
 git clone https://github.com/vmargb/Myoso.git
 cd myoso
 cargo run
