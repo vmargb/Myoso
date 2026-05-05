@@ -70,6 +70,16 @@ cargo run
 
 ---
 
+## Daily cards
+
+Spaced-repetition isn't everything, some cards require more attention than others,
+like the most essential cards in your upcoming exam.
+You can mark new cards as daily or move existing SRS cards into your dailies to have them
+shown in every review session once per day, bypassing any scheduling applied to them.
+Once the demand is gone(e.g. after the exam), you can move those cards back into SRS.
+
+---
+
 ## Features
 
 - **Analytics**: Simple statistics of deck/card data, current progress and currently due sessions.
@@ -85,28 +95,21 @@ cargo run
 
 ---
 
-## Review TUI controls
-
-| Key | Action |
-|-----|--------|
-| `Space` / `Enter` | Reveal the answer for the current step |
-| `1` | **Again** - total blank, short reset |
-| `2` | **Hard** - recalled incorrectly |
-| `3` | **Good** - recalled correctly but with effort |
-| `4` | **Great** - recalled quickly(1-5s) |
-| `5` | **Easy** - instant/effortless |
-| `q` / `Esc` | Quit the session |
-
----
 
 ## Scheduling algorithm
 
 Uses a dynamic SM-2 variant where each **item** (step) is tracked independently:
-Ease is clamped to `[1.3, 3.0]`. The first interval is always 1 day.
+
+| Key | Action                               |
+|-----|--------------------------------------|
+| `1` | **Again** - total blank, short reset |
+| `2` | **Hard** - recalled incorrectly |
+| `3` | **Good** - recalled correctly but with effort |
+| `4` | **Great** - recalled quickly(under 5s) |
+| `5` | **Instant** - instant/effortless (use rarely) |
 
 For **multi-step** cards the session logic is:
 - Find the earliest-due step (by position).
 - Include **all preceding steps** plus that step in the session.
-- This forces you to rebuild the full chain from step 1 every time, not just
-  practise the due step in isolation.
-
+This forces you to rebuild the full chain from step 1 every time, not just
+practise the due step in isolation.

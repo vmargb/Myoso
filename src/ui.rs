@@ -221,6 +221,8 @@ struct AddCardState {
     deck_list_idx:    Option<usize>,
     // review mode
     review_mode:      ReviewMode,
+    // set when launched from inside a review session so save returns to Review
+    editing_from_review: bool,
 }
 
 impl AddCardState {
@@ -247,6 +249,7 @@ impl AddCardState {
             decks,
             deck_list_idx:    None,
             review_mode:      ReviewMode::SpacedRepetition,
+            editing_from_review: false,
         }
     }
 
@@ -885,6 +888,20 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 }
             }
         }
+        KeyCode::Char('e') if !is_done => {
+            let card_id = app.review.as_ref()
+                .and_then(|rs| rs.session.get(rs.card_idx))
+                .map(|rc| rc.card.id.clone());
+            if let Some(id) = card_id {
+                let card  = app.store.load_card(&id)?;
+                let items = app.store.load_items(&id)?;
+                let decks = app.store.list_decks().unwrap_or_default();
+                let mut edit_state = AddCardState::for_edit(&card, &items, decks);
+                edit_state.editing_from_review = true;
+                app.add_card = Some(edit_state);
+                app.go_to(Screen::AddCard);
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -929,7 +946,14 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
         // Esc: go back to PickType when creating, go_back when editing
         KeyCode::Esc => {
             if is_editing {
-                app.go_back();
+                let from_review = app.add_card.as_ref()
+                    .map_or(false, |s| s.editing_from_review);
+                app.add_card = None;
+                if from_review {
+                    app.screen = Screen::Review;
+                } else {
+                    app.go_back();
+                }
             } else {
                 let s = app.add_card.as_mut().unwrap();
                 s.phase   = AddPhase::PickType;
@@ -1077,20 +1101,41 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                         "✓ Card saved!".into()
                     });
                     if is_edit {
+                        let editing_from_review = app.add_card.as_ref()
+                            .map_or(false, |s| s.editing_from_review);
+                        let edited_card_id = app.add_card.as_ref()
+                            .and_then(|s| s.editing_card_id.clone());
                         app.add_card = None;
-                        app.go_back();
-                        if app.screen == Screen::ListCards {
-                            let deck = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
-                            let sel  = app.list_cards.as_ref()
-                                .and_then(|lc| lc.list_state.selected());
-                            if let Ok(cards) = app.store.list_cards(deck.as_deref()) {
-                                let mut new_lc = ListCardsState::new(cards, deck);
-                                if let Some(i) = sel {
-                                    new_lc.list_state.select(Some(
-                                        i.min(new_lc.cards.len().saturating_sub(1))
-                                    ));
+
+                        if editing_from_review {
+                            // return to the review session and patch the live card
+                            app.screen = Screen::Review;
+                            if let (Some(rs), Some(id)) = (app.review.as_mut(), edited_card_id) {
+                                // reload the card from DB and update whichever slot in
+                                // the session matches, so review_mode are current.
+                                if let Ok(fresh_card) = app.store.load_card(&id) {
+                                    for rc in rs.session.iter_mut() {
+                                        if rc.card.id == id {
+                                            rc.card = fresh_card.clone();
+                                        }
+                                    }
                                 }
-                                app.list_cards = Some(new_lc);
+                            }
+                        } else {
+                            app.go_back();
+                            if app.screen == Screen::ListCards {
+                                let deck = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
+                                let sel  = app.list_cards.as_ref()
+                                    .and_then(|lc| lc.list_state.selected());
+                                if let Ok(cards) = app.store.list_cards(deck.as_deref()) {
+                                    let mut new_lc = ListCardsState::new(cards, deck);
+                                    if let Some(i) = sel {
+                                        new_lc.list_state.select(Some(
+                                            i.min(new_lc.cards.len().saturating_sub(1))
+                                        ));
+                                    }
+                                    app.list_cards = Some(new_lc);
+                                }
                             }
                         }
                     } else {
@@ -1967,6 +2012,8 @@ fn render_review(f: &mut Frame, app: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("Reveal   "),
+            Span::styled(" [e] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw("Edit   "),
             Span::styled(" [q] ", Style::default().fg(Color::DarkGray)),
             Span::raw("Quit session"),
             Span::styled("   [↑ /↓ ] ", Style::default().fg(Color::DarkGray)),
@@ -1984,7 +2031,9 @@ fn render_review(f: &mut Frame, app: &AppState) {
             Span::styled(" [4] ", Style::default().fg(Color::Cyan)),
             Span::raw("Great  "),
             Span::styled(" [5] ", Style::default().fg(Color::Blue)),
-            Span::raw("Easy"),
+            Span::raw("Easy  "),
+            Span::styled(" [e] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw("Edit"),
         ];
         Line::from(spans)
     } else {
@@ -1998,7 +2047,9 @@ fn render_review(f: &mut Frame, app: &AppState) {
                 Span::styled(" [4] ", Style::default().fg(Color::Cyan)),
                 Span::raw("Great  "),
                 Span::styled(" [5] ", Style::default().fg(Color::Blue)),
-                Span::raw("Easy"),
+                Span::raw("Easy  "),
+                Span::styled(" [e] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("Edit"),
             ];
             Line::from(spans)
         };
