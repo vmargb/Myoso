@@ -25,7 +25,7 @@ use ratatui::{
 };
 
 use crate::db::Store;
-use crate::models::{Card, CardKind, CardSummary, Item, ItemKind, ReviewCard, Stats};
+use crate::models::{Card, CardKind, CardSummary, Item, ItemKind, ReviewCard, ReviewMode, Stats};
 use rfd::FileDialog;
 
 // ~~~ Screens ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -219,6 +219,8 @@ struct AddCardState {
     // deck suggestions
     decks:            Vec<String>,
     deck_list_idx:    Option<usize>,
+    // review mode
+    review_mode:      ReviewMode,
 }
 
 impl AddCardState {
@@ -244,6 +246,7 @@ impl AddCardState {
             error:            None,
             decks,
             deck_list_idx:    None,
+            review_mode:      ReviewMode::SpacedRepetition,
         }
     }
 
@@ -263,12 +266,12 @@ impl AddCardState {
     }
 
     /// Field layout
-    ///   Simple: deck(0)  question(1)  answer(2)         reversible(3)  [Save](4)
-    ///   Multi:  deck(0)  question(1)  step_name(2)  step_answer(3)  [Add step](4)  steps_list(5)  show_chain(6)  [Save](7)
+    ///   Simple: deck(0)  question(1)  answer(2)  reversible(3)  daily(4)  [Save](5)
+    ///   Multi:  deck(0)  question(1)  step_name(2)  step_answer(3)  [Add step](4)  steps_list(5)  show_chain(6)  daily(7)  [Save](8)
     fn field_count(&self) -> usize {
         match self.kind {
-            AddKind::Simple => 5,
-            AddKind::Multi  => 8,
+            AddKind::Simple => 6,
+            AddKind::Multi  => 9,
         }
     }
 
@@ -281,8 +284,14 @@ impl AddCardState {
         self.focused = if self.focused == 0 { n - 1 } else { self.focused - 1 };
     }
 
-    fn is_save(&self)       -> bool { self.focused == self.field_count() - 1 }
-    fn is_reversible(&self) -> bool { self.kind == AddKind::Simple && self.focused == 3 }
+    fn is_save(&self)         -> bool { self.focused == self.field_count() - 1 }
+    fn is_reversible(&self)   -> bool { self.kind == AddKind::Simple && self.focused == 3 }
+    fn is_daily_toggle(&self) -> bool {
+        match self.kind {
+            AddKind::Simple => self.focused == 4,
+            AddKind::Multi  => self.focused == 7,
+        }
+    }
     fn is_step_name(&self)  -> bool { self.kind == AddKind::Multi  && self.focused == 2 }
     fn is_add_step_button(&self) -> bool { self.kind == AddKind::Multi && self.focused == 4 }
     fn is_steps_list(&self) -> bool { self.kind == AddKind::Multi  && self.focused == 5 }
@@ -374,6 +383,7 @@ impl AddCardState {
         s.phase    = AddPhase::FillForm;
         s.deck     = card.deck.clone();
         s.reversible = card.reversible;
+        s.review_mode = card.review_mode.clone();
         match card.kind {
             CardKind::Simple => { // handle question & answer for simple kind
                 s.kind = AddKind::Simple;
@@ -894,6 +904,7 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
     let sugg_count    = app.add_card.as_ref().unwrap().filtered_decks().len();
     let is_editing    = app.add_card.as_ref().unwrap().editing_card_id.is_some();
     let is_show_chain = app.add_card.as_ref().unwrap().is_show_chain();
+    let is_daily      = app.add_card.as_ref().unwrap().is_daily_toggle();
 
     // ~~ Pick-type phase ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if phase == AddPhase::PickType {
@@ -1000,6 +1011,15 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
             s.show_chain = !s.show_chain;
         }
 
+        KeyCode::Char(' ') if is_daily => {
+            let s = app.add_card.as_mut().unwrap();
+            s.review_mode = if s.review_mode.is_daily() {
+                ReviewMode::SpacedRepetition
+            } else {
+                ReviewMode::Daily
+            };
+        }
+
         // === Edit selected step (Enter on steps list) ===
         KeyCode::Enter if is_steps_list => {
             let s = app.add_card.as_mut().unwrap();
@@ -1102,7 +1122,7 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
             s.pop_char();
         }
 
-        KeyCode::Char(c) if !is_rev && !is_show_chain && !is_save => {
+        KeyCode::Char(c) if !is_rev && !is_show_chain && !is_daily && !is_save => {
             let s = app.add_card.as_mut().unwrap();
             if s.focused == 0 { s.deck_list_idx = None; }
             s.error = None;
@@ -1157,6 +1177,32 @@ fn on_list_cards(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 let decks = app.store.list_decks().unwrap_or_default();
                 app.add_card = Some(AddCardState::for_edit(&card, &items, decks));
                 app.go_to(Screen::AddCard);
+            }
+        }
+        KeyCode::Char('m') => {
+            let (card_id, current_mode) = app.list_cards.as_ref()
+                .and_then(|lc| lc.list_state.selected().and_then(|i| lc.cards.get(i)))
+                .map(|c| (c.card_id.clone(), c.review_mode.clone()))
+                .unzip();
+            if let (Some(id), Some(mode)) = (card_id, current_mode) {
+                let new_mode = if mode.is_daily() {
+                    ReviewMode::SpacedRepetition
+                } else {
+                    ReviewMode::Daily
+                };
+                app.store.set_card_mode(&id, &new_mode)?;
+                let deck  = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
+                let sel   = app.list_cards.as_ref().and_then(|lc| lc.list_state.selected());
+                let cards = app.store.list_cards(deck.as_deref())?;
+                let mut new_lc = ListCardsState::new(cards, deck);
+                if let Some(i) = sel {
+                    new_lc.list_state.select(Some(i.min(new_lc.cards.len().saturating_sub(1))));
+                }
+                app.list_cards = Some(new_lc);
+                app.flash = Some(format!(
+                    "✓ Switched to {}",
+                    if new_mode.is_daily() { "Daily" } else { "Spaced Repetition" }
+                ));
             }
         }
         _ => {}
@@ -1215,6 +1261,27 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 let cards = app.store.list_cards(Some(&deck))?;
                 app.list_cards = Some(ListCardsState::new(cards, Some(deck)));
                 app.go_to(Screen::ListCards);
+            }
+        }
+        // [M]: toggle all cards in the selected deck between Daily and SR
+        KeyCode::Char('M') => {
+            let deck = app.list_decks.as_ref()
+                .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
+            if let Some(deck) = deck {
+                // Check the current majority mode for this deck
+                let cards = app.store.list_cards(Some(&deck))?;
+                let daily_count = cards.iter().filter(|c| c.review_mode.is_daily()).count();
+                let new_mode = if daily_count * 2 >= cards.len() {
+                    ReviewMode::SpacedRepetition
+                } else {
+                    ReviewMode::Daily
+                };
+                app.store.set_deck_mode(&deck, &new_mode)?;
+                app.flash = Some(format!(
+                    "✓ Deck '{}' → {}",
+                    deck,
+                    if new_mode.is_daily() { "Daily" } else { "Spaced Repetition" }
+                ));
             }
         }
         _ => {}
@@ -1402,7 +1469,8 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.simple_question.trim(),
                 s.answer.trim(),
                 s.reversible,
-                s.answer_image_path.as_deref()
+                s.answer_image_path.as_deref(),
+                &s.review_mode,
             )?,
             AddKind::Multi => store.update_multi_card(
                 card_id,
@@ -1410,6 +1478,7 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.multi_question.trim(),
                 &s.steps,
                 s.show_chain,
+                &s.review_mode,
             )?,
         }
     } else {
@@ -1420,13 +1489,15 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.simple_question.trim(),
                 s.answer.trim(),
                 s.reversible,
-                s.answer_image_path.as_deref()
+                s.answer_image_path.as_deref(),
+                &s.review_mode,
             )?,
             AddKind::Multi => store.add_multi_card(
                 s.deck.trim(),
                 s.multi_question.trim(),
                 &s.steps,
                 s.show_chain,
+                &s.review_mode,
             )?,
         }
     }
@@ -1588,7 +1659,7 @@ fn render_menu(f: &mut Frame, app: &mut AppState) {
 
 fn render_stats(f: &mut Frame, app: &AppState) {
     let size = f.area();
-    let area = centered_rect(50, 10, size);
+    let area = centered_rect(50, 14, size);
     if let Some(ref st) = app.stats {
         let body = vec![
             Line::from(vec![
@@ -1602,7 +1673,7 @@ fn render_stats(f: &mut Frame, app: &AppState) {
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
-                Span::raw("  Due now     : "),
+                Span::raw("  SR due now  : "),
                 Span::styled(st.due_items.to_string(),
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             ]),
@@ -1610,6 +1681,25 @@ fn render_stats(f: &mut Frame, app: &AppState) {
                 Span::raw("  Reviews log : "),
                 Span::styled(st.review_logs.to_string(),
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  Daily cards : "),
+                Span::styled(
+                    st.daily_cards.to_string(),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("  Daily due   : "),
+                Span::styled(
+                    format!("{}/{}", st.daily_due, st.daily_cards),
+                    if st.daily_due > 0 {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -1677,18 +1767,26 @@ fn render_review(f: &mut Frame, app: &AppState) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(v[1]);
 
+    let daily_prefix = if rc.card.review_mode.is_daily() { "★ DAILY  " } else { "" };
     let prompt_label = if rc.card.kind == CardKind::Multi {
         format!(
-            " {} | multi | step {} of {} ",
+            " {}{} | multi | step {} of {} ",
+            daily_prefix,
             rc.card.deck,
             rs.item_idx + 1,
             rc.items.len(),
         )
     } else {
         match item.kind {
-            ItemKind::Reverse => format!(" {} | {} | A->Q ", rc.card.deck, rc.card.kind),
-            _                 => format!(" {} | {} ", rc.card.deck, rc.card.kind),
+            ItemKind::Reverse => format!(" {}{} | {} | A->Q ", daily_prefix, rc.card.deck, rc.card.kind),
+            _                 => format!(" {}{} | {} ", daily_prefix, rc.card.deck, rc.card.kind),
         }
+    };
+
+    let prompt_title_style = if rc.card.review_mode.is_daily() {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
     };
     
     // show the overarching question for Multi cards instead of "Step X"
@@ -1704,7 +1802,7 @@ fn render_review(f: &mut Frame, app: &AppState) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .title(prompt_label)
-                .title_style(Style::default().fg(Color::DarkGray)))
+                .title_style(prompt_title_style))
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         content[0],
@@ -2015,7 +2113,7 @@ fn render_add_card(f: &mut Frame, app: &mut AppState) {
     let is_editing      = app.add_card.as_ref().unwrap().editing_card_id.is_some();
 
     match phase {
-        // Never show PickType when editing — the kind is already fixed.
+        // Never show PickType when editing the kind is already fixed.
         AddPhase::PickType if !is_editing => render_pick_type(f, app.add_card.as_ref().unwrap(), size),
         _ => match kind {
             AddKind::Simple => render_simple_form(f, app.add_card.as_ref().unwrap(), size),
@@ -2093,7 +2191,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
         (filtered.len() as u16 + 2).min(6)
     } else { 0 };
 
-    let total_h = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + 1; // 3 visible lines
+    let total_h = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + 3 + 3 + 1; // added daily toggle
     let area = centered_rect(72, total_h, size);
     let v = Layout::default()
         .direction(Direction::Vertical)
@@ -2104,6 +2202,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
             Constraint::Length(5),       // question
             Constraint::Length(5),       // answer
             Constraint::Length(3),       // reversible
+            Constraint::Length(3),       // daily toggle
             Constraint::Length(3),       // save button
             Constraint::Min(1),          // error / help
         ])
@@ -2200,8 +2299,9 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
         v[5],
     );
 
-    render_save_btn(f, s.focused == 4, v[6]);
-    render_form_hint(f, s.error.as_deref(), v[7]);
+    render_daily_toggle(f, &s.review_mode, s.focused == 4, v[6]);
+    render_save_btn(f, s.focused == 5, v[7]);
+    render_form_hint(f, s.error.as_deref(), v[8]);
 }
 
 fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
@@ -2212,8 +2312,8 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
     } else { 0 };
 
     let steps_h = 6;
-    // 3 visible lines in question/step answer
-    let total_h = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + steps_h + 3 + 3 + 3 + 1;
+    // 3 visible lines in question/step answer; added daily toggle
+    let total_h = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + steps_h + 3 + 3 + 3 + 3 + 1;
 
     let area = centered_rect(72, total_h, size);
     let v = Layout::default()
@@ -2228,7 +2328,8 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
             Constraint::Length(3),       // add step button  (focused == 4)
             Constraint::Length(steps_h), // steps list       (focused == 5)
             Constraint::Length(3),       // show_chain toggle (focused == 6)
-            Constraint::Length(3),       // save button      (focused == 7)
+            Constraint::Length(3),       // daily toggle     (focused == 7)
+            Constraint::Length(3),       // save button      (focused == 8)
             Constraint::Min(1),          // error / help
         ])
         .split(area);
@@ -2380,8 +2481,29 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
         v[8],
     );
 
-    render_save_btn(f, s.focused == 7, v[9]);
-    render_form_hint(f, s.error.as_deref(), v[10]);
+    render_daily_toggle(f, &s.review_mode, s.focused == 7, v[9]);
+    render_save_btn(f, s.focused == 8, v[10]);
+    render_form_hint(f, s.error.as_deref(), v[11]);
+}
+
+fn render_daily_toggle(f: &mut Frame, mode: &ReviewMode, focused: bool, area: Rect) {
+    let (symbol, label, color) = if mode.is_daily() {
+        ("  ★  ", "Daily: reviewed every day (no spaced repetition)", Color::Yellow)
+    } else {
+        ("  ☆  ", "Spaced Repetition: scheduled automatically", Color::DarkGray)
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!("{symbol}{label}"),
+            if focused {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            },
+        ))
+        .block(field_block(" Review Mode  [Space to toggle] ", focused)),
+        area,
+    );
 }
 
 fn render_add_step_btn(f: &mut Frame, focused: bool, editing: bool, area: Rect) {
@@ -2508,8 +2630,15 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
         lc.cards
             .iter()
             .map(|c| {
-                let due_tag = if c.due_at <= now {
+                let daily_tag = if c.review_mode.is_daily() {
+                    Span::styled("★ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::raw("  ")
+                };
+                let due_tag = if c.due_at <= now && !c.review_mode.is_daily() {
                     Span::styled("DUE ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                } else if c.review_mode.is_daily() {
+                    Span::styled("DAY ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                 } else {
                     Span::styled("    ", Style::default())
                 };
@@ -2543,6 +2672,7 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw(" "),
+                    daily_tag,
                     due_tag,
                     kind_tag,
                     deck_tag,
@@ -2573,7 +2703,7 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            " [j/k] navigate  |  [e] edit card  |  [d] delete card  |  [Esc] back",
+            " [j/k] navigate  |  [e] edit card  |  [m] toggle daily/SR  |  [d] delete card  |  [Esc] back",
             Style::default().fg(Color::DarkGray),
         ))
         .alignment(Alignment::Center),
@@ -2640,7 +2770,7 @@ fn render_list_decks(f: &mut Frame, app: &mut AppState) {
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            " [j/k] navigate  |  [Enter/r] review  |  [l] list cards  |  [d] delete deck  |  [Esc] back",
+            " [j/k] navigate  |  [Enter/r] review  |  [l] list cards  |  [M] toggle daily/SR  |  [d] delete deck  |  [Esc] back",
             Style::default().fg(Color::DarkGray),
         ))
         .alignment(Alignment::Center),

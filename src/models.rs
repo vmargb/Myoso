@@ -71,6 +71,42 @@ impl FromStr for ItemKind {
     }
 }
 
+// ~~~ Review mode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewMode {
+    #[default]
+    SpacedRepetition,
+    Daily,
+}
+
+impl ReviewMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewMode::SpacedRepetition => "spaced_repetition",
+            ReviewMode::Daily            => "daily",
+        }
+    }
+    pub fn is_daily(&self) -> bool { *self == ReviewMode::Daily }
+}
+
+impl fmt::Display for ReviewMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for ReviewMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "daily" => Ok(ReviewMode::Daily),
+            _       => Ok(ReviewMode::SpacedRepetition), // graceful fallback
+        }
+    }
+}
+
 // ~~~ Core structs ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +120,8 @@ pub struct Card {
     pub show_chain: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub review_mode: ReviewMode,
 }
 
 fn default_show_chain() -> bool { true }
@@ -126,6 +164,7 @@ pub struct CardSummary {
     pub reversible: bool,
     pub item_count: i32,
     pub due_at: DateTime<Utc>,
+    pub review_mode: ReviewMode,
 }
 
 /// Aggregate counts for the `stats` command.
@@ -135,6 +174,8 @@ pub struct Stats {
     pub items: i64,
     pub due_items: i64,
     pub review_logs: i64,
+    pub daily_cards: i64,
+    pub daily_due: i64,
 }
 
 #[derive(Debug, Default)]

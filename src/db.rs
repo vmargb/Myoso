@@ -39,6 +39,7 @@ impl Store {
                 question    TEXT NOT NULL,
                 reversible  INTEGER NOT NULL DEFAULT 0,
                 show_chain  INTEGER NOT NULL DEFAULT 1,
+                review_mode TEXT NOT NULL DEFAULT 'spaced_repetition',
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
@@ -81,6 +82,10 @@ impl Store {
             [],
         );
         let _ = self.conn.execute(
+            "ALTER TABLE cards ADD COLUMN review_mode TEXT NOT NULL DEFAULT 'spaced_repetition'",
+            [],
+        );
+        let _ = self.conn.execute(
             "ALTER TABLE items ADD COLUMN image_path TEXT",
             [],
         );
@@ -101,7 +106,8 @@ impl Store {
                 "What is a closure?",
                 "A function that captures variables from its surrounding lexical scope.",
                 true,
-                None
+                None,
+                &crate::models::ReviewMode::SpacedRepetition,
             )?;
         }
         Ok(())
@@ -115,16 +121,17 @@ impl Store {
         question: &str,
         answer: &str,
         reversible: bool,
-        image_path: Option<&str>
+        image_path: Option<&str>,
+        review_mode: &crate::models::ReviewMode,
     ) -> Result<()> {
         let card_id = new_id();
         let now = Utc::now();
         let ts = now.to_rfc3339();
         self.conn
             .execute(
-                "INSERT INTO cards(id,deck,kind,question,reversible,created_at,updated_at)
-                 VALUES(?1,?2,'simple',?3,?4,?5,?6)",
-                params![card_id, deck, question, reversible as i32, ts, ts],
+                "INSERT INTO cards(id,deck,kind,question,reversible,review_mode,created_at,updated_at)
+                 VALUES(?1,?2,'simple',?3,?4,?5,?6,?7)",
+                params![card_id, deck, question, reversible as i32, review_mode.as_str(), ts, ts],
             )
             .context("insert simple card")?;
 
@@ -136,7 +143,7 @@ impl Store {
     }
 
     // steps: (string, string, bool) -> (step name, answer, is_markdown)
-    pub fn add_multi_card(&self, deck: &str, question: &str, steps: &[(String, String, Option<String>)], show_chain: bool) -> Result<()> {
+    pub fn add_multi_card(&self, deck: &str, question: &str, steps: &[(String, String, Option<String>)], show_chain: bool, review_mode: &crate::models::ReviewMode) -> Result<()> {
         if steps.is_empty() {
             anyhow::bail!("multi-step cards need at least one step");
         }
@@ -145,9 +152,9 @@ impl Store {
         let ts = now.to_rfc3339();
         self.conn
             .execute(
-                "INSERT INTO cards(id,deck,kind,question,reversible,show_chain,created_at,updated_at)
-                 VALUES(?1,?2,'multi',?3,0,?4,?5,?6)",
-                params![card_id, deck, question, show_chain as i32, ts, ts],
+                "INSERT INTO cards(id,deck,kind,question,reversible,show_chain,review_mode,created_at,updated_at)
+                 VALUES(?1,?2,'multi',?3,0,?4,?5,?6,?7)",
+                params![card_id, deck, question, show_chain as i32, review_mode.as_str(), ts, ts],
             )
             .context("insert multi card")?;
 
@@ -196,7 +203,8 @@ impl Store {
             .conn
             .prepare(
                 "SELECT c.id, c.kind, c.deck, c.question, c.reversible,
-                        MIN(i.due_at) AS due_at, COUNT(i.id) AS item_count
+                        MIN(i.due_at) AS due_at, COUNT(i.id) AS item_count,
+                        c.review_mode
                  FROM cards c
                  JOIN items i ON i.card_id = c.id
                  WHERE (?1 = '' OR c.deck = ?1 OR c.deck LIKE ?1 || '::%')
@@ -210,6 +218,7 @@ impl Store {
                 let kind: String = row.get(1)?;
                 let rev: i32 = row.get(4)?;
                 let due: String = row.get(5)?;
+                let rm: String  = row.get(7)?;
                 Ok(CardSummary {
                     card_id: row.get(0)?,
                     kind: kind.parse().unwrap_or(CardKind::Simple),
@@ -218,6 +227,7 @@ impl Store {
                     reversible: rev != 0,
                     item_count: row.get(6)?,
                     due_at: due.parse().unwrap_or_else(|_| Utc::now()),
+                    review_mode: rm.parse().unwrap_or_default(),
                 })
             })
             .context("query list_cards")?;
@@ -229,50 +239,77 @@ impl Store {
     // load all cards that have at least one due item and build a review session
     pub fn due_session(&self, deck: Option<&str>) -> Result<Vec<ReviewCard>> {
         let filter = deck.unwrap_or("");
-        let now = Utc::now();
+        let now    = Utc::now();
+        let today  = now.format("%Y-%m-%d").to_string();
 
+        let all_cards = self.load_cards_for_session(filter)?;
+
+        let (daily_cards, sr_cards): (Vec<Card>, Vec<Card>) = all_cards
+            .into_iter()
+            .partition(|c| c.review_mode.is_daily());
+
+        let mut session = Vec::new();
+
+        // ── Daily cards first ─────────────────────────────────────────────
+        // Include ALL items; skip card only if every item was reviewed today.
+        for card in daily_cards {
+            let items = self.load_items(&card.id)?;
+            let needs_review = items.iter().any(|it| {
+                it.last_reviewed_at
+                    .map(|t| t.format("%Y-%m-%d").to_string() != today)
+                    .unwrap_or(true)
+            });
+            if needs_review {
+                session.push(ReviewCard { card, items });
+            }
+        }
+
+        // ── Spaced-repetition cards ───────────────────────────────────────
+        for card in sr_cards {
+            let items    = self.load_items(&card.id)?;
+            let selected = due_items_for_card(&card.kind, &items, now);
+            if !selected.is_empty() {
+                session.push(ReviewCard { card, items: selected });
+            }
+        }
+
+        Ok(session)
+    }
+
+    /// Load all cards in `filter` scope, ordered by creation time.
+    fn load_cards_for_session(&self, filter: &str) -> Result<Vec<Card>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id,kind,deck,question,reversible,show_chain,created_at,updated_at
+                "SELECT id,kind,deck,question,reversible,show_chain,created_at,updated_at,review_mode
                  FROM cards WHERE (?1='' OR deck=?1 OR deck LIKE ?1 || '::%') ORDER BY created_at ASC",
             )
-            .context("prepare due_session")?;
+            .context("prepare load_cards_for_session")?;
 
-        let cards: Vec<Card> = stmt
+        let rows = stmt
             .query_map(params![filter], |row| {
                 let kind: String = row.get(1)?;
-                let rev: i32  = row.get(4)?;
-                let sc: i32   = row.get(5)?;
-                let ca: String = row.get(6)?;
-                let ua: String = row.get(7)?;
+                let rev: i32     = row.get(4)?;
+                let sc: i32      = row.get(5)?;
+                let ca: String   = row.get(6)?;
+                let ua: String   = row.get(7)?;
+                let rm: String   = row.get(8)?;
                 Ok(Card {
-                    id: row.get(0)?,
-                    kind: kind.parse().unwrap_or(CardKind::Simple),
-                    deck: row.get(2)?,
-                    question: row.get(3)?,
-                    reversible: rev != 0,
-                    show_chain: sc != 0,
-                    created_at: ca.parse().unwrap_or_else(|_| Utc::now()),
-                    updated_at: ua.parse().unwrap_or_else(|_| Utc::now()),
+                    id:          row.get(0)?,
+                    kind:        kind.parse().unwrap_or(CardKind::Simple),
+                    deck:        row.get(2)?,
+                    question:    row.get(3)?,
+                    reversible:  rev != 0,
+                    show_chain:  sc  != 0,
+                    created_at:  ca.parse().unwrap_or_else(|_| Utc::now()),
+                    updated_at:  ua.parse().unwrap_or_else(|_| Utc::now()),
+                    review_mode: rm.parse().unwrap_or_default(),
                 })
             })
-            .context("query cards")?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("collect cards")?;
+            .context("query cards for session")?;
 
-        let mut session = Vec::new();
-        for card in cards {
-            let items = self.load_items(&card.id)?;
-            let selected = due_items_for_card(&card.kind, &items, now);
-            if !selected.is_empty() {
-                session.push(ReviewCard {
-                    card,
-                    items: selected,
-                });
-            }
-        }
-        Ok(session)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect cards for session")
     }
 
     // Re-check a single card after a rating: returns an updated ReviewCard if the
@@ -282,6 +319,17 @@ impl Store {
         let now   = Utc::now();
         let card  = self.load_card(card_id)?;
         let items = self.load_items(card_id)?;
+
+        if card.review_mode.is_daily() {
+            let today = now.format("%Y-%m-%d").to_string();
+            let needs = items.iter().any(|it| {
+                it.last_reviewed_at
+                    .map(|t| t.format("%Y-%m-%d").to_string() != today)
+                    .unwrap_or(true)
+            });
+            return Ok(if needs { Some(ReviewCard { card, items }) } else { None });
+        }
+
         let selected = due_items_for_card(&card.kind, &items, now);
         if selected.is_empty() {
             Ok(None) // if nothing is due make no changes
@@ -332,7 +380,7 @@ impl Store {
     pub fn load_card(&self, card_id: &str) -> Result<Card> {
         self.conn
             .query_row(
-                "SELECT id,deck,kind,question,reversible,show_chain,created_at,updated_at
+                "SELECT id,deck,kind,question,reversible,show_chain,created_at,updated_at,review_mode
                  FROM cards WHERE id=?1",
                 params![card_id],
                 |row| {
@@ -341,6 +389,7 @@ impl Store {
                     let sc: i32   = row.get(5)?;
                     let ca: String = row.get(6)?;
                     let ua: String = row.get(7)?;
+                    let rm: String = row.get(8)?;
                     Ok(Card {
                         id: row.get(0)?,
                         deck: row.get(1)?,
@@ -350,6 +399,7 @@ impl Store {
                         show_chain: sc != 0,
                         created_at: ca.parse().unwrap_or_else(|_| Utc::now()),
                         updated_at: ua.parse().unwrap_or_else(|_| Utc::now()),
+                        review_mode: rm.parse().unwrap_or_default(),
                     })
                 },
             )
@@ -392,9 +442,33 @@ impl Store {
             )
             .context("load item for review")?;
 
+        // Check whether this card is in daily mode
+        let mode_str: String = self
+            .conn
+            .query_row(
+                "SELECT review_mode FROM cards WHERE id=?1",
+                params![&item.card_id],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "spaced_repetition".to_string());
+        let is_daily = mode_str == "daily";
+
         let prev_interval = item.interval_days;
         let now = Utc::now();
-        let updated = scheduler::apply_confidence(item, confidence, now);
+
+        let updated = if is_daily {
+            // Daily mode: preserve SRS scheduling data entirely.
+            // Only update review tracking fields so last_reviewed_at is today.
+            let n      = item.review_count + 1;
+            let new_avg = if n == 1 {
+                confidence as f64
+            } else {
+                (item.confidence_avg * (n - 1) as f64 + confidence as f64) / n as f64
+            };
+            Item { review_count: n, confidence_avg: new_avg, last_reviewed_at: Some(now), ..item }
+        } else {
+            scheduler::apply_confidence(item, confidence, now)
+        };
 
         self.conn
             .execute(
@@ -415,12 +489,8 @@ impl Store {
             )
             .context("update item")?;
 
-        // De-unlock subsequent steps when an earlier step is failed or barely
-        // recalled (confidence ≤ 2).  Setting their due_at to now means
-        // due_items_for_card will find them on the next session and, because it
-        // always includes every step up to and including the earliest due one,
-        // the learner is forced to rebuild the chain from the weak link forward.
-        if updated.kind == ItemKind::Step && confidence <= 2 {
+        // Step-chain de-unlock only applies to SR cards
+        if !is_daily && updated.kind == ItemKind::Step && confidence <= 2 {
             self.conn
                 .execute(
                     "UPDATE items
@@ -429,8 +499,7 @@ impl Store {
                        AND position > ?3
                        AND kind = 'step'",
                     params![
-                        now.to_rfc3339(), // subsequent due now
-                        //updated.due_at.to_rfc3339(), // syncs with the failed step
+                        now.to_rfc3339(),
                         &updated.card_id,
                         updated.position,
                     ],
@@ -499,6 +568,7 @@ impl Store {
 
     pub fn stats(&self) -> Result<Stats> {
         let now = Utc::now().to_rfc3339();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
         Ok(Stats {
             cards: self
                 .conn
@@ -511,7 +581,9 @@ impl Store {
             due_items: self
                 .conn
                 .query_row(
-                    "SELECT COUNT(*) FROM items WHERE due_at <= ?1",
+                    "SELECT COUNT(*) FROM items i
+                     JOIN cards c ON c.id = i.card_id
+                     WHERE c.review_mode != 'daily' AND i.due_at <= ?1",
                     params![now],
                     |r| r.get(0),
                 )
@@ -520,6 +592,26 @@ impl Store {
                 .conn
                 .query_row("SELECT COUNT(*) FROM review_log", [], |r| r.get(0))
                 .context("count review_log")?,
+            daily_cards: self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cards WHERE review_mode='daily'",
+                    [],
+                    |r| r.get(0),
+                )
+                .context("count daily cards")?,
+            daily_due: self
+                .conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT c.id) FROM cards c
+                     JOIN items i ON i.card_id = c.id
+                     WHERE c.review_mode = 'daily'
+                       AND (i.last_reviewed_at IS NULL
+                            OR date(i.last_reviewed_at) < ?1)",
+                    params![today],
+                    |r| r.get(0),
+                )
+                .context("count daily due")?,
         })
     }
 
@@ -531,6 +623,7 @@ impl Store {
                 "SELECT i.due_at, c.question, c.deck
                 FROM items i
                 JOIN cards c ON c.id = i.card_id
+                WHERE c.review_mode != 'daily'
                 ORDER BY i.due_at ASC
                 LIMIT 1",
             )
@@ -631,8 +724,8 @@ impl Store {
             self.conn
                 .execute(
                     "INSERT OR REPLACE INTO cards
-                        (id, deck, kind, question, reversible, show_chain, created_at, updated_at)
-                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                        (id, deck, kind, question, reversible, show_chain, review_mode, created_at, updated_at)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     params![
                         ic.card.id,
                         ic.card.deck,
@@ -640,6 +733,7 @@ impl Store {
                         ic.card.question,
                         ic.card.reversible as i32,
                         ic.card.show_chain as i32,
+                        ic.card.review_mode.as_str(),
                         ic.card.created_at.to_rfc3339(),
                         ic.card.updated_at.to_rfc3339(),
                     ],
@@ -693,16 +787,17 @@ impl Store {
         question: &str,
         answer: &str,
         reversible: bool,
-        image_path: Option<&str>
+        image_path: Option<&str>,
+        review_mode: &crate::models::ReviewMode,
     ) -> Result<()> {
         let now = Utc::now();
         let ts  = now.to_rfc3339();
         self.conn
             .execute(
                 "UPDATE cards
-                 SET deck=?1, question=?2, reversible=?3, updated_at=?4
-                 WHERE id=?5",
-                params![deck, question, reversible as i32, ts, card_id],
+                 SET deck=?1, question=?2, reversible=?3, review_mode=?4, updated_at=?5
+                 WHERE id=?6",
+                params![deck, question, reversible as i32, review_mode.as_str(), ts, card_id],
             )
             .context("update simple card")?;
 
@@ -761,13 +856,14 @@ impl Store {
         question: &str,
         steps: &[(String, String, Option<String>)],
         show_chain: bool,
+        review_mode: &crate::models::ReviewMode,
     ) -> Result<()> {
         let now = Utc::now();
         let ts  = now.to_rfc3339();
         self.conn
             .execute(
-                "UPDATE cards SET deck=?1, question=?2, show_chain=?3, updated_at=?4 WHERE id=?5",
-                params![deck, question, show_chain as i32, ts, card_id],
+                "UPDATE cards SET deck=?1, question=?2, show_chain=?3, review_mode=?4, updated_at=?5 WHERE id=?6",
+                params![deck, question, show_chain as i32, review_mode.as_str(), ts, card_id],
             )
             .context("update multi card")?;
 
@@ -814,6 +910,30 @@ impl Store {
             )
             .context("delete extra step items")?;
 
+        Ok(())
+    }
+    // ~~ Review-mode helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    /// Toggle a single card between Daily and Spaced Repetition.
+    pub fn set_card_mode(&self, card_id: &str, mode: &crate::models::ReviewMode) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE cards SET review_mode=?1, updated_at=?2 WHERE id=?3",
+                params![mode.as_str(), Utc::now().to_rfc3339(), card_id],
+            )
+            .context("set card mode")?;
+        Ok(())
+    }
+
+    /// Set the review mode for every card in a deck (and all sub-decks).
+    pub fn set_deck_mode(&self, deck: &str, mode: &crate::models::ReviewMode) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE cards SET review_mode=?1, updated_at=?2
+                 WHERE deck=?3 OR deck LIKE ?3 || '::%'",
+                params![mode.as_str(), Utc::now().to_rfc3339(), deck],
+            )
+            .context("set deck mode")?;
         Ok(())
     }
 }
