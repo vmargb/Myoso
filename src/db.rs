@@ -542,15 +542,28 @@ impl Store {
 
     /// Return every distinct deck name, sorted alphabetically.
     pub fn list_decks(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
+        let mut stmt = self.conn
             .prepare("SELECT DISTINCT deck FROM cards ORDER BY deck ASC")
             .context("prepare list_decks")?;
         let rows = stmt
-            .query_map([], |row| row.get(0))
+            .query_map([], |r| r.get::<_, String>(0))
             .context("query list_decks")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("collect list_decks")
+        // keep everything sorted and deduped automatically with BTreeSet
+        let mut decks: std::collections::BTreeSet<String> = rows
+            .collect::<rusqlite::Result<_>>()
+            .context("collect list_decks")?;
+        // The sorted set is then used to take a snapshot of existing decks and
+        // insert any missing ancestor paths (if "A::B::C" exists, it inserts "A" and "A::B")
+        // then decks.into_iter().collect() converts the BTreeSet back into a Vec in sorted order
+        let existing: Vec<String> = decks.iter().cloned().collect();
+        for deck in &existing {
+            let parts: Vec<&str> = deck.split("::").collect();
+            for i in 1..parts.len() {
+                decks.insert(parts[..i].join("::"));
+            }
+        }
+
+        Ok(decks.into_iter().collect())
     }
 
     // ~~ Deletion ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
