@@ -223,6 +223,7 @@ struct AddCardState {
     review_mode:      ReviewMode,
     // set when launched from inside a review session so save returns to Review
     editing_from_review: bool,
+    tags_buf:         String, 
 }
 
 impl AddCardState {
@@ -250,10 +251,11 @@ impl AddCardState {
             deck_list_idx:    None,
             review_mode:      ReviewMode::SpacedRepetition,
             editing_from_review: false,
+            tags_buf:         String::new(),
         }
     }
 
-    /// Decks whose name contains the currently-typed text (case-insensitive).
+    /// Decks whose name contains the currently-typed text (case-insensitive)
     fn filtered_decks(&self) -> Vec<&str> {
         let q = self.deck.trim().to_lowercase();
         self.decks.iter()
@@ -268,13 +270,23 @@ impl AddCardState {
             .and_then(|i| self.filtered_decks().get(i).map(|s| s.to_string()))
     }
 
+    /// Parse tags_buf into a normalised Vec<String>
+    fn parsed_tags(&self) -> Vec<String> {
+        self.tags_buf
+            .split(|c: char| c == ',' || c == ' ')
+            .map(|t| t.trim_start_matches('#').trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
     /// Field layout
-    ///   Simple: deck(0)  question(1)  answer(2)  reversible(3)  daily(4)  [Save](5)
-    ///   Multi:  deck(0)  question(1)  step_name(2)  step_answer(3)  [Add step](4)  steps_list(5)  show_chain(6)  daily(7)  [Save](8)
+    ///   Simple: deck(0)  question(1)  answer(2)  reversible(3)  daily(4)  tags(5)  [Save](6)
+    ///   Multi:  deck(0)  question(1)  step_name(2)  step_answer(3)  [Add step](4)
+    ///           steps_list(5)  show_chain(6)  daily(7)  tags(8)  [Save](9)
     fn field_count(&self) -> usize {
         match self.kind {
-            AddKind::Simple => 6,
-            AddKind::Multi  => 9,
+            AddKind::Simple => 7,
+            AddKind::Multi  => 10,
         }
     }
 
@@ -287,18 +299,18 @@ impl AddCardState {
         self.focused = if self.focused == 0 { n - 1 } else { self.focused - 1 };
     }
 
-    fn is_save(&self)         -> bool { self.focused == self.field_count() - 1 }
-    fn is_reversible(&self)   -> bool { self.kind == AddKind::Simple && self.focused == 3 }
-    fn is_daily_toggle(&self) -> bool {
+    fn is_save(&self)            -> bool { self.focused == self.field_count() - 1 }
+    fn is_reversible(&self)      -> bool { self.kind == AddKind::Simple && self.focused == 3 }
+    fn is_daily_toggle(&self)    -> bool {
         match self.kind {
             AddKind::Simple => self.focused == 4,
             AddKind::Multi  => self.focused == 7,
         }
     }
-    fn is_step_name(&self)  -> bool { self.kind == AddKind::Multi  && self.focused == 2 }
+    fn is_step_name(&self)       -> bool { self.kind == AddKind::Multi && self.focused == 2 }
     fn is_add_step_button(&self) -> bool { self.kind == AddKind::Multi && self.focused == 4 }
-    fn is_steps_list(&self) -> bool { self.kind == AddKind::Multi  && self.focused == 5 }
-    fn is_show_chain(&self) -> bool { self.kind == AddKind::Multi  && self.focused == 6 }
+    fn is_steps_list(&self)      -> bool { self.kind == AddKind::Multi && self.focused == 5 }
+    fn is_show_chain(&self)      -> bool { self.kind == AddKind::Multi && self.focused == 6 }
 
     fn active_buf_mut(&mut self) -> Option<&mut String> {
         match self.kind {
@@ -306,6 +318,7 @@ impl AddCardState {
                 0 => Some(&mut self.deck),
                 1 => Some(&mut self.simple_question),
                 2 => Some(&mut self.answer),
+                5 => Some(&mut self.tags_buf),
                 _ => None,
             },
             AddKind::Multi => match self.focused {
@@ -313,6 +326,7 @@ impl AddCardState {
                 1 => Some(&mut self.multi_question),
                 2 => Some(&mut self.step_name_buf),
                 3 => Some(&mut self.step_buf),
+                8 => Some(&mut self.tags_buf),
                 _ => None, // 4 is add button, 5 is steps list, 6 is save
             },
         }
@@ -378,15 +392,16 @@ impl AddCardState {
         }
     }
 
-    /// Build an AddCardState pre-populated from an existing card for editing.
+    /// Rebuild an AddCardState pre-populated from an existing card for editing.
     /// Jumps straight to FillForm and skips the PickType screen.
-    fn for_edit(card: &Card, items: &[Item], decks: Vec<String>) -> Self {
+    fn for_edit(card: &Card, items: &[Item], decks: Vec<String>, tags: Vec<String>) -> Self {
         let mut s = Self::new(decks);
         s.editing_card_id = Some(card.id.clone());
         s.phase    = AddPhase::FillForm;
         s.deck     = card.deck.clone();
         s.reversible = card.reversible;
         s.review_mode = card.review_mode.clone();
+        s.tags_buf = tags.join(" ");
         match card.kind {
             CardKind::Simple => { // handle question & answer for simple kind
                 s.kind = AddKind::Simple;
@@ -448,28 +463,60 @@ impl AddCardState {
 // ~~~ ListCards state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 struct ListCardsState {
-    cards:          Vec<CardSummary>,
-    list_state:     ListState,
-    deck:           Option<String>,
-    confirm_delete: bool,
+    cards:             Vec<CardSummary>,
+    list_state:        ListState,
+    deck:              Option<String>,
+    confirm_delete:    bool,
+    // search
+    search_query:      String,
+    search_active:     bool,
+    // tag filter
+    tag_filter:        Vec<String>,
+    tag_picker_active: bool,
+    tag_picker_tags:   Vec<String>,
+    tag_picker_state:  ListState,
 }
 
 impl ListCardsState {
     fn new(cards: Vec<CardSummary>, deck: Option<String>) -> Self {
         let mut ls = ListState::default();
         if !cards.is_empty() { ls.select(Some(0)); }
-        Self { cards, list_state: ls, deck, confirm_delete: false }
+        Self {
+            cards,
+            list_state: ls,
+            deck,
+            confirm_delete:    false,
+            search_query:      String::new(),
+            search_active:     false,
+            tag_filter:        Vec::new(),
+            tag_picker_active: false,
+            tag_picker_tags:   Vec::new(),
+            tag_picker_state:  ListState::default(),
+        }
+    }
+
+    fn filtered_cards(&self) -> Vec<&CardSummary> {
+        let q = self.search_query.to_lowercase();
+        self.cards.iter().filter(|c| {
+            let text_ok = q.is_empty()
+                || c.question.to_lowercase().contains(&q)
+                || c.deck.to_lowercase().contains(&q);
+            let tag_ok = self.tag_filter.is_empty()
+                || self.tag_filter.iter().all(|ft| c.tags.iter().any(|ct| ct == ft));
+            text_ok && tag_ok
+        }).collect()
     }
 
     fn next(&mut self) {
-        if self.cards.is_empty() { return; }
-        let i = self.list_state.selected().map_or(0, |i| (i + 1) % self.cards.len());
+        let n = self.filtered_cards().len();
+        if n == 0 { return; }
+        let i = self.list_state.selected().map_or(0, |i| (i + 1) % n);
         self.list_state.select(Some(i));
     }
 
     fn prev(&mut self) {
-        if self.cards.is_empty() { return; }
-        let n = self.cards.len();
+        let n = self.filtered_cards().len();
+        if n == 0 { return; }
         let i = self.list_state.selected()
             .map_or(0, |i| if i == 0 { n - 1 } else { i - 1 });
         self.list_state.select(Some(i));
@@ -482,31 +529,54 @@ struct ListDecksState {
     decks:          Vec<String>,
     list_state:     ListState,
     confirm_delete: bool,
+    // search
+    search_query:   String,
+    search_active:  bool,
 }
 
 impl ListDecksState {
     fn new(decks: Vec<String>) -> Self {
         let mut ls = ListState::default();
         if !decks.is_empty() { ls.select(Some(0)); }
-        Self { decks, list_state: ls, confirm_delete: false }
+        Self {
+            decks,
+            list_state:    ls,
+            confirm_delete: false,
+            search_query:  String::new(),
+            search_active: false,
+        }
+    }
+
+    fn filtered_decks(&self) -> Vec<&str> {
+        let q = self.search_query.to_lowercase();
+        self.decks.iter()
+            .map(String::as_str)
+            .filter(|d| q.is_empty() || d.to_lowercase().contains(&q))
+            .collect()
     }
 
     fn next(&mut self) {
-        if self.decks.is_empty() { return; }
-        let i = self.list_state.selected().map_or(0, |i| (i + 1) % self.decks.len());
+        let n = self.filtered_decks().len();
+        if n == 0 { return; }
+        let i = self.list_state.selected().map_or(0, |i| (i + 1) % n);
         self.list_state.select(Some(i));
     }
 
     fn prev(&mut self) {
-        if self.decks.is_empty() { return; }
-        let n = self.decks.len();
+        let n = self.filtered_decks().len();
+        if n == 0 { return; }
         let i = self.list_state.selected()
             .map_or(0, |i| if i == 0 { n - 1 } else { i - 1 });
         self.list_state.select(Some(i));
     }
 
     fn selected_deck(&self) -> Option<&str> {
-        self.list_state.selected().and_then(|i| self.decks.get(i).map(|s| s.as_str()))
+        let idx = self.list_state.selected()?;
+        let q   = self.search_query.to_lowercase();
+        self.decks.iter()
+            .filter(|d| q.is_empty() || d.to_lowercase().contains(&q))
+            .nth(idx)
+            .map(String::as_str)
     }
 }
 
@@ -895,8 +965,9 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
             if let Some(id) = card_id {
                 let card  = app.store.load_card(&id)?;
                 let items = app.store.load_items(&id)?;
+                let tags  = app.store.get_card_tags(&id)?;
                 let decks = app.store.list_decks().unwrap_or_default();
-                let mut edit_state = AddCardState::for_edit(&card, &items, decks);
+                let mut edit_state = AddCardState::for_edit(&card, &items, decks, tags);
                 edit_state.editing_from_review = true;
                 app.add_card = Some(edit_state);
                 app.go_to(Screen::AddCard);
@@ -1127,8 +1198,11 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                                 let deck = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
                                 let sel  = app.list_cards.as_ref()
                                     .and_then(|lc| lc.list_state.selected());
+                                let tag_filter = app.list_cards.as_ref()
+                                    .map(|lc| lc.tag_filter.clone()).unwrap_or_default();
                                 if let Ok(cards) = app.store.list_cards(deck.as_deref()) {
                                     let mut new_lc = ListCardsState::new(cards, deck);
+                                    new_lc.tag_filter = tag_filter; 
                                     if let Some(i) = sel {
                                         new_lc.list_state.select(Some(
                                             i.min(new_lc.cards.len().saturating_sub(1))
@@ -1180,16 +1254,107 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
 }
 
 fn on_list_cards(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
+    // ~~ tag picker overlay ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    if app.list_cards.as_ref().map_or(false, |lc| lc.tag_picker_active) {
+        match code {
+            KeyCode::Esc | KeyCode::Enter => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.tag_picker_active = false;
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    let n = lc.tag_picker_tags.len();
+                    if n > 0 {
+                        let i = lc.tag_picker_state.selected()
+                            .map_or(0, |i| (i + 1).min(n - 1));
+                        lc.tag_picker_state.select(Some(i));
+                    }
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    let n = lc.tag_picker_tags.len();
+                    if n > 0 {
+                        let i = lc.tag_picker_state.selected()
+                            .map_or(0, |i| i.saturating_sub(1));
+                        lc.tag_picker_state.select(Some(i));
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    if let Some(i) = lc.tag_picker_state.selected() {
+                        if let Some(tag) = lc.tag_picker_tags.get(i).cloned() {
+                            if lc.tag_filter.contains(&tag) {
+                                lc.tag_filter.retain(|t| t != &tag);
+                            } else {
+                                lc.tag_filter.push(tag);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // ~~ search mode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    if app.list_cards.as_ref().map_or(false, |lc| lc.search_active) {
+        match code {
+            KeyCode::Esc => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.search_query.clear();
+                    lc.search_active = false;
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.search_query.pop();
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(lc) = app.list_cards.as_mut() { lc.next(); }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(lc) = app.list_cards.as_mut() { lc.prev(); }
+            }
+            KeyCode::Char(c) => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.search_query.push(c);
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // ~~ confirm delete ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if app.list_cards.as_ref().map_or(false, |lc| lc.confirm_delete) {
         if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-            let card_id = app.list_cards.as_ref()
-                .and_then(|lc| lc.list_state.selected().and_then(|i| lc.cards.get(i)))
-                .map(|c| c.card_id.clone());
+            let card_id = app.list_cards.as_ref().and_then(|lc| {
+                let filtered = lc.filtered_cards();
+                lc.list_state.selected()
+                    .and_then(|i| filtered.get(i).map(|c| c.card_id.clone()))
+            });
             if let Some(id) = card_id {
                 app.store.delete_card(&id)?;
-                let deck = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
+                let deck       = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
+                let tag_filter = app.list_cards.as_ref()
+                    .map(|lc| lc.tag_filter.clone()).unwrap_or_default();
                 let cards = app.store.list_cards(deck.as_deref())?;
-                app.list_cards = Some(ListCardsState::new(cards, deck));
+                let mut new_lc = ListCardsState::new(cards, deck);
+                new_lc.tag_filter = tag_filter;
+                app.list_cards = Some(new_lc);
             }
         } else {
             if let Some(lc) = app.list_cards.as_mut() { lc.confirm_delete = false; }
@@ -1197,51 +1362,91 @@ fn on_list_cards(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // ~~ normal mode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.go_back(),
+
         KeyCode::Down | KeyCode::Char('j') => {
             if let Some(lc) = app.list_cards.as_mut() { lc.next(); }
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(lc) = app.list_cards.as_mut() { lc.prev(); }
         }
+
+        // activate text search
+        KeyCode::Char('/') => {
+            if let Some(lc) = app.list_cards.as_mut() {
+                lc.search_active = true;
+                lc.search_query.clear();
+                let n = lc.filtered_cards().len();
+                lc.list_state.select(if n > 0 { Some(0) } else { None });
+            }
+        }
+
+        // open tag-filter picker
+        KeyCode::Char('#') => {
+            let all_tags = app.store.list_all_tags().unwrap_or_default();
+            if let Some(lc) = app.list_cards.as_mut() {
+                if !all_tags.is_empty() {
+                    lc.tag_picker_tags = all_tags;
+                    if lc.tag_picker_state.selected().is_none() {
+                        lc.tag_picker_state.select(Some(0));
+                    }
+                    lc.tag_picker_active = true;
+                }
+            }
+        }
+
         KeyCode::Char('d') | KeyCode::Delete => {
             if let Some(lc) = app.list_cards.as_mut() {
-                if !lc.cards.is_empty() && lc.list_state.selected().is_some() {
+                let fc_len = lc.filtered_cards().len();
+                if fc_len > 0 && lc.list_state.selected().is_some() {
                     lc.confirm_delete = true;
                 }
             }
         }
+
         KeyCode::Char('e') => {
-            let card_id = app.list_cards.as_ref()
-                .and_then(|lc| lc.list_state.selected().and_then(|i| lc.cards.get(i)))
-                .map(|c| c.card_id.clone());
+            let card_id = app.list_cards.as_ref().and_then(|lc| {
+                let filtered = lc.filtered_cards();
+                lc.list_state.selected()
+                    .and_then(|i| filtered.get(i).map(|c| c.card_id.clone()))
+            });
             if let Some(id) = card_id {
                 let card  = app.store.load_card(&id)?;
                 let items = app.store.load_items(&id)?;
+                let tags  = app.store.get_card_tags(&id)?;
                 let decks = app.store.list_decks().unwrap_or_default();
-                app.add_card = Some(AddCardState::for_edit(&card, &items, decks));
+                app.add_card = Some(AddCardState::for_edit(&card, &items, decks, tags));
                 app.go_to(Screen::AddCard);
             }
         }
+
         KeyCode::Char('m') => {
-            let (card_id, current_mode) = app.list_cards.as_ref()
-                .and_then(|lc| lc.list_state.selected().and_then(|i| lc.cards.get(i)))
-                .map(|c| (c.card_id.clone(), c.review_mode.clone()))
-                .unzip();
-            if let (Some(id), Some(mode)) = (card_id, current_mode) {
+            let result = app.list_cards.as_ref().and_then(|lc| {
+                let filtered = lc.filtered_cards();
+                lc.list_state.selected()
+                    .and_then(|i| filtered.get(i).copied())
+                    .map(|c| (c.card_id.clone(), c.review_mode.clone()))
+            });
+            if let Some((id, mode)) = result {
                 let new_mode = if mode.is_daily() {
                     ReviewMode::SpacedRepetition
                 } else {
                     ReviewMode::Daily
                 };
                 app.store.set_card_mode(&id, &new_mode)?;
-                let deck  = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
-                let sel   = app.list_cards.as_ref().and_then(|lc| lc.list_state.selected());
+                let deck       = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
+                let sel        = app.list_cards.as_ref()
+                    .and_then(|lc| lc.list_state.selected());
+                let tag_filter = app.list_cards.as_ref()
+                    .map(|lc| lc.tag_filter.clone()).unwrap_or_default();
                 let cards = app.store.list_cards(deck.as_deref())?;
                 let mut new_lc = ListCardsState::new(cards, deck);
+                new_lc.tag_filter = tag_filter;
                 if let Some(i) = sel {
-                    new_lc.list_state.select(Some(i.min(new_lc.cards.len().saturating_sub(1))));
+                    let fc_len = new_lc.filtered_cards().len();
+                    new_lc.list_state.select(Some(i.min(fc_len.saturating_sub(1))));
                 }
                 app.list_cards = Some(new_lc);
                 app.flash = Some(format!(
@@ -1250,12 +1455,59 @@ fn on_list_cards(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 ));
             }
         }
+
         _ => {}
     }
     Ok(())
 }
 
 fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
+    // ~~ search mode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    if app.list_decks.as_ref().map_or(false, |ld| ld.search_active) {
+        match code {
+            KeyCode::Esc => {
+                if let Some(ld) = app.list_decks.as_mut() {
+                    ld.search_query.clear();
+                    ld.search_active = false;
+                    let n = ld.filtered_decks().len();
+                    ld.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(ld) = app.list_decks.as_mut() {
+                    ld.search_query.pop();
+                    let n = ld.filtered_decks().len();
+                    ld.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(ld) = app.list_decks.as_mut() { ld.next(); }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(ld) = app.list_decks.as_mut() { ld.prev(); }
+            }
+            KeyCode::Enter | KeyCode::Char('r') => {
+                let deck = app.list_decks.as_ref()
+                    .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
+                if let Some(deck) = deck {
+                    let session = app.store.due_session(Some(&deck))?;
+                    app.review = Some(ReviewState::new(session));
+                    app.go_to(Screen::Review);
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(ld) = app.list_decks.as_mut() {
+                    ld.search_query.push(c);
+                    let n = ld.filtered_decks().len();
+                    ld.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // ~~ confirm delete ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if app.list_decks.as_ref().map_or(false, |ld| ld.confirm_delete) {
         if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
             let deck = app.list_decks.as_ref()
@@ -1271,6 +1523,7 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // ~~ normal mode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     match code {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.go_back();
@@ -1281,14 +1534,21 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(ld) = app.list_decks.as_mut() { ld.prev(); }
         }
+        KeyCode::Char('/') => {
+            if let Some(ld) = app.list_decks.as_mut() {
+                ld.search_active = true;
+                ld.search_query.clear();
+                let n = ld.filtered_decks().len();
+                ld.list_state.select(if n > 0 { Some(0) } else { None });
+            }
+        }
         KeyCode::Char('d') | KeyCode::Delete => {
             if let Some(ld) = app.list_decks.as_mut() {
-                if !ld.decks.is_empty() && ld.list_state.selected().is_some() {
+                if !ld.filtered_decks().is_empty() && ld.list_state.selected().is_some() {
                     ld.confirm_delete = true;
                 }
             }
         }
-        // [Enter] or [r]: start a review session for the selected deck
         KeyCode::Enter | KeyCode::Char('r') => {
             let deck = app.list_decks.as_ref()
                 .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
@@ -1298,7 +1558,6 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 app.go_to(Screen::Review);
             }
         }
-        // [l]: list cards for the selected deck
         KeyCode::Char('l') => {
             let deck = app.list_decks.as_ref()
                 .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
@@ -1308,12 +1567,10 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 app.go_to(Screen::ListCards);
             }
         }
-        // [M]: toggle all cards in the selected deck between Daily and SR
         KeyCode::Char('M') => {
             let deck = app.list_decks.as_ref()
                 .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
             if let Some(deck) = deck {
-                // Check the current majority mode for this deck
                 let cards = app.store.list_cards(Some(&deck))?;
                 let daily_count = cards.iter().filter(|c| c.review_mode.is_daily()).count();
                 let new_mode = if daily_count * 2 >= cards.len() {
@@ -1505,8 +1762,10 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("missing add-card state"))?;
     s.validate().map_err(|e| anyhow::anyhow!(e))?;
 
+    let tags = s.parsed_tags();
+
     if let Some(ref card_id) = s.editing_card_id.clone() {
-        // ~~ Edit path ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        // ~~ edit path ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         match s.kind {
             AddKind::Simple => store.update_simple_card(
                 card_id,
@@ -1526,9 +1785,10 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 &s.review_mode,
             )?,
         }
+        store.set_card_tags(card_id, &tags)?;
     } else {
-        // ~~ Create path ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        match s.kind {
+        // ~~ create path ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        let card_id = match s.kind {
             AddKind::Simple => store.add_simple_card(
                 s.deck.trim(),
                 s.simple_question.trim(),
@@ -1544,7 +1804,8 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.show_chain,
                 &s.review_mode,
             )?,
-        }
+        };
+        store.set_card_tags(&card_id, &tags)?;
     }
     Ok(())
 }
@@ -2242,7 +2503,10 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
         (filtered.len() as u16 + 2).min(6)
     } else { 0 };
 
-    let total_h = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + 3 + 3 + 1; // added daily toggle
+    // heading + deck + sugg + question + answer + reversible + daily + tags + save + hint
+    // let total_h: u16 = 1 + 3 + sugg_h + 5 + 5 + 3 + 3 + 3 + 3 + 1;
+    // extra 3 for the tags row
+    let total_h: u16 = 1 + 3 + sugg_h + 5 + 5 + 3 + 3 + 3 + 3 + 3 + 1;
     let area = centered_rect(72, total_h, size);
     let v = Layout::default()
         .direction(Direction::Vertical)
@@ -2254,6 +2518,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
             Constraint::Length(5),       // answer
             Constraint::Length(3),       // reversible
             Constraint::Length(3),       // daily toggle
+            Constraint::Length(3),       // tags
             Constraint::Length(3),       // save button
             Constraint::Min(1),          // error / help
         ])
@@ -2298,11 +2563,10 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
         );
     }
 
-    // question scroll to bottom so new lines are visible
-    let q_text = with_cursor(&s.simple_question, s.focused == 1);
-    let q_lines = q_text.lines().count() as u16;
+    let q_text    = with_cursor(&s.simple_question, s.focused == 1);
+    let q_lines   = q_text.lines().count() as u16;
     let q_visible = v[3].height.saturating_sub(2);
-    let q_scroll = q_lines.saturating_sub(q_visible);
+    let q_scroll  = q_lines.saturating_sub(q_visible);
     f.render_widget(
         Paragraph::new(q_text)
             .block(field_block(if s.focused == 1 { " Question  │  [^E] editor " } else { " Question " }, s.focused == 1))
@@ -2318,11 +2582,10 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
         (false, true)  => " Answer  [IMG ✓ ] ",
         (false, false) => " Answer ",
     };
-    // answer same scrolling
-    let a_text = with_cursor(&s.answer, s.focused == 2);
-    let a_lines = a_text.lines().count() as u16;
+    let a_text    = with_cursor(&s.answer, s.focused == 2);
+    let a_lines   = a_text.lines().count() as u16;
     let a_visible = v[4].height.saturating_sub(2);
-    let a_scroll = a_lines.saturating_sub(a_visible);
+    let a_scroll  = a_lines.saturating_sub(a_visible);
     f.render_widget(
         Paragraph::new(a_text)
             .block(field_block(answer_title, s.focused == 2))
@@ -2351,8 +2614,17 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
     );
 
     render_daily_toggle(f, &s.review_mode, s.focused == 4, v[6]);
-    render_save_btn(f, s.focused == 5, v[7]);
-    render_form_hint(f, s.error.as_deref(), v[8]);
+
+    // tags field (focused == 5)
+    f.render_widget(
+        Paragraph::new(with_cursor(&s.tags_buf, s.focused == 5))
+            .block(field_block(" Tags  (space or comma separated, e.g. exam-prep year1) ", s.focused == 5))
+            .style(text_style(s.focused == 5)),
+        v[7],
+    );
+
+    render_save_btn(f, s.focused == 6, v[8]);
+    render_form_hint(f, s.error.as_deref(), v[9]);
 }
 
 fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
@@ -2363,25 +2635,27 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
     } else { 0 };
 
     let steps_h = 6;
-    // 3 visible lines in question/step answer; added daily toggle
-    let total_h = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + steps_h + 3 + 3 + 3 + 3 + 1;
+    //  heading + deck + sugg + question + step_name + step_ans + add_btn + steps_list
+    //  + show_chain + daily + tags + save + hint
+    let total_h: u16 = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + steps_h + 3 + 3 + 3 + 3 + 1;
 
     let area = centered_rect(72, total_h, size);
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),       // heading
-            Constraint::Length(3),       // deck input
-            Constraint::Length(sugg_h),  // deck suggestions
-            Constraint::Length(5),       // question
-            Constraint::Length(3),       // step name input  (focused == 2)
-            Constraint::Length(5),       // step answer input (focused == 3)
-            Constraint::Length(3),       // add step button  (focused == 4)
-            Constraint::Length(steps_h), // steps list       (focused == 5)
-            Constraint::Length(3),       // show_chain toggle (focused == 6)
-            Constraint::Length(3),       // daily toggle     (focused == 7)
-            Constraint::Length(3),       // save button      (focused == 8)
-            Constraint::Min(1),          // error / help
+            Constraint::Length(1),        // heading
+            Constraint::Length(3),        // deck input
+            Constraint::Length(sugg_h),   // deck suggestions
+            Constraint::Length(5),        // question
+            Constraint::Length(3),        // step name   (focused == 2)
+            Constraint::Length(5),        // step answer (focused == 3)
+            Constraint::Length(3),        // add step button (focused == 4)
+            Constraint::Length(steps_h),  // steps list  (focused == 5)
+            Constraint::Length(3),        // show_chain  (focused == 6)
+            Constraint::Length(3),        // daily       (focused == 7)
+            Constraint::Length(3),        // tags        (focused == 8)  ← NEW
+            Constraint::Length(3),        // save        (focused == 9)
+            Constraint::Min(1),           // error / help
         ])
         .split(area);
 
@@ -2424,21 +2698,19 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
         );
     }
 
-    // question scroll to bottom so new lines are visible
-    let q_text = with_cursor(&s.multi_question, s.focused == 1);
-    let q_lines = q_text.lines().count() as u16;
+    let q_text    = with_cursor(&s.multi_question, s.focused == 1);
+    let q_lines   = q_text.lines().count() as u16;
     let q_visible = v[3].height.saturating_sub(2);
-    let q_scroll = q_lines.saturating_sub(q_visible);
+    let q_scroll  = q_lines.saturating_sub(q_visible);
     f.render_widget(
         Paragraph::new(q_text)
-            .block(field_block(" Question ", s.focused == 1))
+            .block(field_block(" Question  │  [^E] editor ", s.focused == 1))
             .wrap(Wrap { trim: false })
             .scroll((q_scroll, 0))
             .style(text_style(s.focused == 1)),
         v[3],
     );
 
-    // Step name (optional) focused == 2
     f.render_widget(
         Paragraph::new(with_cursor(&s.step_name_buf, s.focused == 2))
             .block(field_block(" Step Name  (optional, leave blank for 'Step N') ", s.focused == 2))
@@ -2452,10 +2724,10 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
         (false, true)  => " Step Answer  [IMG ✓ ] ",
         (false, false) => " Step Answer ",
     };
-    let step_text = with_cursor(&s.step_buf, s.focused == 3);
-    let step_lines = step_text.lines().count() as u16;
+    let step_text    = with_cursor(&s.step_buf, s.focused == 3);
+    let step_lines   = step_text.lines().count() as u16;
     let step_visible = v[5].height.saturating_sub(2);
-    let step_scroll = step_lines.saturating_sub(step_visible);
+    let step_scroll  = step_lines.saturating_sub(step_visible);
     f.render_widget(
         Paragraph::new(step_text)
             .block(field_block(answer_title, s.focused == 3))
@@ -2467,16 +2739,13 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
 
     render_add_step_btn(f, s.focused == 4, s.editing_step_idx.is_some(), v[6]);
 
-    // Steps list focused == 5
     let step_items: Vec<ListItem> = if s.steps.is_empty() {
         vec![ListItem::new(Span::styled(
             "  (no steps yet)",
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         ))]
     } else {
-        s.steps
-            .iter()
-            .enumerate()
+        s.steps.iter().enumerate()
             .map(|(i, (name, answer, _))| {
                 let prefix = if Some(i) == s.editing_step_idx { " ✎ " } else { "  " };
                 let label = if name.trim().is_empty() {
@@ -2501,19 +2770,14 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
     } else {
         format!(" Steps ({}) ", s.steps.len())
     };
-
-    let mut list = List::new(step_items)
-        .block(field_block(&list_title, s.focused == 5));
-
+    let mut list = List::new(step_items).block(field_block(&list_title, s.focused == 5));
     if s.focused == 5 {
         list = list
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
             .highlight_symbol(">> ");
     }
-
     f.render_stateful_widget(list, v[7], &mut s.step_list_state);
 
-    // Show chain toggle (focused == 6)
     let sc_text = if s.show_chain {
         "  y  Show preceding step answers during review"
     } else {
@@ -2533,8 +2797,17 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
     );
 
     render_daily_toggle(f, &s.review_mode, s.focused == 7, v[9]);
-    render_save_btn(f, s.focused == 8, v[10]);
-    render_form_hint(f, s.error.as_deref(), v[11]);
+
+    // tags field (focused == 8)
+    f.render_widget(
+        Paragraph::new(with_cursor(&s.tags_buf, s.focused == 8))
+            .block(field_block(" Tags  (space or comma separated, e.g. exam-prep year1) ", s.focused == 8))
+            .style(text_style(s.focused == 8)),
+        v[10],
+    );
+
+    render_save_btn(f, s.focused == 9, v[11]);
+    render_form_hint(f, s.error.as_deref(), v[12]);
 }
 
 fn render_daily_toggle(f: &mut Frame, mode: &ReviewMode, focused: bool, area: Rect) {
@@ -2664,22 +2937,29 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
     let size = f.area();
     let lc = match app.list_cards.as_mut() { Some(lc) => lc, None => return };
 
+    // ~~ layout ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     let v = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(size);
 
     let now         = Utc::now();
-    let card_count  = lc.cards.len();
+    let total_count = lc.cards.len();
+    let filtered    = lc.filtered_cards();
+    let filter_count = filtered.len();
 
-    let items: Vec<ListItem> = if lc.cards.is_empty() {
+    // ~~ card list ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let items: Vec<ListItem> = if filtered.is_empty() {
         vec![ListItem::new(Span::styled(
-            "  No cards yet,  use Add Card to create one.",
+            if total_count == 0 {
+                "  No cards yet,  use Add Card to create one."
+            } else {
+                "  No cards match the current filter."
+            },
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        lc.cards
-            .iter()
+        filtered.iter()
             .map(|c| {
                 let daily_tag = if c.review_mode.is_daily() {
                     Span::styled("★ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
@@ -2702,7 +2982,7 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
                     Style::default().fg(Color::Yellow),
                 );
                 let q_tag = Span::styled(
-                    c.question.chars().take(50).collect::<String>(),
+                    c.question.chars().take(40).collect::<String>(),
                     Style::default().fg(Color::White),
                 );
                 let n_tag = Span::styled(
@@ -2721,7 +3001,9 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
                 } else {
                     Span::raw("")
                 };
-                ListItem::new(Line::from(vec![
+
+                // tag chips
+                let mut spans = vec![
                     Span::raw(" "),
                     daily_tag,
                     due_tag,
@@ -2730,40 +3012,127 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
                     q_tag,
                     n_tag,
                     time_tag,
-                ]))
+                ];
+                for tag in &c.tags {
+                    spans.push(Span::styled(
+                        format!(" #{tag}"),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect()
     };
-    // Immutable borrow of lc.cards ended so &mut lc.list_state is now safe
+
+    // ~~ title ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let title = {
+        let base = if let Some(d) = &lc.deck {
+            format!(" Cards in '{}' ", d)
+        } else {
+            " All Cards ".to_string()
+        };
+        let count = if filter_count == total_count {
+            format!("({total_count}) ")
+        } else {
+            format!("({filter_count}/{total_count}) ")
+        };
+        let filter_tags: String = lc.tag_filter.iter()
+            .map(|t| format!(" #{t}"))
+            .collect::<Vec<_>>()
+            .join("");
+        let search_indicator = if !lc.search_query.is_empty() {
+            format!(" [/{}]", lc.search_query)
+        } else {
+            String::new()
+        };
+        format!("{base}{count}{filter_tags}{search_indicator}")
+    };
 
     f.render_stateful_widget(
         List::new(items)
             .block(Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(if let Some(d) = &lc.deck {
-                    format!(" Cards in '{}' ({card_count}) ", d)
-                } else {
-                    format!(" All Cards ({card_count}) ")
-                }))
+                .title(title))
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
             .highlight_symbol("> "),
         v[0],
         &mut lc.list_state,
     );
 
+    // ~~ bottom bar ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    let bottom_lines = if lc.search_active {
+        vec![
+            Line::from(vec![
+                Span::styled(" Search: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{}▌", lc.search_query),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(Span::styled(
+                " [j/k] navigate  │  [Esc] cancel search  │  [Enter] select",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    } else {
+        let tag_hint = if !lc.tag_filter.is_empty() { "[#] tags ✓" } else { "[#] filter tags" };
+        vec![
+            Line::from(Span::styled(
+                format!(
+                    " [j/k] navigate  │  [/] search  │  {tag_hint}  │  [e] edit  │  [m] toggle SR/daily  │  [d] delete  │  [Esc] back"
+                ),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    };
     f.render_widget(
-        Paragraph::new(Span::styled(
-            " [j/k] navigate  |  [e] edit card  |  [m] toggle daily/SR  |  [d] delete card  |  [Esc] back",
-            Style::default().fg(Color::DarkGray),
-        ))
-        .alignment(Alignment::Center),
+        Paragraph::new(bottom_lines).alignment(Alignment::Center),
         v[1],
     );
 
+    // ~~ Overlays ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if lc.confirm_delete {
         render_confirm_dialog(f, "  Delete this card and all its review history?", size);
     }
+    if lc.tag_picker_active {
+        render_tag_picker(f, lc, size);
+    }
+}
+
+fn render_tag_picker(f: &mut Frame, lc: &mut ListCardsState, size: Rect) {
+    let area = centered_rect(46, 20, size);
+    f.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = lc.tag_picker_tags.iter().map(|tag| {
+        let active = lc.tag_filter.contains(tag);
+        let check  = if active { "✓" } else { " " };
+        ListItem::new(Line::from(Span::styled(
+            format!("  [{check}]  #{tag}"),
+            if active {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        )))
+    }).collect();
+
+    f.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" Filter by Tags  [Space] toggle  [Enter/Esc] close "),
+            )
+            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_symbol("> "),
+        area,
+        &mut lc.tag_picker_state,
+    );
 }
 
 // ~~ List Decks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2774,23 +3143,27 @@ fn render_list_decks(f: &mut Frame, app: &mut AppState) {
 
     let v = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(size);
 
-    let deck_count = ld.decks.len();
+    let total_count  = ld.decks.len();
+    let filtered     = ld.filtered_decks();
+    let filter_count = filtered.len();
 
-    let items: Vec<ListItem> = if ld.decks.is_empty() {
+    let items: Vec<ListItem> = if filtered.is_empty() {
         vec![ListItem::new(Span::styled(
-            "  No decks yet -- add a card to create one.",
+            if total_count == 0 {
+                "  No decks yet -- add a card to create one."
+            } else {
+                "  No decks match the search."
+            },
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        ld.decks
-            .iter()
+        filtered.iter()
             .map(|d| {
                 let depth = crate::models::deck_depth(d);
                 let leaf  = crate::models::deck_leaf(d);
-                // Indent sub-decks: two spaces per level, then a branch glyph.
                 let (indent, glyph, col) = if depth == 0 {
                     (String::new(), "[D]  ", Color::Yellow)
                 } else {
@@ -2807,24 +3180,51 @@ fn render_list_decks(f: &mut Frame, app: &mut AppState) {
             .collect()
     };
 
+    let count_label = if filter_count == total_count {
+        format!("({total_count})")
+    } else {
+        format!("({filter_count}/{total_count})")
+    };
+    let search_indicator = if !ld.search_query.is_empty() {
+        format!("  [/{}] ", ld.search_query)
+    } else {
+        String::new()
+    };
+    let title = format!(" Decks {count_label}  [:: = sub-deck]{search_indicator}");
+
     f.render_stateful_widget(
         List::new(items)
             .block(Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(format!(" Decks ({deck_count})  [:: = sub-deck] ")))
+                .title(title))
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
             .highlight_symbol("> "),
         v[0],
         &mut ld.list_state,
     );
 
+    let bottom_lines = if ld.search_active {
+        vec![
+            Line::from(vec![
+                Span::styled(" Search: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{}▌", ld.search_query), Style::default().fg(Color::White)),
+            ]),
+            Line::from(Span::styled(
+                " [j/k] navigate  │  [Esc] cancel search  │  [Enter/r] review",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                " [j/k] navigate  │  [/] search  │  [Enter/r] review  │  [l] list cards  │  [M] toggle daily/SR  │  [d] delete  │  [Esc] back",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    };
     f.render_widget(
-        Paragraph::new(Span::styled(
-            " [j/k] navigate  |  [Enter/r] review  |  [l] list cards  |  [M] toggle daily/SR  |  [d] delete deck  |  [Esc] back",
-            Style::default().fg(Color::DarkGray),
-        ))
-        .alignment(Alignment::Center),
+        Paragraph::new(bottom_lines).alignment(Alignment::Center),
         v[1],
     );
 

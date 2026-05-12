@@ -41,7 +41,6 @@ fn main() -> Result<()> {
 
     let db_path = cli.db.to_string_lossy().to_string();
     let store = Store::open(&db_path)?;
-    store.seed_if_empty()?;
     ui::run_tui(&store)?;
     Ok(())
 }

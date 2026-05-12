@@ -70,16 +70,6 @@ cargo run
 
 ---
 
-## Daily cards
-
-Spaced-repetition isn't everything, some cards require more attention than others,
-like the most essential cards in your upcoming exam.
-You can mark new cards as daily or move existing SRS cards into your dailies to have them
-shown in every review session once per day, bypassing any scheduling applied to them.
-Once the demand is gone(e.g. after the exam), you can move those cards back into SRS.
-
----
-
 ## Features
 
 - **Analytics**: Simple statistics of deck/card data, current progress and currently due sessions.
@@ -92,9 +82,17 @@ Once the demand is gone(e.g. after the exam), you can move those cards back into
 - **Syntax Highlighting**: Code blocks in markdown are syntax-highlighted for any programming language.
 - **Image preview**: Insert path to images locally into an answer/step (handwritten work or screenshot)
 - **Subdecks**: Organise decks into 'sub-decks', allowing clear separation (e.g., vocabulary, grammar)
+- **Tags**: Organise cards even further by adding tags, allowing easy search filtering
+
+### Daily cards
+
+Spaced-repetition isn't everything, some cards require more attention than others,
+like the most essential cards in your upcoming exam.
+You can mark new cards as daily or move existing SRS cards into your dailies to have them
+shown in every review session once per day, bypassing any scheduling applied to them.
+Once the demand is gone(e.g. after the exam), you can move those cards back into SRS.
 
 ---
-
 
 ## Scheduling algorithm
 

@@ -122,6 +122,8 @@ pub struct Card {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub review_mode: ReviewMode,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 fn default_show_chain() -> bool { true }
@@ -165,6 +167,7 @@ pub struct CardSummary {
     pub item_count: i32,
     pub due_at: DateTime<Utc>,
     pub review_mode: ReviewMode,
+    pub tags: Vec<String>,
 }
 
 /// Aggregate counts for the `stats` command.

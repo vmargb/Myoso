@@ -73,6 +73,20 @@ impl Store {
                 previous_interval_days REAL NOT NULL,
                 new_interval_days      REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS tags (
+                id   TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS card_tags (
+                card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+                tag_id  TEXT NOT NULL REFERENCES tags(id)  ON DELETE CASCADE,
+                PRIMARY KEY (card_id, tag_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_card_tags_card ON card_tags(card_id);
+            CREATE INDEX IF NOT EXISTS idx_card_tags_tag  ON card_tags(tag_id);
             ",
             )
             .context("schema migration")?;
@@ -92,27 +106,6 @@ impl Store {
         Ok(())
     }
 
-    // ~~ Seeding ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    /// Insert a sample card if the database is empty.
-    pub fn seed_if_empty(&self) -> Result<()> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0))
-            .context("seed check")?;
-        if count == 0 {
-            self.add_simple_card(
-                "default",
-                "What is a closure?",
-                "A function that captures variables from its surrounding lexical scope.",
-                true,
-                None,
-                &crate::models::ReviewMode::SpacedRepetition,
-            )?;
-        }
-        Ok(())
-    }
-
     // ~~ Card creation ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     pub fn add_simple_card(
@@ -123,14 +116,14 @@ impl Store {
         reversible: bool,
         image_path: Option<&str>,
         review_mode: &crate::models::ReviewMode,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let card_id = new_id();
         let now = Utc::now();
         let ts = now.to_rfc3339();
         self.conn
             .execute(
                 "INSERT INTO cards(id,deck,kind,question,reversible,review_mode,created_at,updated_at)
-                 VALUES(?1,?2,'simple',?3,?4,?5,?6,?7)",
+                VALUES(?1,?2,'simple',?3,?4,?5,?6,?7)",
                 params![card_id, deck, question, reversible as i32, review_mode.as_str(), ts, ts],
             )
             .context("insert simple card")?;
@@ -139,11 +132,18 @@ impl Store {
         if reversible {
             self.insert_item(&card_id, 2, "reverse", answer, question, now, None)?;
         }
-        Ok(())
+        Ok(card_id)
     }
 
     // steps: (string, string, bool) -> (step name, answer, is_markdown)
-    pub fn add_multi_card(&self, deck: &str, question: &str, steps: &[(String, String, Option<String>)], show_chain: bool, review_mode: &crate::models::ReviewMode) -> Result<()> {
+    pub fn add_multi_card(
+        &self,
+        deck: &str,
+        question: &str,
+        steps: &[(String, String, Option<String>)],
+        show_chain: bool,
+        review_mode: &crate::models::ReviewMode,
+    ) -> Result<String> {
         if steps.is_empty() {
             anyhow::bail!("multi-step cards need at least one step");
         }
@@ -153,7 +153,7 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO cards(id,deck,kind,question,reversible,show_chain,review_mode,created_at,updated_at)
-                 VALUES(?1,?2,'multi',?3,0,?4,?5,?6,?7)",
+                VALUES(?1,?2,'multi',?3,0,?4,?5,?6,?7)",
                 params![card_id, deck, question, show_chain as i32, review_mode.as_str(), ts, ts],
             )
             .context("insert multi card")?;
@@ -168,7 +168,7 @@ impl Store {
             };
             self.insert_item(&card_id, pos as i32, "step", &label, answer, now, img.as_deref())?;
         }
-        Ok(())
+        Ok(card_id)
     }
 
     fn insert_item(
@@ -203,31 +203,39 @@ impl Store {
             .conn
             .prepare(
                 "SELECT c.id, c.kind, c.deck, c.question, c.reversible,
-                        MIN(i.due_at) AS due_at, COUNT(i.id) AS item_count,
-                        c.review_mode
-                 FROM cards c
-                 JOIN items i ON i.card_id = c.id
-                 WHERE (?1 = '' OR c.deck = ?1 OR c.deck LIKE ?1 || '::%')
-                 GROUP BY c.id
-                 ORDER BY due_at ASC, c.created_at ASC",
+                        MIN(i.due_at) AS due_at, COUNT(DISTINCT i.id) AS item_count,
+                        c.review_mode,
+                        GROUP_CONCAT(DISTINCT t.name) AS tag_names
+                FROM cards c
+                JOIN items i ON i.card_id = c.id
+                LEFT JOIN card_tags ct ON ct.card_id = c.id
+                LEFT JOIN tags t ON t.id = ct.tag_id
+                WHERE (?1 = '' OR c.deck = ?1 OR c.deck LIKE ?1 || '::%')
+                GROUP BY c.id
+                ORDER BY due_at ASC, c.created_at ASC",
             )
             .context("prepare list_cards")?;
 
         let rows = stmt
             .query_map(params![filter], |row| {
-                let kind: String = row.get(1)?;
-                let rev: i32 = row.get(4)?;
-                let due: String = row.get(5)?;
-                let rm: String  = row.get(7)?;
+                let kind: String       = row.get(1)?;
+                let rev: i32           = row.get(4)?;
+                let due: String        = row.get(5)?;
+                let rm: String         = row.get(7)?;
+                let tag_csv: Option<String> = row.get(8)?;
+                let tags = tag_csv
+                    .map(|s| s.split(',').map(|t| t.to_string()).collect::<Vec<_>>())
+                    .unwrap_or_default();
                 Ok(CardSummary {
-                    card_id: row.get(0)?,
-                    kind: kind.parse().unwrap_or(CardKind::Simple),
-                    deck: row.get(2)?,
-                    question: row.get(3)?,
-                    reversible: rev != 0,
-                    item_count: row.get(6)?,
-                    due_at: due.parse().unwrap_or_else(|_| Utc::now()),
+                    card_id:     row.get(0)?,
+                    kind:        kind.parse().unwrap_or(CardKind::Simple),
+                    deck:        row.get(2)?,
+                    question:    row.get(3)?,
+                    reversible:  rev != 0,
+                    item_count:  row.get(6)?,
+                    due_at:      due.parse().unwrap_or_else(|_| Utc::now()),
                     review_mode: rm.parse().unwrap_or_default(),
+                    tags,
                 })
             })
             .context("query list_cards")?;
@@ -282,7 +290,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id,kind,deck,question,reversible,show_chain,created_at,updated_at,review_mode
-                 FROM cards WHERE (?1='' OR deck=?1 OR deck LIKE ?1 || '::%') ORDER BY created_at ASC",
+                FROM cards WHERE (?1='' OR deck=?1 OR deck LIKE ?1 || '::%') ORDER BY created_at ASC",
             )
             .context("prepare load_cards_for_session")?;
 
@@ -304,6 +312,7 @@ impl Store {
                     created_at:  ca.parse().unwrap_or_else(|_| Utc::now()),
                     updated_at:  ua.parse().unwrap_or_else(|_| Utc::now()),
                     review_mode: rm.parse().unwrap_or_default(),
+                    tags:        vec![],
                 })
             })
             .context("query cards for session")?;
@@ -381,7 +390,7 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id,deck,kind,question,reversible,show_chain,created_at,updated_at,review_mode
-                 FROM cards WHERE id=?1",
+                FROM cards WHERE id=?1",
                 params![card_id],
                 |row| {
                     let kind: String = row.get(2)?;
@@ -391,15 +400,16 @@ impl Store {
                     let ua: String = row.get(7)?;
                     let rm: String = row.get(8)?;
                     Ok(Card {
-                        id: row.get(0)?,
-                        deck: row.get(1)?,
-                        kind: kind.parse().unwrap_or(CardKind::Simple),
-                        question: row.get(3)?,
-                        reversible: rev != 0,
-                        show_chain: sc != 0,
-                        created_at: ca.parse().unwrap_or_else(|_| Utc::now()),
-                        updated_at: ua.parse().unwrap_or_else(|_| Utc::now()),
+                        id:          row.get(0)?,
+                        deck:        row.get(1)?,
+                        kind:        kind.parse().unwrap_or(CardKind::Simple),
+                        question:    row.get(3)?,
+                        reversible:  rev != 0,
+                        show_chain:  sc != 0,
+                        created_at:  ca.parse().unwrap_or_else(|_| Utc::now()),
+                        updated_at:  ua.parse().unwrap_or_else(|_| Utc::now()),
                         review_mode: rm.parse().unwrap_or_default(),
+                        tags:        vec![],
                     })
                 },
             )
@@ -663,7 +673,8 @@ impl Store {
         let now = Utc::now();
 
         for s in &summaries {
-            let card = self.load_card(&s.card_id)?;
+            let mut card = self.load_card(&s.card_id)?;
+            card.tags = self.get_card_tags(&s.card_id)?;
             let mut items = self.load_items(&s.card_id)?;
             if reset_metadata {
                 for item in &mut items {
@@ -741,6 +752,9 @@ impl Store {
                 .context("upsert card")?;
 
             if exists { summary.cards_replaced += 1; } else { summary.cards_imported += 1; }
+
+            // restore tags. ic.card.tags is an empty vec if the JSON predates tags support
+            self.set_card_tags(&ic.card.id, &ic.card.tags)?;
 
             for item in ic.items {
                 self.conn
@@ -935,6 +949,86 @@ impl Store {
             )
             .context("set deck mode")?;
         Ok(())
+    }
+    
+    // ~~ Tag helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    /// get the id of an existing tag by name or create it and return the new id
+    fn get_or_create_tag(&self, raw_name: &str) -> Result<String> {
+        let name = raw_name.trim().to_lowercase();
+        anyhow::ensure!(!name.is_empty(), "tag name cannot be empty");
+
+        match self.conn.query_row(
+            "SELECT id FROM tags WHERE name=?1",
+            params![name],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(id) => Ok(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let id = new_id();
+                self.conn
+                    .execute("INSERT INTO tags(id, name) VALUES(?1, ?2)", params![id, name])
+                    .context("insert tag")?;
+                Ok(id)
+            }
+            Err(e) => Err(e).context("look up tag"),
+        }
+    }
+
+    /// replace the entire tag set for a card atomically
+    /// and pass an empty slice to clear all tags
+    pub fn set_card_tags(&self, card_id: &str, tags: &[String]) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM card_tags WHERE card_id=?1", params![card_id])
+            .context("clear card tags")?;
+
+        for raw in tags {
+            let name = raw.trim().to_lowercase();
+            if name.is_empty() { continue; }
+            let tag_id = self.get_or_create_tag(&name)?;
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO card_tags(card_id, tag_id) VALUES(?1, ?2)",
+                    params![card_id, tag_id],
+                )
+                .context("link card tag")?;
+        }
+        Ok(())
+    }
+
+    /// return all tag names for a card, sorted alphabetically
+    pub fn get_card_tags(&self, card_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT t.name FROM tags t
+                JOIN card_tags ct ON ct.tag_id = t.id
+                WHERE ct.card_id = ?1
+                ORDER BY t.name ASC",
+            )
+            .context("prepare get_card_tags")?;
+
+        let rows = stmt
+            .query_map(params![card_id], |r| r.get(0))
+            .context("query card tags")?;
+
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+            .context("collect card tags")
+    }
+
+    /// return every tag name in the database sorted alphabetically
+    pub fn list_all_tags(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM tags ORDER BY name ASC")
+            .context("prepare list_all_tags")?;
+
+        let rows = stmt
+            .query_map([], |r| r.get(0))
+            .context("query all tags")?;
+
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+            .context("collect tags")
     }
 }
 
