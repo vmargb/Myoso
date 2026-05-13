@@ -71,7 +71,8 @@ impl Store {
                 confidence             INTEGER NOT NULL,
                 duration_ms            INTEGER NOT NULL,
                 previous_interval_days REAL NOT NULL,
-                new_interval_days      REAL NOT NULL
+                new_interval_days      REAL NOT NULL,
+                chain_reexposure       INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS tags (
@@ -101,6 +102,10 @@ impl Store {
         );
         let _ = self.conn.execute(
             "ALTER TABLE items ADD COLUMN image_path TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE review_log ADD COLUMN chain_reexposure INTEGER NOT NULL DEFAULT 0",
             [],
         );
         Ok(())
@@ -418,8 +423,14 @@ impl Store {
 
     // ~~ Review recording ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    pub fn record_review(&self, item_id: &str, confidence: u8, duration: Duration) -> Result<()> {
-        // Load the current item state
+    /// When 'chain_reexposure' is true, that means the item is a preceding step
+    /// that has already been fully scheduled once this session (the user is
+    /// replaying the chain to unlock a later step they failed). In that case
+    /// the SRS schedule (interval_days, ease, due_at, lapses) is left
+    /// untouched, only the analytics fields are updated.  This prevents
+    /// artificially inflated intervals caused by repeated same-session exposure
+    pub fn record_review(&self, item_id: &str, confidence: u8, duration: Duration, chain_reexposure: bool) -> Result<()> {
+        // load the current item state
         let item = self
             .conn
             .query_row(
@@ -476,6 +487,18 @@ impl Store {
                 (item.confidence_avg * (n - 1) as f64 + confidence as f64) / n as f64
             };
             Item { review_count: n, confidence_avg: new_avg, last_reviewed_at: Some(now), ..item }
+        } else if chain_reexposure {
+            // chain re-exposure: this step was already fully scheduled earlier
+            // in the same session. Update analytics only, leave the SRS state
+            // (interval_days, ease, due_at, lapses) completely unchanged so
+            // the schedule reflects the *first* honest recall
+            let n = item.review_count + 1;
+            let new_avg = if n == 1 {
+                confidence as f64
+            } else {
+                (item.confidence_avg * (n - 1) as f64 + confidence as f64) / n as f64
+            };
+            Item { review_count: n, confidence_avg: new_avg, last_reviewed_at: Some(now), ..item }
         } else {
             scheduler::apply_confidence(item, confidence, now)
         };
@@ -520,8 +543,8 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO review_log(id,item_id,card_id,reviewed_at,confidence,duration_ms,
-                                        previous_interval_days,new_interval_days)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                                        previous_interval_days,new_interval_days,chain_reexposure)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 params![
                     new_id(),
                     &updated.id,
@@ -531,6 +554,7 @@ impl Store {
                     duration.as_millis() as i64,
                     prev_interval,
                     updated.interval_days,
+                    chain_reexposure as i32,
                 ],
             )
             .context("insert review_log")?;
