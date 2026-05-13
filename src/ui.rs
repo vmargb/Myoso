@@ -6,6 +6,7 @@
 
 use std::io;
 use std::time::Instant;
+use std::collections::HashSet;
 
 use chrono::Utc;
 use chrono::DateTime;
@@ -60,7 +61,11 @@ struct ReviewState {
     total_items:       usize,
     done_items:        usize,
     finished_duration: Option<std::time::Duration>,
-    answer_scroll: u16,
+    answer_scroll:     u16,
+    // contains Item IDs that have already received a full SRS for curr session
+    // any later rating of the same item (chain re-exposure) will only
+    // update analytics, leaving the schedule unchanged
+    session_rated:     HashSet<String>,
 }
 
 impl ReviewState {
@@ -77,6 +82,7 @@ impl ReviewState {
             done_items: 0,
             finished_duration: None,
             answer_scroll: 0,
+            session_rated: HashSet::new(),
         }
     }
 
@@ -119,7 +125,17 @@ impl ReviewState {
         let is_last_item = self.item_idx == self.session[self.card_idx].items.len() - 1;
         let card_id      = self.session[self.card_idx].card.id.clone();
 
-        store.record_review(&item_id, confidence, self.item_started_at.elapsed())?;
+        // a step is a chain re-exposure when it has already been fully
+        // scheduled once during this session.  Only applies to steps, simple
+        // forward/reverse items are never re-shown within a session
+        let chain_reexposure = is_step && self.session_rated.contains(&item_id);
+
+        store.record_review(&item_id, confidence, self.item_started_at.elapsed(), chain_reexposure)?;
+
+        // mark this item as having received its first full update this session
+        // later appearances (chain re-exposures) will skip rescheduling
+        self.session_rated.insert(item_id.clone());
+
         self.done_items += 1;
 
         if is_step && confidence <= 2 {
