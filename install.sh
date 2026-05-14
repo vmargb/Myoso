@@ -46,6 +46,8 @@ INSTALL_DIR="$HOME/.local/bin"
 mkdir -p "$INSTALL_DIR"
 
 echo "Installing to $INSTALL_DIR..."
+# remove old binary to avoid "Text file busy" errors during self-update
+rm -f "$INSTALL_DIR/$BIN_NAME" 
 mv "$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
 chmod +x "$INSTALL_DIR/$BIN_NAME"
 

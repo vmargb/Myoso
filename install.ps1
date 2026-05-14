@@ -1,11 +1,9 @@
 $ErrorActionPreference = "Stop"
-
 $Repo = "vmargb/myoso"
 $BinName = "myoso.exe"
 $Target = "x86_64-pc-windows-msvc"
 
 Write-Host "Fetching latest release..."
-
 $Release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
 $Tag = $Release.tag_name
 
@@ -29,8 +27,21 @@ Expand-Archive $Artifact -DestinationPath .
 $InstallDir = "$env:USERPROFILE\.myoso\bin"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-Move-Item "$BinName" "$InstallDir\$BinName" -Force
+$DestPath = "$InstallDir\$BinName"
+$OldPath = "$DestPath.old"
 
+# *** WINDOWS FILE LOCK BYPASS ***
+# cannot overwrite a running executable, but we can rename it
+if (Test-Path $DestPath) {
+    # delete any lingering .old file from a previous update
+    if (Test-Path $OldPath) {
+        Remove-Item $OldPath -Force -ErrorAction SilentlyContinue
+    }
+    # rename the currently running binary out of the way
+    Rename-Item -Path $DestPath -NewName "$BinName.old" -Force
+}
+
+Move-Item "$BinName" $DestPath -Force
 Write-Host "Installed to $InstallDir"
 
 # add to PATH if missing
@@ -38,12 +49,8 @@ $CurrentPath = [Environment]::GetEnvironmentVariable("PATH", "User")
 
 if ($CurrentPath -notlike "*$InstallDir*") {
     Write-Host "Adding to PATH..."
-    [Environment]::SetEnvironmentVariable(
-        "PATH",
-        "$CurrentPath;$InstallDir",
-        "User"
-    )
-    Write-Host "Restart your terminal to use 'myoso'"
+    [Environment]::SetEnvironmentVariable("PATH", "$CurrentPath;$InstallDir", "User")
+    Write-Host "Added to PATH. Restart your terminal."
 } else {
     Write-Host "Already in PATH"
 }
