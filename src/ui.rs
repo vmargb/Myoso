@@ -949,7 +949,7 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         KeyCode::Enter | KeyCode::Char(' ') if !is_done => {
             if let Some(r) = app.review.as_mut() { r.reveal(); }
         }
-        KeyCode::Char(c @ '1'..='5') if !is_done && phase == Some(ReviewPhase::Revealed) => {
+        KeyCode::Char(c @ '1'..='4') if !is_done && phase == Some(ReviewPhase::Revealed) => {
             if let Some(r) = app.review.as_mut() {
                 r.rate(store, c as u8 - b'0')?;
             }
@@ -2305,9 +2305,7 @@ fn render_review(f: &mut Frame, app: &AppState) {
             Span::styled("← fail   ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
             Span::styled(" [3] ", Style::default().fg(Color::Green)),
             Span::raw("Good  "),
-            Span::styled(" [4] ", Style::default().fg(Color::Cyan)),
-            Span::raw("Great  "),
-            Span::styled(" [5] ", Style::default().fg(Color::Blue)),
+            Span::styled(" [4] ", Style::default().fg(Color::Blue)),
             Span::raw("Easy  "),
             Span::styled(" [e] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::raw("Edit"),
@@ -2321,9 +2319,7 @@ fn render_review(f: &mut Frame, app: &AppState) {
                 Span::raw("Hard  "),
                 Span::styled(" [3] ", Style::default().fg(Color::Green)),
                 Span::raw("Good  "),
-                Span::styled(" [4] ", Style::default().fg(Color::Cyan)),
-                Span::raw("Great  "),
-                Span::styled(" [5] ", Style::default().fg(Color::Blue)),
+                Span::styled(" [4] ", Style::default().fg(Color::Blue)),
                 Span::raw("Easy  "),
                 Span::styled(" [e] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                 Span::raw("Edit"),

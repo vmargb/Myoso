@@ -52,12 +52,18 @@ impl Store {
                 prompt           TEXT NOT NULL,
                 answer           TEXT NOT NULL,
                 due_at           TEXT NOT NULL,
-                interval_days    REAL NOT NULL DEFAULT 1.0,
-                ease             REAL NOT NULL DEFAULT 2.5,
+                interval_days    REAL NOT NULL DEFAULT 0.0,
+                -- 'ease' column now stores FSRS memory stability (S) instead
+                -- the column is kept as 'ease' just for schema compatibility
+                ease             REAL NOT NULL DEFAULT 0.0,
                 last_reviewed_at TEXT,
                 lapses           INTEGER NOT NULL DEFAULT 0,
                 review_count     INTEGER NOT NULL DEFAULT 0,
-                confidence_avg   REAL NOT NULL DEFAULT 0.0
+                confidence_avg   REAL NOT NULL DEFAULT 0.0,
+                image_path       TEXT,
+                -- FSRS item difficulty (D) 0.0 = never reviewed by FSRS
+                -- bootstrapped fresh on next rating
+                difficulty       REAL NOT NULL DEFAULT 0.0
             );
 
             CREATE INDEX IF NOT EXISTS idx_items_card_pos ON items(card_id, position);
@@ -91,7 +97,10 @@ impl Store {
             ",
             )
             .context("schema migration")?;
-        // Safe migration for existing databases, add show_chain and markdown if absent
+
+        // safe migrations for databases that predate a given column
+        // each ALTER TABLE is intentionally allowed to fail silently when the
+        // column already exists
         let _ = self.conn.execute(
             "ALTER TABLE cards ADD COLUMN show_chain INTEGER NOT NULL DEFAULT 1",
             [],
@@ -108,6 +117,14 @@ impl Store {
             "ALTER TABLE review_log ADD COLUMN chain_reexposure INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // FSRS migration, add the difficulty column
+        // existing rows get difficulty = 0.0, which the scheduler treats as
+        // "never reviewed by FSRS" and bootstraps  afresh state on next rating
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN difficulty REAL NOT NULL DEFAULT 0.0",
+            [],
+        );
+
         Ok(())
     }
 
@@ -140,7 +157,7 @@ impl Store {
         Ok(card_id)
     }
 
-    // steps: (string, string, bool) -> (step name, answer, is_markdown)
+    // steps: (step name, answer, optional image path)
     pub fn add_multi_card(
         &self,
         deck: &str,
@@ -184,16 +201,19 @@ impl Store {
         prompt: &str,
         answer: &str,
         now: DateTime<Utc>,
-        image_path: Option<&str>
+        image_path: Option<&str>,
     ) -> Result<()> {
         let id = new_id();
-        // set due_at just before now so every new item is immediately reviewable
+        // due_at is set just before now so every new item is immediately reviewable
+        // interval_days, ease (stability), and difficulty all start at 0.0, so the
+        // scheduler treats difficulty == 0.0 as "never reviewed by FSRS" and will
+        // bootstrap fresh state on the first rating.
         let due = (now - chrono::Duration::seconds(1)).to_rfc3339();
         self.conn
             .execute(
                 "INSERT INTO items(id,card_id,position,kind,prompt,answer,due_at,
-                                   interval_days,ease,lapses,review_count,confidence_avg,image_path)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7, 1.0,2.5,0,0,0.0,?8)",
+                                   interval_days,ease,lapses,review_count,confidence_avg,image_path,difficulty)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7, 0.0,0.0,0,0,0.0,?8,0.0)",
                 params![id, card_id, pos, kind, prompt, answer, due, image_path],
             )
             .context("insert item")?;
@@ -223,10 +243,10 @@ impl Store {
 
         let rows = stmt
             .query_map(params![filter], |row| {
-                let kind: String       = row.get(1)?;
-                let rev: i32           = row.get(4)?;
-                let due: String        = row.get(5)?;
-                let rm: String         = row.get(7)?;
+                let kind: String            = row.get(1)?;
+                let rev: i32                = row.get(4)?;
+                let due: String             = row.get(5)?;
+                let rm: String              = row.get(7)?;
                 let tag_csv: Option<String> = row.get(8)?;
                 let tags = tag_csv
                     .map(|s| s.split(',').map(|t| t.to_string()).collect::<Vec<_>>())
@@ -356,33 +376,40 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id,card_id,position,kind,prompt,answer,due_at,
-                        interval_days,ease,last_reviewed_at,lapses,review_count,confidence_avg,image_path
+                // Column indices (0-based):
+                //  0 id | 1 card_id | 2 position | 3 kind | 4 prompt | 5 answer |
+                //  6 due_at | 7 interval_days | 8 ease(stability) |
+                //  9 last_reviewed_at | 10 lapses | 11 review_count |
+                //  12 confidence_avg | 13 image_path | 14 difficulty
+                "SELECT id, card_id, position, kind, prompt, answer, due_at,
+                        interval_days, ease, last_reviewed_at, lapses, review_count,
+                        confidence_avg, image_path, difficulty
                  FROM items WHERE card_id=?1 ORDER BY position ASC",
             )
             .context("prepare load_items")?;
 
         let rows = stmt
             .query_map(params![card_id], |row| {
-                let kind: String = row.get(3)?;
-                let due: String = row.get(6)?;
-                let last: Option<String> = row.get(9)?;
+                let kind: String             = row.get(3)?;
+                let due: String              = row.get(6)?;
+                let last: Option<String>     = row.get(9)?;
                 let image_path: Option<String> = row.get(13)?;
                 Ok(Item {
-                    id: row.get(0)?,
-                    card_id: row.get(1)?,
-                    position: row.get(2)?,
-                    kind: kind.parse().unwrap_or(ItemKind::Forward),
-                    prompt: row.get(4)?,
-                    answer: row.get(5)?,
-                    due_at: due.parse().unwrap_or_else(|_| Utc::now()),
-                    interval_days: row.get(7)?,
-                    ease: row.get(8)?,
+                    id:               row.get(0)?,
+                    card_id:          row.get(1)?,
+                    position:         row.get(2)?,
+                    kind:             kind.parse().unwrap_or(ItemKind::Forward),
+                    prompt:           row.get(4)?,
+                    answer:           row.get(5)?,
+                    due_at:           due.parse().unwrap_or_else(|_| Utc::now()),
+                    interval_days:    row.get(7)?,
+                    stability:        row.get(8)?,
                     last_reviewed_at: last.and_then(|s| s.parse().ok()),
-                    lapses: row.get(10)?,
-                    review_count: row.get(11)?,
-                    confidence_avg: row.get(12)?,
-                    image_path
+                    lapses:           row.get(10)?,
+                    review_count:     row.get(11)?,
+                    confidence_avg:   row.get(12)?,
+                    image_path,
+                    difficulty:       row.get(14)?,
                 })
             })
             .context("query items")?;
@@ -399,11 +426,11 @@ impl Store {
                 params![card_id],
                 |row| {
                     let kind: String = row.get(2)?;
-                    let rev: i32  = row.get(4)?;
-                    let sc: i32   = row.get(5)?;
-                    let ca: String = row.get(6)?;
-                    let ua: String = row.get(7)?;
-                    let rm: String = row.get(8)?;
+                    let rev: i32     = row.get(4)?;
+                    let sc: i32      = row.get(5)?;
+                    let ca: String   = row.get(6)?;
+                    let ua: String   = row.get(7)?;
+                    let rm: String   = row.get(8)?;
                     Ok(Card {
                         id:          row.get(0)?,
                         deck:        row.get(1)?,
@@ -423,41 +450,50 @@ impl Store {
 
     // ~~ Review recording ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    /// When 'chain_reexposure' is true, that means the item is a preceding step
-    /// that has already been fully scheduled once this session (the user is
-    /// replaying the chain to unlock a later step they failed). In that case
-    /// the SRS schedule (interval_days, ease, due_at, lapses) is left
-    /// untouched, only the analytics fields are updated.  This prevents
-    /// artificially inflated intervals caused by repeated same-session exposure
-    pub fn record_review(&self, item_id: &str, confidence: u8, duration: Duration, chain_reexposure: bool) -> Result<()> {
-        // load the current item state
+    /// record a review result and advance the item's FSRS schedule
+    /// chain_reexposure == true means this item is a preceding step that was
+    /// already fully scheduled earlier in the same session (so the user is
+    /// replaying the chain to unlock a step they failed). In that case the FSRS
+    /// state (stability, difficulty, interval_days, due_at, lapses) is left
+    /// completely untouched, and only the analytics counters are updated. Which
+    /// prevents the chain-replay reviews from *inflating* the item's stability
+    pub fn record_review(
+        &self,
+        item_id: &str,
+        confidence: u8,
+        duration: Duration,
+        chain_reexposure: bool,
+    ) -> Result<()> {
+        // load current item state
         let item = self
             .conn
             .query_row(
-                "SELECT id,card_id,position,kind,prompt,answer,due_at,
-                        interval_days,ease,last_reviewed_at,lapses,review_count,confidence_avg,image_path
+                "SELECT id, card_id, position, kind, prompt, answer, due_at,
+                        interval_days, ease, last_reviewed_at, lapses, review_count,
+                        confidence_avg, image_path, difficulty
                  FROM items WHERE id=?1",
                 params![item_id],
                 |row| {
-                    let kind: String = row.get(3)?;
-                    let due: String = row.get(6)?;
-                    let last: Option<String> = row.get(9)?;
+                    let kind: String             = row.get(3)?;
+                    let due: String              = row.get(6)?;
+                    let last: Option<String>     = row.get(9)?;
                     let image_path: Option<String> = row.get(13)?;
                     Ok(Item {
-                        id: row.get(0)?,
-                        card_id: row.get(1)?,
-                        position: row.get(2)?,
-                        kind: kind.parse().unwrap_or(ItemKind::Forward),
-                        prompt: row.get(4)?,
-                        answer: row.get(5)?,
-                        due_at: due.parse().unwrap_or_else(|_| Utc::now()),
-                        interval_days: row.get(7)?,
-                        ease: row.get(8)?,
+                        id:               row.get(0)?,
+                        card_id:          row.get(1)?,
+                        position:         row.get(2)?,
+                        kind:             kind.parse().unwrap_or(ItemKind::Forward),
+                        prompt:           row.get(4)?,
+                        answer:           row.get(5)?,
+                        due_at:           due.parse().unwrap_or_else(|_| Utc::now()),
+                        interval_days:    row.get(7)?,
+                        stability:        row.get(8)?,
                         last_reviewed_at: last.and_then(|s| s.parse().ok()),
-                        lapses: row.get(10)?,
-                        review_count: row.get(11)?,
-                        confidence_avg: row.get(12)?,
-                        image_path
+                        lapses:           row.get(10)?,
+                        review_count:     row.get(11)?,
+                        confidence_avg:   row.get(12)?,
+                        image_path,
+                        difficulty:       row.get(14)?,
                     })
                 },
             )
@@ -478,41 +514,35 @@ impl Store {
         let now = Utc::now();
 
         let updated = if is_daily {
-            // Daily mode: preserve SRS scheduling data entirely.
-            // Only update review tracking fields so last_reviewed_at is today.
-            let n      = item.review_count + 1;
-            let new_avg = if n == 1 {
-                confidence as f64
-            } else {
-                (item.confidence_avg * (n - 1) as f64 + confidence as f64) / n as f64
-            };
+            // daily mode, FSRS state is frozen, so only update analytics so that
+            // last_reviewed_at reflects today (used for the "reviewed today" gate)
+            let n       = item.review_count + 1;
+            let new_avg = rolling_avg(item.confidence_avg, item.review_count, confidence);
             Item { review_count: n, confidence_avg: new_avg, last_reviewed_at: Some(now), ..item }
         } else if chain_reexposure {
             // chain re-exposure: this step was already fully scheduled earlier
-            // in the same session. Update analytics only, leave the SRS state
-            // (interval_days, ease, due_at, lapses) completely unchanged so
-            // the schedule reflects the *first* honest recall
-            let n = item.review_count + 1;
-            let new_avg = if n == 1 {
-                confidence as f64
-            } else {
-                (item.confidence_avg * (n - 1) as f64 + confidence as f64) / n as f64
-            };
+            // this session. so update analytics only which leave FSRS state (stability,
+            // difficulty, interval_days, due_at, lapses) completely unchanged so
+            // the schedule reflects the *first* honest recall this session
+            let n       = item.review_count + 1;
+            let new_avg = rolling_avg(item.confidence_avg, item.review_count, confidence);
             Item { review_count: n, confidence_avg: new_avg, last_reviewed_at: Some(now), ..item }
         } else {
+            // normal SR review: hand off to the FSRS scheduler
             scheduler::apply_confidence(item, confidence, now)
         };
 
         self.conn
             .execute(
                 "UPDATE items
-                 SET due_at=?1, interval_days=?2, ease=?3, last_reviewed_at=?4,
-                     lapses=?5, review_count=?6, confidence_avg=?7
-                 WHERE id=?8",
+                 SET due_at=?1, interval_days=?2, ease=?3, difficulty=?4,
+                     last_reviewed_at=?5, lapses=?6, review_count=?7, confidence_avg=?8
+                 WHERE id=?9",
                 params![
                     updated.due_at.to_rfc3339(),
                     updated.interval_days,
-                    updated.ease,
+                    updated.stability,   // stored in 'ease' column
+                    updated.difficulty,
                     updated.last_reviewed_at.map(|t| t.to_rfc3339()),
                     updated.lapses,
                     updated.review_count,
@@ -522,7 +552,11 @@ impl Store {
             )
             .context("update item")?;
 
-        // Step-chain de-unlock only applies to SR cards
+        // step-chain de-unlock
+        // when a step is rated Again(1) or Hard(2) it was not recalled well
+        // enough. So all subsequent steps from it are immediately due so the user
+        // must rebuild the full chain from this point on their next session
+        // This only applies to SR cards (never daily mode) (obviously)
         if !is_daily && updated.kind == ItemKind::Step && confidence <= 2 {
             self.conn
                 .execute(
@@ -614,7 +648,7 @@ impl Store {
     // ~~ Stats & export ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     pub fn stats(&self) -> Result<Stats> {
-        let now = Utc::now().to_rfc3339();
+        let now   = Utc::now().to_rfc3339();
         let today = Utc::now().format("%Y-%m-%d").to_string();
         Ok(Stats {
             cards: self
@@ -716,8 +750,9 @@ impl Store {
             if reset_metadata {
                 for item in &mut items {
                     item.due_at           = now - chrono::Duration::seconds(1);
-                    item.interval_days    = 1.0;
-                    item.ease             = 2.5;
+                    item.interval_days    = 0.0;
+                    item.stability        = 0.0;
+                    item.difficulty       = 0.0;
                     item.last_reviewed_at = None;
                     item.lapses           = 0;
                     item.review_count     = 0;
@@ -737,10 +772,12 @@ impl Store {
     }
 
 
-    // ~~ Import ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    /// works for both full exports and single-deck exports
-    /// cards/items where ID already exists in the DB are replaced
+    /// both full exports and single-deck exports
+    /// Cards/items whose ID already exists in the DB are replaced
+    /// Older exports that predate FSRS carry `ease` (SM-2 factor) and no
+    /// `difficulty` fieldm the `#[serde(default)]` on `Item::difficulty`
+    /// ensures those deserialise to 0.0, which the scheduler treats as
+    /// "never reviewed by FSRS" and bootstraps fresh on next rating
     pub fn import_json(&self, data: &[u8]) -> Result<ImportSummary> {
         #[derive(serde::Deserialize)]
         struct ImportFile {
@@ -799,8 +836,8 @@ impl Store {
                         "INSERT OR REPLACE INTO items
                             (id, card_id, position, kind, prompt, answer, due_at,
                             interval_days, ease, last_reviewed_at,
-                            lapses, review_count, confidence_avg, image_path)
-                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                            lapses, review_count, confidence_avg, image_path, difficulty)
+                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                         params![
                             item.id,
                             item.card_id,
@@ -810,12 +847,13 @@ impl Store {
                             item.answer,
                             item.due_at.to_rfc3339(),
                             item.interval_days,
-                            item.ease,
+                            item.stability,      // stored in 'ease' column
                             item.last_reviewed_at.map(|t| t.to_rfc3339()),
                             item.lapses,
                             item.review_count,
                             item.confidence_avg,
-                            item.image_path
+                            item.image_path,
+                            item.difficulty,
                         ],
                     )
                     .context("upsert item")?;
@@ -963,6 +1001,7 @@ impl Store {
 
         Ok(())
     }
+
     // ~~ Review-mode helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     /// Toggle a single card between Daily and Spaced Repetition.
@@ -1085,6 +1124,16 @@ fn due_items_for_card(kind: &CardKind, items: &[Item], now: DateTime<Utc>) -> Ve
             None => vec![],
         },
         CardKind::Simple => items.iter().filter(|it| it.due_at <= now).cloned().collect(),
+    }
+}
+
+/// increment a running average without keeping a running sum
+fn rolling_avg(prev_avg: f64, prev_count: i32, new_value: u8) -> f64 {
+    let n = (prev_count + 1) as f64;
+    if prev_count == 0 {
+        new_value as f64
+    } else {
+        (prev_avg * prev_count as f64 + new_value as f64) / n
     }
 }
 

@@ -32,8 +32,8 @@ impl FromStr for CardKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "simple" => Ok(CardKind::Simple),
-            "multi" => Ok(CardKind::Multi),
-            _ => Err(format!("unknown card kind: {s}")),
+            "multi"  => Ok(CardKind::Multi),
+            _        => Err(format!("unknown card kind: {s}")),
         }
     }
 }
@@ -54,7 +54,7 @@ impl ItemKind {
         match self {
             ItemKind::Forward => "forward",
             ItemKind::Reverse => "reverse",
-            ItemKind::Step => "step",
+            ItemKind::Step    => "step",
         }
     }
 }
@@ -129,6 +129,17 @@ pub struct Card {
 fn default_show_chain() -> bool { true }
 
 /// A single reviewable unit within a card.
+///
+/// # FSRS scheduling fields
+/// - `stability`  – FSRS memory stability S (days until ~90 % retention).
+///                  Stored in the `ease` DB column for schema compatibility.
+/// - `difficulty` – FSRS item difficulty D (1–10 scale internally).
+///                  Stored in the newly-added `difficulty` DB column.
+///
+/// Items that have never been reviewed by FSRS carry `stability == 0.0` and
+/// `difficulty == 0.0`; the scheduler uses this as a sentinel to bootstrap
+/// fresh FSRS state on the first rating rather than treating stale SM-2
+/// `ease` values as valid FSRS stability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
     pub id: String,
@@ -139,7 +150,14 @@ pub struct Item {
     pub answer: String,
     pub due_at: DateTime<Utc>,
     pub interval_days: f64,
-    pub ease: f64,
+    /// FSRS memory stability S.  Serialised as `"ease"` for backward
+    /// compatibility with existing JSON exports.
+    #[serde(rename = "ease", alias = "stability")]
+    pub stability: f64,
+    /// FSRS item difficulty D.  Defaults to 0.0 in older exports / DB rows,
+    /// which triggers a fresh FSRS bootstrap on the next review.
+    #[serde(default)]
+    pub difficulty: f64,
     pub last_reviewed_at: Option<DateTime<Utc>>,
     pub lapses: i32,
     pub review_count: i32,
