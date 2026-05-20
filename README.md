@@ -96,7 +96,7 @@ Once the demand is gone(e.g. after the exam), you can move those cards back into
 
 ## Scheduling algorithm
 
-Myoso now uses **FSRS** (Free Spaced Repetition Scheduler), a modern memory model that is used to track each **item** (step) independently using two properties:
+`Myoso` now uses **FSRS** (Free Spaced Repetition Scheduler), a modern memory model that is used to track each **item** (step) independently using two properties:
 1. *stability* (how long the memory lasts)
 2. *difficulty* (how hard the item is for you personally)
 
@@ -109,8 +109,6 @@ Intervals are calculated to target a 90% recall probability at review time, and 
 | `3` | **Good**: recalled correctly with some effort |
 | `4` | **Easy**: recalled instantly and effortlessly |
 
-For **multi-step** cards the session logic is:
-- Find the earliest-due step (by position).
-- Include **all preceding steps** plus that step in the session.
+For **multi-step** cards the session logic is, find the earliest-due step (by position), then include **all preceding steps** plus that step in the session. This forces you to rebuild the full chain from step 1 every time, rather than practicing the due step in isolation. The new behaviour in `Myoso` is that rating any *preceding* step **Again** or **Hard** immediately makes all subsequent steps due, so the chain must be rebuilt from that point on your next session.
 
-This forces you to rebuild the full chain from step 1 every time, not just practise the due step in isolation. The unique behaviour in Myoso is that rating a step **Again** or **Hard** immediately makes all subsequent steps due, so the chain must be rebuilt from that point on your next session.
+Additionally, `Myoso` uniquely handles the problem of **chain re-exposure**, meaning rating a step as *easy* because you had recently just saw it(from rebuilding the chain) will not artificially inflate the cards schedule. This behaviour only applies to multi-step cards.
