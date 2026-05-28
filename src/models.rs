@@ -186,6 +186,8 @@ pub struct CardSummary {
     pub due_at: DateTime<Utc>,
     pub review_mode: ReviewMode,
     pub tags: Vec<String>,
+    // space-joined item answers used for answer-scope searching
+    pub answers_text: String,
 }
 
 /// Aggregate counts for the `stats` command.

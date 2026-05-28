@@ -230,7 +230,8 @@ impl Store {
                 "SELECT c.id, c.kind, c.deck, c.question, c.reversible,
                         MIN(i.due_at) AS due_at, COUNT(DISTINCT i.id) AS item_count,
                         c.review_mode,
-                        GROUP_CONCAT(DISTINCT t.name) AS tag_names
+                        GROUP_CONCAT(DISTINCT t.name) AS tag_names,
+                        GROUP_CONCAT(i.answer, ' ')   AS answers_text
                 FROM cards c
                 JOIN items i ON i.card_id = c.id
                 LEFT JOIN card_tags ct ON ct.card_id = c.id
@@ -248,19 +249,21 @@ impl Store {
                 let due: String             = row.get(5)?;
                 let rm: String              = row.get(7)?;
                 let tag_csv: Option<String> = row.get(8)?;
+                let answers: Option<String> = row.get(9)?;
                 let tags = tag_csv
                     .map(|s| s.split(',').map(|t| t.to_string()).collect::<Vec<_>>())
                     .unwrap_or_default();
                 Ok(CardSummary {
-                    card_id:     row.get(0)?,
-                    kind:        kind.parse().unwrap_or(CardKind::Simple),
-                    deck:        row.get(2)?,
-                    question:    row.get(3)?,
-                    reversible:  rev != 0,
-                    item_count:  row.get(6)?,
-                    due_at:      due.parse().unwrap_or_else(|_| Utc::now()),
-                    review_mode: rm.parse().unwrap_or_default(),
+                    card_id:      row.get(0)?,
+                    kind:         kind.parse().unwrap_or(CardKind::Simple),
+                    deck:         row.get(2)?,
+                    question:     row.get(3)?,
+                    reversible:   rev != 0,
+                    item_count:   row.get(6)?,
+                    due_at:       due.parse().unwrap_or_else(|_| Utc::now()),
+                    review_mode:  rm.parse().unwrap_or_default(),
                     tags,
+                    answers_text: answers.unwrap_or_default(),
                 })
             })
             .context("query list_cards")?;

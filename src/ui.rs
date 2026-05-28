@@ -476,6 +476,35 @@ impl AddCardState {
     }
 }
 
+// ~~~ SearchScope ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// switch between different search scopes: quesion, answer and both
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SearchScope {
+    #[default]
+    Questions,  // question + deck (default behaviour)
+    Answers,    // item answers / steps only
+    Both,       // question + deck + answers
+}
+
+impl SearchScope {
+    fn label(self) -> &'static str {
+        match self {
+            SearchScope::Questions => "Q",
+            SearchScope::Answers   => "A",
+            SearchScope::Both      => "Q+A",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            SearchScope::Questions => SearchScope::Answers,
+            SearchScope::Answers   => SearchScope::Both,
+            SearchScope::Both      => SearchScope::Questions,
+        }
+    }
+}
+
 // ~~~ ListCards state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 struct ListCardsState {
@@ -486,6 +515,7 @@ struct ListCardsState {
     // search
     search_query:      String,
     search_active:     bool,
+    search_scope:      SearchScope,
     // tag filter
     tag_filter:        Vec<String>,
     tag_picker_active: bool,
@@ -504,6 +534,7 @@ impl ListCardsState {
             confirm_delete:    false,
             search_query:      String::new(),
             search_active:     false,
+            search_scope:      SearchScope::default(),
             tag_filter:        Vec::new(),
             tag_picker_active: false,
             tag_picker_tags:   Vec::new(),
@@ -514,9 +545,20 @@ impl ListCardsState {
     fn filtered_cards(&self) -> Vec<&CardSummary> {
         let q = self.search_query.to_lowercase();
         self.cards.iter().filter(|c| {
-            let text_ok = q.is_empty()
-                || c.question.to_lowercase().contains(&q)
-                || c.deck.to_lowercase().contains(&q);
+            let text_ok = q.is_empty() || match self.search_scope {
+                SearchScope::Questions => {
+                    c.question.to_lowercase().contains(&q)
+                        || c.deck.to_lowercase().contains(&q)
+                }
+                SearchScope::Answers => {
+                    c.answers_text.to_lowercase().contains(&q)
+                }
+                SearchScope::Both => {
+                    c.question.to_lowercase().contains(&q)
+                        || c.deck.to_lowercase().contains(&q)
+                        || c.answers_text.to_lowercase().contains(&q)
+                }
+            };
             let tag_ok = self.tag_filter.is_empty()
                 || self.tag_filter.iter().all(|ft| c.tags.iter().any(|ct| ct == ft));
             text_ok && tag_ok
@@ -908,7 +950,7 @@ fn event_loop(
                     Screen::Review    => on_review(app, key.code)?,
                     Screen::AddCard   => on_add_card(app, key)?,
                     Screen::ListDecks => on_list_decks(app, key.code)?,
-                    Screen::ListCards => on_list_cards(app, key.code)?,
+                    Screen::ListCards => on_list_cards(app, key)?,
                     Screen::Export    => on_export(app, key.code)?,
                     Screen::Import    => on_import(app, key.code)?,
                 }
@@ -1269,7 +1311,9 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn on_list_cards(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
+fn on_list_cards(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
+    let code = key.code;
+
     // ~~ tag picker overlay ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if app.list_cards.as_ref().map_or(false, |lc| lc.tag_picker_active) {
         match code {
@@ -1325,6 +1369,7 @@ fn on_list_cards(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 if let Some(lc) = app.list_cards.as_mut() {
                     lc.search_query.clear();
                     lc.search_active = false;
+                    lc.search_scope = SearchScope::default();
                     let n = lc.filtered_cards().len();
                     lc.list_state.select(if n > 0 { Some(0) } else { None });
                 }
@@ -1336,11 +1381,20 @@ fn on_list_cards(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                     lc.list_state.select(if n > 0 { Some(0) } else { None });
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            // type into the search query instead for j/k (bug fix)
+            KeyCode::Down => {
                 if let Some(lc) = app.list_cards.as_mut() { lc.next(); }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 if let Some(lc) = app.list_cards.as_mut() { lc.prev(); }
+            }
+            // tab cycles the search scope Q -> A -> Q+A -> Q etc...
+            KeyCode::Tab => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.search_scope = lc.search_scope.next();
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                }
             }
             KeyCode::Char(c) => {
                 if let Some(lc) = app.list_cards.as_mut() {
@@ -3055,7 +3109,7 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
             .collect::<Vec<_>>()
             .join("");
         let search_indicator = if !lc.search_query.is_empty() {
-            format!(" [/{}]", lc.search_query)
+            format!(" [/{}] ({})", lc.search_query, lc.search_scope.label())
         } else {
             String::new()
         };
@@ -3078,14 +3132,19 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
     let bottom_lines = if lc.search_active {
         vec![
             Line::from(vec![
-                Span::styled(" Search: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(" Search ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("[{}]", lc.search_scope.label()),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(": ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!("{}▌", lc.search_query),
                     Style::default().fg(Color::White),
                 ),
             ]),
             Line::from(Span::styled(
-                " [j/k] navigate  │  [Esc] cancel search  │  [Enter] select",
+                " [↑ /↓ ] navigate  │  [Tab] cycle scope (Q/A/Q+A)  │  [Esc] cancel  │  [Enter] select",
                 Style::default().fg(Color::DarkGray),
             )),
         ]
