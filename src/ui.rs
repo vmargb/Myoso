@@ -1365,6 +1365,70 @@ fn on_list_cards(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
     // ~~ search mode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if app.list_cards.as_ref().map_or(false, |lc| lc.search_active) {
         match code {
+            // enter: leave search edit mode but keep the filter
+            KeyCode::Enter => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.search_active = false;
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+
+            // esc: clear the query and leave search edit mode
+            KeyCode::Esc => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.search_query.clear();
+                    lc.search_active = false;
+                    lc.search_scope = SearchScope::default();
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+
+            KeyCode::Backspace => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.search_query.pop();
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.next();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.prev();
+                }
+            }
+
+            // tab cycles the search scope Q -> A -> Q+A -> Q etc...
+            KeyCode::Tab => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.search_scope = lc.search_scope.next();
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+
+            KeyCode::Char(c) => {
+                if let Some(lc) = app.list_cards.as_mut() {
+                    lc.search_query.push(c);
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                }
+            }
+
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // ~~ search mode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    if app.list_cards.as_ref().map_or(false, |lc| lc.search_active) {
+        match code {
             KeyCode::Esc => {
                 if let Some(lc) = app.list_cards.as_mut() {
                     lc.search_query.clear();
@@ -1407,7 +1471,6 @@ fn on_list_cards(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-
     // ~~ confirm delete ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if app.list_cards.as_ref().map_or(false, |lc| lc.confirm_delete) {
         if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
@@ -1434,8 +1497,6 @@ fn on_list_cards(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
 
     // ~~ normal mode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.go_back(),
-
         KeyCode::Down | KeyCode::Char('j') => {
             if let Some(lc) = app.list_cards.as_mut() { lc.next(); }
         }
@@ -1443,15 +1504,30 @@ fn on_list_cards(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
             if let Some(lc) = app.list_cards.as_mut() { lc.prev(); }
         }
 
-        // activate text search
+        // activate text search (keep existing query so it can be edited)
         KeyCode::Char('/') => {
             if let Some(lc) = app.list_cards.as_mut() {
                 lc.search_active = true;
-                lc.search_query.clear();
                 let n = lc.filtered_cards().len();
                 lc.list_state.select(if n > 0 { Some(0) } else { None });
             }
         }
+
+        // esc clears an active filter first, otherwise it goes back
+        KeyCode::Esc => {
+            if let Some(lc) = app.list_cards.as_mut() {
+                if !lc.search_query.is_empty() {
+                    lc.search_query.clear();
+                    lc.search_scope = SearchScope::default();
+                    let n = lc.filtered_cards().len();
+                    lc.list_state.select(if n > 0 { Some(0) } else { None });
+                } else {
+                    app.go_back();
+                }
+            }
+        }
+
+        KeyCode::Char('q') => app.go_back(),
 
         // open tag-filter picker
         KeyCode::Char('#') => {
@@ -3144,7 +3220,17 @@ fn render_list_cards(f: &mut Frame, app: &mut AppState) {
                 ),
             ]),
             Line::from(Span::styled(
-                " [↑ /↓ ] navigate  │  [Tab] cycle scope (Q/A/Q+A)  │  [Esc] cancel  │  [Enter] select",
+                " [Enter] done  │  [Esc] clear  │  [Tab] scope  │  [↑ /↓ ] navigate",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    } else if !lc.search_query.is_empty() {
+        let tag_hint = if !lc.tag_filter.is_empty() { "[#] tags ✓" } else { "[#] filter tags" };
+        vec![
+            Line::from(Span::styled(
+                format!(
+                    " [/] edit search  │  [Esc] clear filter  │  {tag_hint}  │  [e] edit  │  [m] toggle SR/daily  │  [d] delete"
+                ),
                 Style::default().fg(Color::DarkGray),
             )),
         ]
