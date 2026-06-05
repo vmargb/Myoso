@@ -188,7 +188,7 @@ impl Store {
             } else {
                 name.trim().to_string()
             };
-            self.insert_item(&card_id, pos as i32, "step", &label, answer, now, img.as_deref())?;
+            self.insert_item(&card_id, pos as i32, "step", label.as_str(), answer, now, img.as_deref())?;
         }
         Ok(card_id)
     }
@@ -989,7 +989,7 @@ impl Store {
                     )
                     .context("update step item")?;
             } else {
-                self.insert_item(card_id, pos, "step", &label, answer, now, img.as_deref())?;
+                self.insert_item(card_id, pos, "step", label.as_str(), answer, now, img.as_deref())?;
             }
         }
 
