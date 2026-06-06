@@ -17,7 +17,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use rfd::FileDialog;
 
 use crate::db::Store;
-use crate::models::ReviewMode;
+use crate::models::{ReviewMode, SessionLimits};
 
 use state::{
     AddCardState, AddKind, AddPhase, AppState, ExportFocus, ImportFocus,
@@ -814,7 +814,7 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 let deck = app.list_decks.as_ref()
                     .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
                 if let Some(deck) = deck {
-                    let session = app.store.due_session(Some(&deck))?;
+                    let session = app.store.due_session(Some(&deck), &SessionLimits::default())?;
                     app.review = Some(ReviewState::new(session));
                     app.go_to(Screen::Review);
                 }
@@ -877,7 +877,7 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
             let deck = app.list_decks.as_ref()
                 .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
             if let Some(deck) = deck {
-                let session = app.store.due_session(Some(&deck))?;
+                let session = app.store.due_session(Some(&deck), &SessionLimits::default())?;
                 app.review = Some(ReviewState::new(session));
                 app.go_to(Screen::Review);
             }

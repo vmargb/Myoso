@@ -208,6 +208,46 @@ pub struct ImportSummary {
     pub cards_replaced: usize,  // cards whose ID already existed
 }
 
+// ~~~ Session limits ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// controls how many cards enter a single review session to not overwhelm you
+//
+// `due_session` splits SR cards into two buckets:
+//   reviews – cards where at least one item has been reviewed before
+//             capped by `max_reviews` (default 200)
+//   new – cards where every item still has `review_count == 0`
+//         capped by `new_cards` (default 20)
+//
+// daily-mode cards are never subject to these limits (hence dailies)
+// `SessionLimits::unlimited()` to remove the cap entirely
+#[derive(Debug, Clone)]
+pub struct SessionLimits {
+    // maximum review cards shown per session
+    pub max_reviews: usize,
+    // maximum new cards introduced per session
+    pub new_cards: usize,
+}
+
+impl Default for SessionLimits {
+    fn default() -> Self {
+        Self {
+            max_reviews: 200,
+            new_cards:   20,
+        }
+    }
+}
+
+// Use this later for unlimited flag
+// impl SessionLimits {
+//     pub fn new(max_reviews: usize, new_cards: usize) -> Self {
+//         Self { max_reviews, new_cards }
+//     }
+//     // removes both caps, equivalent to setting 9999 in Anki's deck options
+//     pub fn unlimited() -> Self {
+//         Self { max_reviews: usize::MAX, new_cards: usize::MAX }
+//     }
+// }
+
 // ~~~ Sub-deck ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // deck names use '::' separators: "Math::Calculus::Integrals"
 // no schema changes since the deck column stores the full path as TEXT

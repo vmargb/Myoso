@@ -273,7 +273,12 @@ impl Store {
     }
 
     // load all cards that have at least one due item and build a review session
-    pub fn due_session(&self, deck: Option<&str>) -> Result<Vec<ReviewCard>> {
+    // `limits' enforces Anki-style per-session caps:
+    //    up to `limits.max_reviews` SR cards that have been seen before
+    //    up to `limits.new_cards`   SR cards being introduced for the FIRST time
+    // the caps don't apply to daily mode cards
+    // pass `SessionLimits::unlimited()' to get unlimited
+    pub fn due_session(&self, deck: Option<&str>, limits: &SessionLimits) -> Result<Vec<ReviewCard>> {
         let filter = deck.unwrap_or("");
         let now    = Utc::now();
         let today  = now.format("%Y-%m-%d").to_string();
@@ -286,8 +291,8 @@ impl Store {
 
         let mut session = Vec::new();
 
-        // ── Daily cards first ─────────────────────────────────────────────
-        // Include ALL items; skip card only if every item was reviewed today.
+        // daily cards first
+        // include ALL items, skip card only if every item was reviewed today
         for card in daily_cards {
             let items = self.load_items(&card.id)?;
             let needs_review = items.iter().any(|it| {
@@ -300,14 +305,37 @@ impl Store {
             }
         }
 
-        // ── Spaced-repetition cards ───────────────────────────────────────
+        // SRS cards (not dailies)
+        // split due SR cards into two buckets before enforcing caps:
+        //  reviews – at least one item in the card has been reviewed before
+        //             These are retention-critical and fill the session first
+        //  new     – every item still has review_count == 0 (never introduced)
+        //             New cards are appended after reviews, up to the new-card cap
+        //
+        // The "is new" test looks at all items, not just the due subset, so a
+        // multi-step card where step 1 has been reviewed but step 2 is newly due
+        // is correctly classified as a review card, not a new card
+        let mut sr_reviews: Vec<ReviewCard> = Vec::new();
+        let mut sr_new:     Vec<ReviewCard> = Vec::new();
+
         for card in sr_cards {
             let items    = self.load_items(&card.id)?;
             let selected = due_items_for_card(&card.kind, &items, now);
-            if !selected.is_empty() {
-                session.push(ReviewCard { card, items: selected });
+            if selected.is_empty() { continue; }
+
+            if items.iter().all(|it| it.review_count == 0) {
+                sr_new.push(ReviewCard { card, items: selected });
+            } else {
+                sr_reviews.push(ReviewCard { card, items: selected });
             }
         }
+
+        // Apply caps then merge: reviews before new cards
+        sr_reviews.truncate(limits.max_reviews);
+        sr_new.truncate(limits.new_cards);
+
+        session.extend(sr_reviews);
+        session.extend(sr_new);
 
         Ok(session)
     }

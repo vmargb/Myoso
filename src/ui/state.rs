@@ -10,7 +10,7 @@ use std::time::Instant;
 use ratatui::widgets::ListState;
 
 use crate::db::Store;
-use crate::models::{Card, CardKind, CardSummary, Item, ItemKind, ReviewCard, ReviewMode, Stats};
+use crate::models::{Card, CardKind, CardSummary, Item, ItemKind, ReviewCard, ReviewMode, Stats, SessionLimits};
 
 // ~~~ Screens ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -791,7 +791,7 @@ impl<'a> AppState<'a> {
         self.flash = None;
         match self.menu_state.selected() {
             Some(0) => {
-                let session = self.store.due_session(None)?;
+                let session = self.store.due_session(None, &SessionLimits::default())?;
                 self.review = Some(ReviewState::new(session));
                 self.go_to(Screen::Review);
             }
