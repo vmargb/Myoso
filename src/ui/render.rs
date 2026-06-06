@@ -91,7 +91,7 @@ pub(super) fn render_menu(f: &mut Frame, app: &mut AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(20),
-            Constraint::Length(3),
+            Constraint::Length(8),
             Constraint::Length(MENU_ITEMS as u16 + 2),
             Constraint::Min(1),
         ])
@@ -109,19 +109,33 @@ pub(super) fn render_menu(f: &mut Frame, app: &mut AppState) {
             .split(area)[1]
     };
 
-    // Title
-    f.render_widget(
-        Paragraph::new(vec![
+    let title_art = vec![
+        " __   __ _  _  _  _________ ___  ",
+        "│  ╲ ╱  │ ││ ││ │╱ _ ╲  ___) _ ╲ ",
+        "│   v   │ ╲│ │╱ │ │ │ ╲ ╲ │ │ │ │",
+        "│ │╲_╱│ │╲_   _╱│ │ │ │> >│ │ │ │",
+        "│ │   │ │  │ │  │ │_│ ╱ ╱_│ │_│ │",
+        "│_│   │_│  │_│   ╲___╱_____)___╱ ",
+    ];
+
+    let mut title_lines: Vec<Line> = title_art
+        .into_iter()
+        .map(|line| {
             Line::from(Span::styled(
-                "Myoso",
+                line,
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "Step-by-step flashcards for the terminal",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ])
-        .alignment(Alignment::Center),
+            ))
+        })
+        .collect();
+
+    title_lines.push(Line::from("")); // empty line for spacing
+    title_lines.push(Line::from(Span::styled(
+        "Step-by-step flashcards for the terminal",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    f.render_widget(
+        Paragraph::new(title_lines).alignment(Alignment::Center),
         v[1],
     );
 
@@ -145,8 +159,19 @@ pub(super) fn render_menu(f: &mut Frame, app: &mut AppState) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(" Menu "),
+                    .border_type(BorderType::Thick)
+                    .title(" Menu ")
+                    .title_style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            // .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .border_style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD), 
+                    ),
             )
             .highlight_style(
                 Style::default()
