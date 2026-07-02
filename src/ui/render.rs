@@ -300,11 +300,6 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
         v[0],
     );
 
-    let content = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(v[1]);
-
     let daily_prefix = if rc.card.review_mode.is_daily() { "★ DAILY  " } else { "" };
     let prompt_label = if rc.card.kind == CardKind::Multi {
         format!(
@@ -334,19 +329,8 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
         item.prompt.as_str()
     };
 
-    f.render_widget(
-        Paragraph::new(display_prompt)
-            .block(Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(prompt_label)
-                .title_style(prompt_title_style))
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        content[0],
-    );
-
-    let mut lines: Vec<Line> = Vec::new();
+    // context lines are shared by both phases, multi-card breadcrumb/chain or a plain kind label
+    let mut context_lines: Vec<Line> = Vec::new();
 
     if rc.card.kind == CardKind::Multi {
         let total_in_session = rc.items.len();
@@ -370,8 +354,8 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
             ));
         }
-        lines.push(Line::from(crumb_spans));
-        lines.push(Line::from(""));
+        context_lines.push(Line::from(crumb_spans));
+        context_lines.push(Line::from(""));
 
         // ~~ Preceding steps rebuild context ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if rc.card.show_chain {
@@ -383,17 +367,17 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
                 } else {
                     format!("  {}. {} ✓", i + 1, prev.prompt)
                 };
-                lines.push(Line::from(Span::styled(
+                context_lines.push(Line::from(Span::styled(
                     display_label,
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
                 )));
                 for l in prev.answer.lines() {
-                    lines.push(Line::from(Span::styled(
+                    context_lines.push(Line::from(Span::styled(
                         format!("    {l}"),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
-                lines.push(Line::from(""));
+                context_lines.push(Line::from(""));
             }
         }
 
@@ -404,7 +388,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
             format!("  {}. {}  ", rs.item_idx + 1, item.prompt)
         };
         if is_target {
-            lines.push(Line::from(vec![
+            context_lines.push(Line::from(vec![
                 Span::styled(
                     cur_step_label,
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -415,7 +399,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
                 ),
             ]));
         } else {
-            lines.push(Line::from(vec![
+            context_lines.push(Line::from(vec![
                 Span::styled(
                     cur_step_label,
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -428,22 +412,59 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
             ItemKind::Reverse => "  Question  (reverse card)",
             ItemKind::Step    => "  Step",
         };
-        lines.push(Line::from(Span::styled(
+        context_lines.push(Line::from(Span::styled(
             hint,
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )));
     }
 
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    // ONE stable card for BOTH phases, same position/size always, so revealing
+    // never repositions or resizes anything, it only grows the content inside
+    let card = centered_rect(80, v[1].height.saturating_sub(2).max(10), v[1]);
+
+    let mut lines: Vec<Line> = vec![Line::from(""), Line::from("")];
+    for l in display_prompt.lines() {
+        lines.push(Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+    }
     lines.push(Line::from(""));
+    lines.extend(context_lines);
+
+    let border_color = match rs.phase {
+        ReviewPhase::Thinking => Color::DarkGray,
+        ReviewPhase::Revealed => Color::Cyan,
+    };
+
+    let ans_title = match rs.phase {
+        ReviewPhase::Thinking => String::new(),
+        ReviewPhase::Revealed if item.image_path.is_some() => " Answer • image attached ".to_string(),
+        ReviewPhase::Revealed => " Answer ".to_string(),
+    };
 
     match rs.phase {
         ReviewPhase::Thinking => {
+            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  [ Space / Enter to reveal ]",
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
             )));
         }
         ReviewPhase::Revealed => {
+            lines.push(Line::from(""));
+            let divider_width = (card.width as usize).saturating_sub(4).clamp(10, 60);
+            lines.push(Line::from(Span::styled(
+                format!("  {}", "─".repeat(divider_width)),
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                ans_title.trim().to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+
             if item.image_path.is_some() {
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -475,25 +496,19 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
         }
     }
 
-    let ans_title = if rs.phase == ReviewPhase::Thinking {
-        " Answer (hidden) "
-    } else if item.image_path.is_some() {
-        " Answer • image attached "
-    } else {
-        " Answer "
-    };
-
     f.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .title(ans_title),
+                    .border_style(Style::default().fg(border_color))
+                    .title(prompt_label)
+                    .title_style(prompt_title_style),
             )
             .wrap(Wrap { trim: false })
             .scroll((rs.answer_scroll, 0)),
-        content[1],
+        card,
     );
 
     let footer = if rs.phase == ReviewPhase::Thinking {

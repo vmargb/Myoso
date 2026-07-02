@@ -16,13 +16,13 @@
 
 ## What is it?
 
-Standard flashcard apps are great for 1:1 facts and definitions but struggle with long chains of thought or
-**procedural knowledge**:
+Ordinary flashcard apps are great for 1:1 facts and definitions but struggle with *long chain of thought* or
+**Step-by-step knowledge**:
 - "What are all the verb endings in past tense?"
-- "how do I reverse a linked list?"
+- "how do you reverse a linked list?"
 - "walk me through this derivation".
 
-Standard flashcard *can* be used in this way, but end up adding too much mental load to each card. Myoso models each procedure as an ordered sequence of steps. During review you reveal and rate each step individually, unlocking later steps only after earlier ones are recalled. Forgetting an earlier step automatically blocks access to the subsequent steps until you rebuild the chain again, which reinforces the full procedural flow rather than merely memorising isolated bits.
+Standard flashcard *can* be used in this way, but end up carrying too much **mental load** on each card. Myoso fixes this problem by modellling your answer as an ordered sequence of steps. During review, you **reveal and rate each step** individually, unlocking later steps only after earlier ones are recalled well. Likewise, forgetting an *earlier* step naturally blocks access to the subsequent steps until you **rebuild the chain again**. This reinforces the full procedural flow, rather than merely memorising isolated bits as normal flashcards would do.
 
 ---
 
@@ -75,9 +75,8 @@ cargo run
 - **Analytics**: Simple statistics of deck/card data, current progress and currently due sessions.
 - **Reversible cards**: Support for making cards reversible, where q->a becomes a->q.
 - **Step-by-step cards**: Cards that require multiple steps towards the answers, where each step is rated individually.
-- **Multi-line support**: Add or edit multiple lines within question and answer textboxes.
 - **Import/Export**: Export a specific deck or all decks into `JSON` format, which can be imported by anyone else.
-- **External Editor Support**: Open any textbox in your default editor (e.g., Neovim, VS Code, Notepad) directly from the TUI. Works seamlessly across all operating systems. Save and close the editor to automatically return to the TUI with your updated text.
+- **External Editor Support**: Open any textbox in your default editor (e.g., Neovim, VS Code, Notepad) directly from the TUI. Works seamlessly across all operating systems. Close the editor to automatically return to the TUI with your updated text.
 - **Markdown Rendering**: All markdown formatting (e.g., bold, italics, lists) is now rendered during review sessions.
 - **Syntax Highlighting**: Code blocks in markdown are syntax-highlighted for any programming language.
 - **Image preview**: Insert path to images locally into an answer/step (handwritten work or screenshot)
@@ -96,7 +95,7 @@ Once the demand is gone(e.g. after the exam), you can move those cards back into
 
 ## Scheduling algorithm
 
-`Myoso` now uses **FSRS** (Free Spaced Repetition Scheduler), a modern memory model that is used to track each **item** (step) independently using two properties:
+`Myoso` now uses **FSRS** (Free Spaced Repetition Scheduler). FSRS has been modified to track each **item** (step) independently using two properties:
 1. *stability* (how long the memory lasts)
 2. *difficulty* (how hard the item is for you personally)
 
@@ -104,11 +103,13 @@ Intervals are calculated to target a 90% recall probability at review time, and 
 
 | Key | Action |
 |-----|--------|
-| `1` | **Again**: complete blank; short reset |
+| `1` | **Again**: complete blank |
 | `2` | **Hard**: recalled incorrectly or with major effort |
 | `3` | **Good**: recalled correctly with some effort |
 | `4` | **Easy**: recalled instantly and effortlessly |
 
-For **multi-step** cards the session logic is, find the earliest-due step (by position), then include **all preceding steps** plus that step in the session. This forces you to rebuild the full chain from step 1 every time, rather than practicing the due step in isolation. The new behaviour in `Myoso` is that rating any *preceding* step **Again** or **Hard** immediately makes all subsequent steps due, so the chain must be rebuilt from that point on your next session.
+> [!NOTE]
+> It is highly recommended to only use the `1` & `3` options, while reserving `2` & `4`
+> for **rare** occassions for optimal recall performance.
 
-Additionally, `Myoso` uniquely handles the problem of **chain re-exposure**, meaning rating a step as *easy* because you had recently just saw it(from rebuilding the chain) will not artificially inflate the cards schedule. This behaviour only applies to multi-step cards.
+Additionally, `Myoso` handles a unique problem which I call: **chain re-exposure** ratings. Where you repeatedly rate a step as `good` or `easy` just because you had recently saw it(from rebuilding the chain again in the **same session**). This would artificially **inflate** the cards schedule from stacking multiple easy's on the same card. Therefore, any chain re-exposure ratings now interpolate a **tapering effect** against the SRS algorithm to prevent this inflation.
