@@ -104,12 +104,12 @@ Intervals are calculated to target a 90% recall probability at review time, and 
 | Key | Action |
 |-----|--------|
 | `1` | **Again**: complete blank |
-| `2` | **Hard**: recalled incorrectly or with major effort |
-| `3` | **Good**: recalled correctly with some effort |
+| `2` | **Hard**: correct but with major effort |
+| `3` | **Good**: correct with some effort |
 | `4` | **Easy**: recalled instantly and effortlessly |
 
 > [!NOTE]
-> It is highly recommended to only use the `1` & `3` options, while reserving `2` & `4`
-> for **rare** occassions for optimal recall performance.
+> It is highly recommended to avoid the `4` option.
+> Reserving it only for **rare** occassions for optimal recall performance.
 
 Additionally, `Myoso` handles a unique problem which I call: **chain re-exposure** ratings. Where you repeatedly rate a step as `good` or `easy` just because you had recently saw it(from rebuilding the chain again in the **same session**). This would artificially **inflate** the cards schedule from stacking multiple easy's on the same card. Therefore, any chain re-exposure ratings now interpolate a **tapering effect** against the SRS algorithm to prevent this inflation.

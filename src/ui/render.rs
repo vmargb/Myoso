@@ -531,9 +531,9 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
         let spans = vec![
             Span::styled(" [1] ", Style::default().fg(Color::Red)),
             Span::raw("Again  "),
+            Span::styled("← fail   ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
             Span::styled(" [2] ", Style::default().fg(Color::Yellow)),
             Span::raw("Hard  "),
-            Span::styled("← fail   ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
             Span::styled(" [3] ", Style::default().fg(Color::Green)),
             Span::raw("Good  "),
             Span::styled(" [4] ", Style::default().fg(Color::Blue)),

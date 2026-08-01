@@ -121,7 +121,7 @@ impl ReviewState {
 
         self.done_items += 1;
 
-        if is_step && confidence <= 2 {
+        if is_step && confidence == 1 {
             // failure: skip remaining steps, jump to next card
             let skipped_items = self.session[self.card_idx].items.len() - self.item_idx - 1;
             self.total_items -= skipped_items;
