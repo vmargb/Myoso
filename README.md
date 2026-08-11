@@ -22,7 +22,9 @@ Ordinary flashcard apps are great for 1:1 facts and definitions but struggle wit
 - "how do you reverse a linked list?"
 - "walk me through this derivation".
 
-Standard flashcard *can* be used in this way, but end up carrying too much **mental load** on each card. Myoso fixes this problem by modellling your answer as an ordered sequence of steps. During review, you **reveal and rate each step** individually, unlocking later steps only after earlier ones are recalled well. Likewise, forgetting an *earlier* step naturally blocks access to the subsequent steps until you **rebuild the chain again**. This reinforces the full procedural flow, rather than merely memorising isolated bits as normal flashcards would do.
+Standard flashcard *can* be used in this way, but wind up becoming **heavy**, carrying too much mental load. A deck with hundreds(or thousands) of these *heavy* cards quickly become unsustainable to maintain long-term.
+
+Myoso fixes this problem by modellling your answer as an ordered sequence of steps. During review, you **reveal and rate each step** individually, unlocking later steps only after earlier ones are recalled well. Likewise, forgetting an *earlier* step naturally blocks access to the subsequent steps until you **rebuild the chain again**. This reinforces the full procedural flow, rather than merely memorising isolated bits as normal flashcards would do.
 
 ---
 
@@ -38,6 +40,7 @@ curl -sSf https://raw.githubusercontent.com/vmargb/Myoso/main/install.sh | sh
 ```
 
 #### Windows
+Open "PowerShell" or "Windows Terminal":
 ```powershell
 irm https://raw.githubusercontent.com/vmargb/Myoso/main/install.ps1 | iex
 ```
@@ -112,4 +115,4 @@ Intervals are calculated to target a 90% recall probability at review time, and 
 > It is highly recommended to avoid the `4` option.
 > Reserving it only for **rare** occassions for optimal recall performance.
 
-Additionally, `Myoso` handles a unique problem which I call: **chain re-exposure** ratings. Where you repeatedly rate a step as `good` or `easy` just because you had recently saw it(from rebuilding the chain again in the **same session**). This would artificially **inflate** the cards schedule from stacking multiple easy's on the same card. Therefore, any chain re-exposure ratings now interpolate a **tapering effect** against the SRS algorithm to prevent this inflation.
+Additionally, `Myoso` handles a unique *re-exposure* problem where you repeatedly rate a step as `good` or `easy` because you had just recently saw it(from rebuilding the steps again in the **same session**). This would artificially *inflate* the cards schedule because you stacked multiple `easy`'s on the same steps. Therefore, any *re-exposure* ratings now introduce a **tapering effect** against the SRS algorithm to prevent this inflation.

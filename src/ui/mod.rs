@@ -9,7 +9,10 @@ mod render;
 use std::io;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -20,16 +23,17 @@ use crate::db::Store;
 use crate::models::{ReviewMode, SessionLimits};
 
 use state::{
-    AddCardState, AddKind, AddPhase, AppState, ExportFocus, ImportFocus,
-    ListCardsState, ListDecksState, ReviewPhase, ReviewState, Screen, SearchScope,
+    AddCardState, AddKind, AddPhase, AppState, ClickTarget, ExportFocus, ImportFocus,
+    ListCardsState, ListDecksState, MENU_ITEMS, ReviewPhase, ReviewState, Screen, SearchScope,
 };
+use render::row_to_list_index;
 
 // ~~~ Entry point ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 pub fn run_tui(store: &Store) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -37,7 +41,7 @@ pub fn run_tui(store: &Store) -> anyhow::Result<()> {
     let res = event_loop(&mut terminal, &mut app);
     // always restore the terminal even on error
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
     res
 }
 
@@ -50,21 +54,30 @@ fn event_loop(
     loop {
         if app.should_quit { break; }
 
+        // click regions are rebuilt fresh every frame by the renderers, since
+        // layouts and screen coordinates can change between draws
+        let mut clicks: Vec<(ratatui::layout::Rect, ClickTarget)> = Vec::new();
         terminal.draw(|f| {
             match app.screen {
-                Screen::MainMenu  => render::render_menu(f, app),
+                Screen::MainMenu  => render::render_menu(f, app, &mut clicks),
                 Screen::Stats     => render::render_stats(f, app),
-                Screen::Review    => render::render_review(f, app),
-                Screen::AddCard   => render::render_add_card(f, app),
-                Screen::ListDecks => render::render_list_decks(f, app),
-                Screen::ListCards => render::render_list_cards(f, app),
-                Screen::Export    => render::render_export(f, app),
-                Screen::Import    => render::render_import(f, app),
+                Screen::Review    => render::render_review(f, app, &mut clicks),
+                Screen::AddCard   => render::render_add_card(f, app, &mut clicks),
+                Screen::ListDecks => render::render_list_decks(f, app, &mut clicks),
+                Screen::ListCards => render::render_list_cards(f, app, &mut clicks),
+                Screen::Export    => render::render_export(f, app, &mut clicks),
+                Screen::Import    => render::render_import(f, app, &mut clicks),
             }
         })?;
+        app.click_regions = clicks;
 
         if event::poll(std::time::Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
+            match event::read()? {
+                Event::Mouse(mouse) => {
+                    on_mouse(app, mouse)?;
+                    continue;
+                }
+                Event::Key(key) => {
                 if key.kind != KeyEventKind::Press { continue; }
 
                 // Ctrl+E on any multiline field opens external editor
@@ -132,6 +145,8 @@ fn event_loop(
                     Screen::Export    => on_export(app, key.code)?,
                     Screen::Import    => on_import(app, key.code)?,
                 }
+                }
+                _ => {}
             }
         }
     }
@@ -1077,6 +1092,186 @@ fn on_import(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ~~~ Mouse handlers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// clicks are hit-tested against the regions the last frames renderers registered
+// state::ClickTarget / render::Clicks
+
+fn on_mouse(app: &mut AppState, mouse: MouseEvent) -> anyhow::Result<()> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => on_click(app, mouse.column, mouse.row)?,
+        MouseEventKind::ScrollDown => dispatch_scroll(app, KeyCode::Down)?,
+        MouseEventKind::ScrollUp   => dispatch_scroll(app, KeyCode::Up)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// mouse wheel: reuse whatever the Down/Up arrow already does
+/// screen scroll the review answer, move a list selection.
+fn dispatch_scroll(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
+    match app.screen {
+        Screen::MainMenu  => on_menu(app, code)?,
+        Screen::Stats     => {}
+        Screen::Review    => on_review(app, code)?,
+        Screen::AddCard   => on_add_card(app, KeyEvent::new(code, KeyModifiers::NONE))?,
+        Screen::ListDecks => on_list_decks(app, code)?,
+        Screen::ListCards => on_list_cards(app, KeyEvent::new(code, KeyModifiers::NONE))?,
+        Screen::Export    => on_export(app, code)?,
+        Screen::Import    => on_import(app, code)?,
+    }
+    Ok(())
+}
+
+fn on_click(app: &mut AppState, col: u16, row: u16) -> anyhow::Result<()> {
+    let (area, target) = match app.hit_test(col, row) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    match target {
+        ClickTarget::MenuList => {
+            if let Some(i) = row_to_list_index(area, app.menu_state.offset(), row) {
+                if i < MENU_ITEMS {
+                    app.menu_state.select(Some(i));
+                    app.menu_select()?;
+                }
+            }
+        }
+
+        ClickTarget::PickSimple => {
+            if let Some(s) = app.add_card.as_mut() {
+                s.kind = AddKind::Simple;
+                s.phase = AddPhase::FillForm;
+            }
+        }
+        ClickTarget::PickMulti => {
+            if let Some(s) = app.add_card.as_mut() {
+                s.kind = AddKind::Multi;
+                s.phase = AddPhase::FillForm;
+            }
+        }
+
+        ClickTarget::AddCardField(idx) => {
+            if let Some(s) = app.add_card.as_mut() {
+                s.focused = idx;
+                if idx != 0 { s.deck_list_idx = None; }
+            }
+        }
+        ClickTarget::AddCardToggle(idx) => {
+            if let Some(s) = app.add_card.as_mut() { s.focused = idx; }
+            on_add_card(app, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))?;
+        }
+        ClickTarget::AddCardButton(idx) => {
+            if let Some(s) = app.add_card.as_mut() { s.focused = idx; }
+            on_add_card(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+        }
+        ClickTarget::StepsList => {
+            let mut hit = false;
+            if let Some(s) = app.add_card.as_mut() {
+                let offset = s.step_list_state.offset();
+                if let Some(i) = row_to_list_index(area, offset, row) {
+                    if i < s.steps.len() {
+                        s.focused = 5;
+                        s.step_list_state.select(Some(i));
+                        hit = true;
+                    }
+                }
+            }
+            // clicking a step also opens it for editing, same as pressing enter
+            if hit {
+                on_add_card(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+            }
+        }
+        ClickTarget::DeckSuggestions => {
+            let mut confirm = false;
+            if let Some(s) = app.add_card.as_mut() {
+                let n = s.filtered_decks().len();
+                if let Some(i) = row_to_list_index(area, 0, row) {
+                    if i < n {
+                        s.focused = 0;
+                        s.deck_list_idx = Some(i);
+                        confirm = true;
+                    }
+                }
+            }
+            if confirm {
+                on_add_card(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+            }
+        }
+
+        ClickTarget::ReviewCard => {
+            on_review(app, KeyCode::Char(' '))?;
+        }
+        ClickTarget::ReviewRate(n) => {
+            on_review(app, KeyCode::Char((b'0' + n) as char))?;
+        }
+
+        ClickTarget::DecksList => {
+            if let Some(ld) = app.list_decks.as_mut() {
+                if let Some(i) = row_to_list_index(area, ld.list_state.offset(), row) {
+                    if i < ld.filtered_decks().len() { ld.list_state.select(Some(i)); }
+                }
+            }
+        }
+        ClickTarget::CardsList => {
+            if let Some(lc) = app.list_cards.as_mut() {
+                if let Some(i) = row_to_list_index(area, lc.list_state.offset(), row) {
+                    if i < lc.filtered_cards().len() { lc.list_state.select(Some(i)); }
+                }
+            }
+        }
+        ClickTarget::TagPickerList => {
+            if let Some(lc) = app.list_cards.as_mut() {
+                if let Some(i) = row_to_list_index(area, lc.tag_picker_state.offset(), row) {
+                    if let Some(tag) = lc.tag_picker_tags.get(i).cloned() {
+                        lc.tag_picker_state.select(Some(i));
+                        if lc.tag_filter.contains(&tag) {
+                            lc.tag_filter.retain(|t| t != &tag);
+                        } else {
+                            lc.tag_filter.push(tag);
+                        }
+                    }
+                }
+            }
+        }
+
+        ClickTarget::ExportDeckList => {
+            if let Some(ex) = app.export.as_mut() {
+                if let Some(i) = row_to_list_index(area, ex.list_state.offset(), row) {
+                    if i < ex.list_len() {
+                        ex.focus = ExportFocus::DeckList;
+                        ex.list_state.select(Some(i));
+                        ex.refresh_default_path();
+                    }
+                }
+            }
+        }
+        ClickTarget::ExportToggle => {
+            if let Some(ex) = app.export.as_mut() {
+                ex.focus = ExportFocus::ResetToggle;
+                ex.reset_metadata = !ex.reset_metadata;
+            }
+        }
+        ClickTarget::ExportPathField => {
+            if let Some(ex) = app.export.as_mut() { ex.focus = ExportFocus::PathField; }
+        }
+        ClickTarget::ExportConfirmBtn => {
+            if let Some(ex) = app.export.as_mut() { ex.focus = ExportFocus::ConfirmBtn; }
+            on_export(app, KeyCode::Enter)?;
+        }
+
+        ClickTarget::ImportPathField => {
+            if let Some(im) = app.import.as_mut() { im.focus = ImportFocus::PathField; }
+        }
+        ClickTarget::ImportConfirmBtn => {
+            if let Some(im) = app.import.as_mut() { im.focus = ImportFocus::ConfirmBtn; }
+            on_import(app, KeyCode::Enter)?;
+        }
+    }
+    Ok(())
+}
+
 // ~~~ Save helper ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
@@ -1143,10 +1338,10 @@ fn open_in_editor(
 ) -> anyhow::Result<String> {
     // give the terminal back to the OS so the editor gets a clean screen
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
     let result = edit::edit(content).unwrap_or_else(|_| content.to_string());
     // reclaim the terminal for ratatui
-    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture);
     let _ = enable_raw_mode();
     terminal.clear()?; // force a full redraw
     // trim the trailing newline that most editors append on save, since the

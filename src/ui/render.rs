@@ -13,12 +13,50 @@ use ratatui::{
 };
 
 use super::state::{
-    AddCardState, AddKind, AddPhase, AppState, ExportFocus, ImportFocus,
+    AddCardState, AddKind, AddPhase, AppState, ClickTarget, ExportFocus, ImportFocus,
     ListCardsState, MENU_ITEMS, ReviewPhase,
 };
 use crate::models::{CardKind, ItemKind, ReviewMode};
 
-// ~~~ Layout / style helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// ~~~ click-region helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// every renderer collects clickable Rects into a `clicks` vector as it draws
+// the event loop and copies that vector into `app.click_regions` when frame is done
+type Clicks = Vec<(Rect, ClickTarget)>;
+
+fn register_span_clicks(clicks: &mut Clicks, area: Rect, spans: &[Span], targets: &[(&str, ClickTarget)]) {
+    if area.height == 0 || area.width < 2 { return; }
+    let inner_x = area.x + 1;
+    let inner_w = area.width.saturating_sub(2);
+    let total_w: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+    let mut x = inner_x + inner_w.saturating_sub(total_w.min(inner_w)) / 2;
+    let y = area.y + 1;
+    for i in 0..spans.len() {
+        let w = spans[i].content.chars().count() as u16;
+        let trimmed = spans[i].content.trim();
+        let mut matched: Option<ClickTarget> = None;
+        for &(needle, target) in targets {
+            if needle == trimmed { matched = Some(target); break; }
+        }
+        if let Some(target) = matched {
+            let mut click_w = w;
+            if i + 1 < spans.len() {
+                click_w += spans[i + 1].content.chars().count() as u16;
+            }
+            clicks.push((Rect { x, y, width: click_w.max(1), height: 1 }, target));
+        }
+        x += w;
+    }
+}
+
+/// convert a mouse row into an index into a possibly scrolled List
+pub(super) fn row_to_list_index(area: Rect, offset: usize, row: u16) -> Option<usize> {
+    let top    = area.y + 1;
+    let bottom = area.y + area.height.saturating_sub(1);
+    if row < top || row >= bottom { return None; }
+    Some(offset + (row - top) as usize)
+}
+// ~~~ layout / style helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 pub(super) fn centered_rect(pct_x: u16, height: u16, r: Rect) -> Rect {
     let vert = Layout::default()
@@ -85,7 +123,7 @@ fn format_time_until(due: DateTime<Utc>) -> String {
 
 // ~~~ Renderers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-pub(super) fn render_menu(f: &mut Frame, app: &mut AppState) {
+pub(super) fn render_menu(f: &mut Frame, app: &mut AppState, clicks: &mut Clicks) {
     let size = f.area();
     let v = Layout::default()
         .direction(Direction::Vertical)
@@ -154,6 +192,7 @@ pub(super) fn render_menu(f: &mut Frame, app: &mut AppState) {
     .map(|s| ListItem::new(*s))
     .collect::<Vec<_>>();
 
+    let menu_area = centre(v[2]);
     f.render_stateful_widget(
         List::new(items)
             .block(
@@ -180,9 +219,10 @@ pub(super) fn render_menu(f: &mut Frame, app: &mut AppState) {
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol(" ▶ "),
-        centre(v[2]),
+        menu_area,
         &mut app.menu_state,
     );
+    clicks.push((menu_area, ClickTarget::MenuList));
 
     if let Some(ref msg) = app.flash {
         f.render_widget(
@@ -259,7 +299,7 @@ pub(super) fn render_stats(f: &mut Frame, app: &AppState) {
 
 // ~~ Review ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-pub(super) fn render_review(f: &mut Frame, app: &AppState) {
+pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) {
     let size = f.area();
     let rs = match app.review.as_ref() { Some(r) => r, None => return };
 
@@ -422,6 +462,9 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
     // ONE stable card for BOTH phases, same position/size always, so revealing
     // never repositions or resizes anything, it only grows the content inside
     let card = centered_rect(80, v[1].height.saturating_sub(2).max(10), v[1]);
+    if rs.phase == ReviewPhase::Thinking {
+        clicks.push((card, ClickTarget::ReviewCard));
+    }
 
     let mut lines: Vec<Line> = vec![Line::from(""), Line::from("")];
     for l in display_prompt.lines() {
@@ -541,6 +584,12 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
             Span::styled(" [e] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::raw("Edit"),
         ];
+        register_span_clicks(clicks, v[2], &spans, &[
+            ("[1]", ClickTarget::ReviewRate(1)),
+            ("[2]", ClickTarget::ReviewRate(2)),
+            ("[3]", ClickTarget::ReviewRate(3)),
+            ("[4]", ClickTarget::ReviewRate(4)),
+        ]);
         Line::from(spans)
     } else {
         let spans = vec![
@@ -555,6 +604,12 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState) {
             Span::styled(" [e] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::raw("Edit"),
         ];
+        register_span_clicks(clicks, v[2], &spans, &[
+            ("[1]", ClickTarget::ReviewRate(1)),
+            ("[2]", ClickTarget::ReviewRate(2)),
+            ("[3]", ClickTarget::ReviewRate(3)),
+            ("[4]", ClickTarget::ReviewRate(4)),
+        ]);
         Line::from(spans)
     };
     f.render_widget(
@@ -661,23 +716,23 @@ fn render_review_done(f: &mut Frame, rs: &super::state::ReviewState, size: Rect)
 
 // ~~ Add Card ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-pub(super) fn render_add_card(f: &mut Frame, app: &mut AppState) {
+pub(super) fn render_add_card(f: &mut Frame, app: &mut AppState, clicks: &mut Clicks) {
     let size        = f.area();
     let phase       = app.add_card.as_ref().unwrap().phase;
     let kind        = app.add_card.as_ref().unwrap().kind;
     let is_editing  = app.add_card.as_ref().unwrap().editing_card_id.is_some();
 
     match phase {
-        // Never show PickType when editing — the kind is already fixed.
-        AddPhase::PickType if !is_editing => render_pick_type(f, app.add_card.as_ref().unwrap(), size),
+        // never show PickType when editing, the kind is already fixed
+        AddPhase::PickType if !is_editing => render_pick_type(f, app.add_card.as_ref().unwrap(), size, clicks),
         _ => match kind {
-            AddKind::Simple => render_simple_form(f, app.add_card.as_ref().unwrap(), size),
-            AddKind::Multi  => render_multi_form(f, app, size),
+            AddKind::Simple => render_simple_form(f, app.add_card.as_ref().unwrap(), size, clicks),
+            AddKind::Multi  => render_multi_form(f, app, size, clicks),
         },
     }
 }
 
-fn render_pick_type(f: &mut Frame, s: &AddCardState, size: Rect) {
+fn render_pick_type(f: &mut Frame, s: &AddCardState, size: Rect, clicks: &mut Clicks) {
     let area = centered_rect(60, 14, size);
     let v = Layout::default()
         .direction(Direction::Vertical)
@@ -728,6 +783,10 @@ fn render_pick_type(f: &mut Frame, s: &AddCardState, size: Rect) {
                 })),
             v[slot],
         );
+        clicks.push((v[slot], match kind {
+            AddKind::Simple => ClickTarget::PickSimple,
+            AddKind::Multi  => ClickTarget::PickMulti,
+        }));
     }
 
     f.render_widget(
@@ -740,7 +799,7 @@ fn render_pick_type(f: &mut Frame, s: &AddCardState, size: Rect) {
     );
 }
 
-fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
+fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect, clicks: &mut Clicks) {
     let filtered = s.filtered_decks();
     let sugg_h: u16 = if s.focused == 0 && !filtered.is_empty() {
         (filtered.len() as u16 + 2).min(6)
@@ -781,6 +840,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
             .style(text_style(s.focused == 0)),
         v[1],
     );
+    clicks.push((v[1], ClickTarget::AddCardField(0)));
 
     if sugg_h > 0 {
         let items: Vec<ListItem> = filtered.iter().enumerate().map(|(i, d)| {
@@ -803,6 +863,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
             ),
             v[2],
         );
+        clicks.push((v[2], ClickTarget::DeckSuggestions));
     }
 
     let q_text    = with_cursor(&s.simple_question, s.focused == 1);
@@ -817,6 +878,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
             .style(text_style(s.focused == 1)),
         v[3],
     );
+    clicks.push((v[3], ClickTarget::AddCardField(1)));
 
     let answer_title = match (s.focused == 2, s.answer_image_path.is_some()) {
         (true,  true)  => " Answer  │  [Ctrl+e] editor  │  [Ctrl+o] change image  [IMG ✓ ] ",
@@ -836,6 +898,7 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
             .style(text_style(s.focused == 2)),
         v[4],
     );
+    clicks.push((v[4], ClickTarget::AddCardField(2)));
 
     let rev_text = if s.reversible {
         "  y  Also create A -> Q reverse card"
@@ -854,8 +917,10 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
         .block(field_block(" Reversible  [Space to toggle] ", s.focused == 3)),
         v[5],
     );
+    clicks.push((v[5], ClickTarget::AddCardToggle(3)));
 
     render_daily_toggle(f, &s.review_mode, s.focused == 4, v[6]);
+    clicks.push((v[6], ClickTarget::AddCardToggle(4)));
 
     // tags field (focused == 5)
     f.render_widget(
@@ -864,12 +929,14 @@ fn render_simple_form(f: &mut Frame, s: &AddCardState, size: Rect) {
             .style(text_style(s.focused == 5)),
         v[7],
     );
+    clicks.push((v[7], ClickTarget::AddCardField(5)));
 
     render_save_btn(f, s.focused == 6, v[8]);
+    clicks.push((v[8], ClickTarget::AddCardButton(6)));
     render_form_hint(f, s.error.as_deref(), v[9]);
 }
 
-fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
+fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut Clicks) {
     let s = app.add_card.as_mut().unwrap();
     let filtered = s.filtered_decks();
     let sugg_h: u16 = if s.focused == 0 && !filtered.is_empty() {
@@ -916,6 +983,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
             .style(text_style(s.focused == 0)),
         v[1],
     );
+    clicks.push((v[1], ClickTarget::AddCardField(0)));
 
     if sugg_h > 0 {
         let items: Vec<ListItem> = filtered.iter().enumerate().map(|(i, d)| {
@@ -938,6 +1006,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
             ),
             v[2],
         );
+        clicks.push((v[2], ClickTarget::DeckSuggestions));
     }
 
     let q_text    = with_cursor(&s.multi_question, s.focused == 1);
@@ -952,6 +1021,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
             .style(text_style(s.focused == 1)),
         v[3],
     );
+    clicks.push((v[3], ClickTarget::AddCardField(1)));
 
     f.render_widget(
         Paragraph::new(with_cursor(&s.step_name_buf, s.focused == 2))
@@ -959,6 +1029,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
             .style(text_style(s.focused == 2)),
         v[4],
     );
+    clicks.push((v[4], ClickTarget::AddCardField(2)));
 
     let answer_title = match (s.focused == 3, s.step_image_path.is_some()) {
         (true,  true)  => " Step Answer  [Enter] newline  │  [Ctrl+e] editor  │  [Ctrl+o] change image  [IMG ✓ ] ",
@@ -978,8 +1049,10 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
             .style(text_style(s.focused == 3)),
         v[5],
     );
+    clicks.push((v[5], ClickTarget::AddCardField(3)));
 
     render_add_step_btn(f, s.focused == 4, s.editing_step_idx.is_some(), v[6]);
+    clicks.push((v[6], ClickTarget::AddCardButton(4)));
 
     let step_items: Vec<ListItem> = if s.steps.is_empty() {
         vec![ListItem::new(Span::styled(
@@ -1019,6 +1092,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
             .highlight_symbol(">> ");
     }
     f.render_stateful_widget(list, v[7], &mut s.step_list_state);
+    clicks.push((v[7], ClickTarget::StepsList));
 
     let sc_text = if s.show_chain {
         "  y  Show preceding step answers during review"
@@ -1037,8 +1111,10 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
         .block(field_block(" Show chain  [Space to toggle] ", s.focused == 6)),
         v[8],
     );
+    clicks.push((v[8], ClickTarget::AddCardToggle(6)));
 
     render_daily_toggle(f, &s.review_mode, s.focused == 7, v[9]);
+    clicks.push((v[9], ClickTarget::AddCardToggle(7)));
 
     // tags field (focused == 8)
     f.render_widget(
@@ -1047,8 +1123,10 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect) {
             .style(text_style(s.focused == 8)),
         v[10],
     );
+    clicks.push((v[10], ClickTarget::AddCardField(8)));
 
     render_save_btn(f, s.focused == 9, v[11]);
+    clicks.push((v[11], ClickTarget::AddCardButton(9)));
     render_form_hint(f, s.error.as_deref(), v[12]);
 }
 
@@ -1154,7 +1232,7 @@ fn render_confirm_dialog(f: &mut Frame, msg: &str, size: Rect) {
 
 // ~~ List Cards ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState) {
+pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState, clicks: &mut Clicks) {
     let size = f.area();
     let lc = match app.list_cards.as_mut() { Some(lc) => lc, None => return };
 
@@ -1282,6 +1360,7 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState) {
         v[0],
         &mut lc.list_state,
     );
+    clicks.push((v[0], ClickTarget::CardsList));
 
     // ~~ bottom bar ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     let bottom_lines = if lc.search_active {
@@ -1334,11 +1413,11 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState) {
         render_confirm_dialog(f, "  Delete this card and all its review history?", size);
     }
     if lc.tag_picker_active {
-        render_tag_picker(f, lc, size);
+        render_tag_picker(f, lc, size, clicks);
     }
 }
 
-fn render_tag_picker(f: &mut Frame, lc: &mut ListCardsState, size: Rect) {
+fn render_tag_picker(f: &mut Frame, lc: &mut ListCardsState, size: Rect, clicks: &mut Clicks) {
     let area = centered_rect(46, 20, size);
     f.render_widget(Clear, area);
 
@@ -1369,11 +1448,12 @@ fn render_tag_picker(f: &mut Frame, lc: &mut ListCardsState, size: Rect) {
         area,
         &mut lc.tag_picker_state,
     );
+    clicks.push((area, ClickTarget::TagPickerList));
 }
 
 // ~~ List Decks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-pub(super) fn render_list_decks(f: &mut Frame, app: &mut AppState) {
+pub(super) fn render_list_decks(f: &mut Frame, app: &mut AppState, clicks: &mut Clicks) {
     let size = f.area();
     let ld = match app.list_decks.as_mut() { Some(ld) => ld, None => return };
 
@@ -1439,6 +1519,7 @@ pub(super) fn render_list_decks(f: &mut Frame, app: &mut AppState) {
         v[0],
         &mut ld.list_state,
     );
+    clicks.push((v[0], ClickTarget::DecksList));
 
     let bottom_lines = if ld.search_active {
         vec![
@@ -1469,7 +1550,7 @@ pub(super) fn render_list_decks(f: &mut Frame, app: &mut AppState) {
     }
 }
 
-pub(super) fn render_export(f: &mut Frame, app: &mut AppState) {
+pub(super) fn render_export(f: &mut Frame, app: &mut AppState, clicks: &mut Clicks) {
     let size = f.area();
     let ex   = match app.export.as_mut() { Some(e) => e, None => return };
 
@@ -1504,6 +1585,7 @@ pub(super) fn render_export(f: &mut Frame, app: &mut AppState) {
         v[0],
         &mut ex.list_state,
     );
+    clicks.push((v[0], ClickTarget::ExportDeckList));
 
     // ~~ Reset toggle ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     let fr = ex.focus == ExportFocus::ResetToggle;
@@ -1525,6 +1607,7 @@ pub(super) fn render_export(f: &mut Frame, app: &mut AppState) {
         .block(field_block("", fr)),
         v[1],
     );
+    clicks.push((v[1], ClickTarget::ExportToggle));
 
     // ~~ Path field ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     let fp = ex.focus == ExportFocus::PathField;
@@ -1534,6 +1617,7 @@ pub(super) fn render_export(f: &mut Frame, app: &mut AppState) {
             .style(text_style(fp)),
         v[2],
     );
+    clicks.push((v[2], ClickTarget::ExportPathField));
 
     // ~~ Export button ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     let fb  = ex.focus == ExportFocus::ConfirmBtn;
@@ -1550,6 +1634,7 @@ pub(super) fn render_export(f: &mut Frame, app: &mut AppState) {
             .border_style(if fb { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) })),
         v[3],
     );
+    clicks.push((v[3], ClickTarget::ExportConfirmBtn));
 
     // ~~ Hint / status ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     let hint = if let Some(ref msg) = ex.status {
@@ -1564,7 +1649,7 @@ pub(super) fn render_export(f: &mut Frame, app: &mut AppState) {
     f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), v[4]);
 }
 
-pub(super) fn render_import(f: &mut Frame, app: &mut AppState) {
+pub(super) fn render_import(f: &mut Frame, app: &mut AppState, clicks: &mut Clicks) {
     let size = f.area();
     let im   = match app.import.as_mut() { Some(i) => i, None => return };
 
@@ -1587,6 +1672,7 @@ pub(super) fn render_import(f: &mut Frame, app: &mut AppState) {
             .style(text_style(fp)),
         v[1],
     );
+    clicks.push((v[1], ClickTarget::ImportPathField));
 
     // ~~ Import button ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     let fb = im.focus == ImportFocus::ConfirmBtn;
@@ -1602,6 +1688,7 @@ pub(super) fn render_import(f: &mut Frame, app: &mut AppState) {
             .border_style(if fb { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) })),
         v[2],
     );
+    clicks.push((v[2], ClickTarget::ImportConfirmBtn));
 
     // ~~ Hint / status ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     let hint = if let Some(ref msg) = im.status {

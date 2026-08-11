@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use ratatui::widgets::ListState;
+use ratatui::{layout::Rect, widgets::ListState};
 
 use crate::db::Store;
 use crate::models::{Card, CardKind, CardSummary, Item, ItemKind, ReviewCard, ReviewMode, Stats, SessionLimits};
@@ -720,6 +720,37 @@ impl ImportState {
     }
 }
 
+// ~~~ Mouse click targets ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// Rect -> ClickTarget mapping for every clickable widget
+// as they draw each frame in render.rs
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickTarget {
+    MenuList,
+    PickSimple,
+    PickMulti,
+    /// click-to-focus a text field / row by its `focused` index
+    AddCardField(usize),
+    /// click-to-focus + immediately toggle (reversible / show_chain / daily)
+    AddCardToggle(usize),
+    /// click-to-focus + immediately activate (Add step / Save)
+    AddCardButton(usize),
+    StepsList,
+    DeckSuggestions,
+    ReviewCard,
+    ReviewRate(u8),
+    DecksList,
+    CardsList,
+    TagPickerList,
+    ExportDeckList,
+    ExportToggle,
+    ExportPathField,
+    ExportConfirmBtn,
+    ImportPathField,
+    ImportConfirmBtn,
+}
+
 // ~~~ Application state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 pub const MENU_ITEMS: usize = 8;
@@ -738,6 +769,8 @@ pub struct AppState<'a> {
     pub should_quit: bool,
     pub export:      Option<ExportState>,
     pub import:      Option<ImportState>,
+    // rebuilt every frame by the renderers, checked on mouse clicks
+    pub click_regions: Vec<(Rect, ClickTarget)>,
 }
 
 impl<'a> AppState<'a> {
@@ -758,7 +791,21 @@ impl<'a> AppState<'a> {
             should_quit: false,
             export:      None,
             import:      None,
+            click_regions: Vec::new(),
         }
+    }
+
+    /// Find the topmost (most-recently-registered) click region containing
+    /// (col, row), returning both its Rect (so callers can do their own
+    /// row-within-list arithmetic) and the target it maps to
+    pub fn hit_test(&self, col: u16, row: u16) -> Option<(Rect, ClickTarget)> {
+        self.click_regions
+            .iter()
+            .rev()
+            .find(|(r, _)| {
+                col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+            })
+            .copied()
     }
 
     /// Navigate to a new screen, remembering where we came from
