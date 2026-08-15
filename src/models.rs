@@ -71,6 +71,68 @@ impl FromStr for ItemKind {
     }
 }
 
+// ~~~ weak-step handling: leech status ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// computed at read time in `db::Store::record_review` right after an item's
+// consecutive-fail/hard counters are updated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeechStatus {
+    None,
+    /// Consecutive-fail streak
+    Leech,
+    /// Consecutive-hard streak only: the step is known but effortful, not
+    /// forgotten. Surfaces a passive, non-blocking rename/split nudge
+    /// never the blocking prompt, and never offers scaffolding
+    HardStreak,
+}
+
+// ~~~ weak-step handling: scaffolding ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScaffoldState {
+    #[default]
+    Normal,
+    Scaffolded,
+}
+
+impl ScaffoldState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScaffoldState::Normal     => "normal",
+            ScaffoldState::Scaffolded => "scaffolded",
+        }
+    }
+    pub fn is_scaffolded(&self) -> bool { *self == ScaffoldState::Scaffolded }
+}
+
+impl fmt::Display for ScaffoldState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for ScaffoldState {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "scaffolded" => Ok(ScaffoldState::Scaffolded),
+            _            => Ok(ScaffoldState::Normal), // graceful fallback
+        }
+    }
+}
+
+/// single (phrase, weight) entry in an item's cloze-deletion span pool
+/// the literal marked substring is stored, not character offsets
+/// if user edits the step's answer later, offsets would silently rot
+/// substring needle just needs a `.contains()` at render time, and if it no
+/// longer matches, it's dropped from the render set rather than an error
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeakSpan {
+    pub phrase: String,
+    pub weight: u32,
+}
+
 // ~~~ Review mode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -164,6 +226,28 @@ pub struct Item {
     pub confidence_avg: f64,
     #[serde(default)]
     pub image_path: Option<String>,
+    /// rolling count of consecutive `Again` (confidence == 1) ratings.
+    /// Reset to 0 on any confidence >= 3 rating
+    #[serde(default)]
+    pub consecutive_fails: i32, // leach detection
+    /// Rolling count of consecutive `Hard` (confidence == 2) ratings.
+    /// Reset to 0 on any confidence >= 3 rating
+    #[serde(default)]
+    pub consecutive_hards: i32,
+    #[serde(default)]
+    pub scaffold_state: ScaffoldState,
+    /// daily-capped count of scaffolded passes toward graduation back to normal
+    #[serde(default)]
+    pub scaffold_passes: i32,
+    /// Date (RFC3339 date-only, e.g. "2026-08-13") of the last scaffolded
+    #[serde(default)]
+    pub scaffold_pass_date: Option<chrono::NaiveDate>,
+    /// Cloze-deletion span pool, substrings of `answer` the user has
+    /// identified as their own blind spot, with a weight that increases
+    /// each time the same phrase is marked again. Rendered highest-weight
+    /// first when the item is scaffolded.
+    #[serde(default)]
+    pub weak_spans: Vec<WeakSpan>,
 }
 
 /// A card together with the subset of items that are due (or needed for context).

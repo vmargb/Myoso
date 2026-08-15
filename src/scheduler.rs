@@ -19,6 +19,16 @@ const FACTOR: f64 = 19.0 / 81.0;
 /// target recall probability at each scheduled review
 const DESIRED_RETENTION: f64 = 0.9;
 
+// ~~~ weak-step handling ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+/// shared threshold for leech detection, and scaffold graduation
+pub const LEECH_STREAK_THRESHOLD: u32 = 4;
+
+/// Number of most-recent rating events (from `review_log`) inspected for the
+/// oscillating Again/Hard/Again/Hard leech pattern that never produces a
+/// clean consecutive streak of either type alone
+pub const LEECH_LOOKBACK_EVENTS: usize = 6;
+
 // FSRS-5 default weights
 // source: https://github.com/open-spaced-repetition/py-fsrs
 //
@@ -221,6 +231,12 @@ mod tests {
             review_count:     0,
             confidence_avg:   0.0,
             image_path:       None,
+            consecutive_fails: 0,
+            consecutive_hards: 0,
+            scaffold_state: crate::models::ScaffoldState::Normal,
+            scaffold_passes: 0,
+            scaffold_pass_date: None,
+            weak_spans: Vec::new(),
         }
     }
 

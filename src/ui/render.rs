@@ -14,9 +14,9 @@ use ratatui::{
 
 use super::state::{
     AddCardState, AddKind, AddPhase, AppState, ClickTarget, ExportFocus, ImportFocus,
-    ListCardsState, MENU_ITEMS, ReviewPhase,
+    LeechPrompt, ListCardsState, MENU_ITEMS, ReviewPhase, WeakSpanPrompt,
 };
-use crate::models::{CardKind, ItemKind, ReviewMode};
+use crate::models::{CardKind, Item, ItemKind, ReviewMode};
 
 // ~~~ click-region helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
@@ -299,6 +299,63 @@ pub(super) fn render_stats(f: &mut Frame, app: &AppState) {
 
 // ~~ Review ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+/// weak-step handling, build the cloze-blanked answer text shown
+/// for a scaffolded item. Prefers the user's own weight-sorted weak spans
+fn build_cloze_text(item: &Item) -> String {
+    let mut spans: Vec<&crate::models::WeakSpan> = item
+        .weak_spans
+        .iter()
+        .filter(|s| item.answer.contains(s.phrase.as_str()))
+        .collect();
+    spans.sort_by(|a, b| b.weight.cmp(&a.weight));
+
+    let mut phrases: Vec<String> = spans.into_iter().take(3).map(|s| s.phrase.clone()).collect();
+
+    if phrases.is_empty() {
+        let words: Vec<&str> = item.answer.split_whitespace().collect();
+        phrases = fallback_random_words(&item.id, &words, 2);
+    }
+
+    // longest phrase first, so a shorter phrase that happens to be a
+    phrases.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+
+    let mut out = item.answer.clone();
+    for p in &phrases {
+        if p.is_empty() {
+            continue;
+        }
+        let blank = "▁".repeat(p.chars().count().max(3));
+        out = out.replace(p.as_str(), &blank);
+    }
+    out
+}
+
+/// Deterministic (per item, stable across re-renders within a session)
+/// pseudo-random word, enough variety so that
+/// two scaffolded items don't always blank "the" or the first word
+fn fallback_random_words(item_id: &str, words: &[&str], count: usize) -> Vec<String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut hasher = DefaultHasher::new();
+    item_id.hash(&mut hasher);
+    let mut seed = hasher.finish().max(1);
+
+    let n = words.len();
+    let want = count.min(n);
+    let mut picked = std::collections::HashSet::new();
+    while picked.len() < want {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        picked.insert((seed as usize) % n);
+    }
+    picked.into_iter().map(|i| words[i].to_string()).collect()
+}
+
 pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) {
     let size = f.area();
     let rs = match app.review.as_ref() { Some(r) => r, None => return };
@@ -314,6 +371,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
 
     let rc   = &rs.session[rs.card_idx];
     let item = &rc.items[rs.item_idx];
+    let is_scaffolded = item.scaffold_state.is_scaffolded();
 
     let v = Layout::default()
         .direction(Direction::Vertical)
@@ -462,7 +520,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
     // ONE stable card for BOTH phases, same position/size always, so revealing
     // never repositions or resizes anything, it only grows the content inside
     let card = centered_rect(80, v[1].height.saturating_sub(2).max(10), v[1]);
-    if rs.phase == ReviewPhase::Thinking {
+    if !is_scaffolded && rs.phase == ReviewPhase::Thinking {
         clicks.push((card, ClickTarget::ReviewCard));
     }
 
@@ -476,9 +534,13 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
     lines.push(Line::from(""));
     lines.extend(context_lines);
 
-    let border_color = match rs.phase {
-        ReviewPhase::Thinking => Color::DarkGray,
-        ReviewPhase::Revealed => Color::Cyan,
+    let border_color = if is_scaffolded {
+        Color::Magenta
+    } else {
+        match rs.phase {
+            ReviewPhase::Thinking => Color::DarkGray,
+            ReviewPhase::Revealed => Color::Cyan,
+        }
     };
 
     let ans_title = match rs.phase {
@@ -487,55 +549,79 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         ReviewPhase::Revealed => " Answer ".to_string(),
     };
 
-    match rs.phase {
-        ReviewPhase::Thinking => {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  [ Space / Enter to reveal ]",
+    if is_scaffolded {
+        // no reveal gate, the (cloze-blanked) answer is always on screen
+        lines.push(Line::from(""));
+        let divider_width = (card.width as usize).saturating_sub(4).clamp(10, 60);
+        lines.push(Line::from(Span::styled(
+            format!("  {}", "─".repeat(divider_width)),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                " Scaffolded ",
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("— pass {}/{} today to graduate", item.scaffold_passes.max(0), crate::scheduler::LEECH_STREAK_THRESHOLD),
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-            )));
+            ),
+        ]));
+        lines.push(Line::from(""));
+        for l in build_cloze_text(item).lines() {
+            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))));
         }
-        ReviewPhase::Revealed => {
-            lines.push(Line::from(""));
-            let divider_width = (card.width as usize).saturating_sub(4).clamp(10, 60);
-            lines.push(Line::from(Span::styled(
-                format!("  {}", "─".repeat(divider_width)),
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(Span::styled(
-                ans_title.trim().to_string(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(""));
-
-            if item.image_path.is_some() {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "  Image attached  ",
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "press ",
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        "[o]",
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        " to open",
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
+    } else {
+        match rs.phase {
+            ReviewPhase::Thinking => {
                 lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  [ Space / Enter to reveal ]",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                )));
             }
+            ReviewPhase::Revealed => {
+                lines.push(Line::from(""));
+                let divider_width = (card.width as usize).saturating_sub(4).clamp(10, 60);
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", "─".repeat(divider_width)),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    ans_title.trim().to_string(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(""));
 
-            let rendered = crate::markdown::render(&item.answer);
-            lines.extend(rendered.lines);
+                if item.image_path.is_some() {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "  Image attached  ",
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            "press ",
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            "[o]",
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            " to open",
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                    lines.push(Line::from(""));
+                }
+
+                let rendered = crate::markdown::render(&item.answer);
+                lines.extend(rendered.lines);
+            }
         }
     }
 
@@ -554,7 +640,27 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         card,
     );
 
-    let footer = if rs.phase == ReviewPhase::Thinking {
+    let footer = if is_scaffolded {
+        // weak-step handling Phase 2: grading is pass/fail only while
+        // scaffolded [1] Fail and [3] Good/Pass reuse the existing
+        let spans = vec![
+            Span::styled(" [1] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw("Fail  "),
+            Span::styled(" [3] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("Pass  "),
+            Span::styled(
+                " (2/4 unavailable while scaffolded)  ",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ),
+            Span::styled(" [e] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw("Edit"),
+        ];
+        register_span_clicks(clicks, v[2], &spans, &[
+            ("[1]", ClickTarget::ReviewRate(1)),
+            ("[3]", ClickTarget::ReviewRate(3)),
+        ]);
+        Line::from(spans)
+    } else if rs.phase == ReviewPhase::Thinking {
         Line::from(vec![
             Span::styled(
                 " [Space] ",
@@ -619,6 +725,168 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
                 .border_type(BorderType::Rounded))
             .alignment(Alignment::Center),
         v[2],
+    );
+
+    // passive hard-streak nudge, shown as a
+    // dismissible-by-nature (clears on next item) note just above the card
+    if let Some(nudge) = rs.hard_nudge.as_ref() {
+        let nudge_area = Rect {
+            x: v[1].x,
+            y: v[1].y,
+            width: v[1].width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  ⚠ {nudge}"),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+            )))
+            .alignment(Alignment::Center),
+            nudge_area,
+        );
+    }
+
+    if let Some(prompt) = rs.leech_prompt.as_ref() {
+        render_leech_prompt(f, prompt, size, clicks);
+    }
+    if let Some(prompt) = rs.weak_span_prompt.as_ref() {
+        render_weak_span_prompt(f, prompt, size);
+    }
+}
+
+/// Blocking rename/split intervention prompt
+fn render_leech_prompt(f: &mut Frame, prompt: &LeechPrompt, size: Rect, clicks: &mut Clicks) {
+    let height = if prompt.is_step { 11 } else { 9 };
+    let area = centered_rect(60, height, size);
+    f.render_widget(Clear, area);
+
+    let title: String = prompt.prompt_text.chars().take(40).collect();
+    let ellipsis = if prompt.prompt_text.chars().count() > 40 { "…" } else { "" };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " This step keeps giving you trouble —",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            " what do you want to do?",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!(" \"{title}{ellipsis}\""),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )),
+        Line::from(""),
+    ];
+    lines.push(Line::from(vec![
+        Span::styled(" [1] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("Rename step  "),
+        Span::styled("(fix a vague title)", Style::default().fg(Color::DarkGray)),
+    ]));
+    if prompt.is_step {
+        lines.push(Line::from(vec![
+            Span::styled(" [2] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Split step  "),
+            Span::styled("(redistribute the content)", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(" [3] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("Enable scaffolding  "),
+        Span::styled("(hint-assisted practice for a while)", Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" [c] ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::raw("Continue as-is"),
+    ]));
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Leech detected "),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+
+    // click regions, one row each starting after the 5-line header
+    let base_y = area.y + 6;
+    let mut row = 0u16;
+    clicks.push((Rect { x: area.x, y: base_y + row, width: area.width, height: 1 }, ClickTarget::LeechRename));
+    row += 1;
+    if prompt.is_step {
+        clicks.push((Rect { x: area.x, y: base_y + row, width: area.width, height: 1 }, ClickTarget::LeechSplit));
+        row += 1;
+    }
+    clicks.push((Rect { x: area.x, y: base_y + row, width: area.width, height: 1 }, ClickTarget::LeechScaffold));
+    row += 1;
+    clicks.push((Rect { x: area.x, y: base_y + row, width: area.width, height: 1 }, ClickTarget::LeechContinue));
+}
+
+/// Weak-span marking prompt. Entirely skippable
+/// fires after any confidence <= 2 rating so the user can tag
+/// the exact words they blanked on
+fn render_weak_span_prompt(f: &mut Frame, prompt: &WeakSpanPrompt, size: Rect) {
+    let height = (prompt.words.len() as u16 + 8).min(size.height.saturating_sub(2)).max(10);
+    let area = centered_rect(64, height, size);
+    f.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " Mark the word(s) you blanked on (optional)",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            " [space] toggle   [enter] mark phrase   [esc] done",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    // wrap the word list across lines of around 8 words so long answers stay readable
+    let mut cur = vec![Span::raw(" ")];
+    for (i, w) in prompt.words.iter().enumerate() {
+        let selected = prompt.selected.contains(&i);
+        let is_cursor = i == prompt.cursor;
+        let style = match (selected, is_cursor) {
+            (true, true)  => Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+            (true, false) => Style::default().fg(Color::Black).bg(Color::Cyan),
+            (false, true) => Style::default().fg(Color::Yellow).add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
+            (false, false)=> Style::default().fg(Color::White),
+        };
+        cur.push(Span::styled(format!("{w} "), style));
+        if (i + 1) % 8 == 0 {
+            lines.push(Line::from(std::mem::replace(&mut cur, vec![Span::raw(" ")])));
+        }
+    }
+    if cur.len() > 1 {
+        lines.push(Line::from(cur));
+    }
+    lines.push(Line::from(""));
+    if prompt.committed_any {
+        lines.push(Line::from(Span::styled(
+            " ✓ marked — select more, or press esc when done",
+            Style::default().fg(Color::Green),
+        )));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" Mark blind spot "),
+            )
+            .wrap(Wrap { trim: true }),
+        area,
     );
 }
 

@@ -63,7 +63,17 @@ impl Store {
                 image_path       TEXT,
                 -- FSRS item difficulty (D) 0.0 = never reviewed by FSRS
                 -- bootstrapped fresh on next rating
-                difficulty       REAL NOT NULL DEFAULT 0.0
+                difficulty       REAL NOT NULL DEFAULT 0.0,
+                -- weak-step handling rolling consecutive-rating
+                -- counters, distinct from lifetime lapses
+                -- scheduler::LEECH_STREAK_THRESHOLD
+                consecutive_fails INTEGER NOT NULL DEFAULT 0,
+                consecutive_hards INTEGER NOT NULL DEFAULT 0,
+                -- weak-step handling (Phase 2): scaffolding
+                scaffold_state     TEXT NOT NULL DEFAULT 'normal',
+                scaffold_passes    INTEGER NOT NULL DEFAULT 0,
+                weak_spans         TEXT NOT NULL DEFAULT '[]',
+                scaffold_pass_date TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_items_card_pos ON items(card_id, position);
@@ -122,6 +132,32 @@ impl Store {
         // "never reviewed by FSRS" and bootstraps  afresh state on next rating
         let _ = self.conn.execute(
             "ALTER TABLE items ADD COLUMN difficulty REAL NOT NULL DEFAULT 0.0",
+            [],
+        );
+        // weak-step handling leech-detection counters
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN consecutive_fails INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN consecutive_hards INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Weak-step handling Phase 2: scaffolding.
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN scaffold_state TEXT NOT NULL DEFAULT 'normal'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN scaffold_passes INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN weak_spans TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN scaffold_pass_date TEXT",
             [],
         );
 
@@ -212,8 +248,11 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO items(id,card_id,position,kind,prompt,answer,due_at,
-                                   interval_days,ease,lapses,review_count,confidence_avg,image_path,difficulty)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7, 0.0,0.0,0,0,0.0,?8,0.0)",
+                                   interval_days,ease,lapses,review_count,confidence_avg,image_path,difficulty,
+                                   consecutive_fails,consecutive_hards,
+                                   scaffold_state,scaffold_passes,weak_spans,scaffold_pass_date)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7, 0.0,0.0,0,0,0.0,?8,0.0, 0,0,
+                        'normal',0,'[]',NULL)",
                 params![id, card_id, pos, kind, prompt, answer, due, image_path],
             )
             .context("insert item")?;
@@ -411,10 +450,15 @@ impl Store {
                 //  0 id | 1 card_id | 2 position | 3 kind | 4 prompt | 5 answer |
                 //  6 due_at | 7 interval_days | 8 ease(stability) |
                 //  9 last_reviewed_at | 10 lapses | 11 review_count |
-                //  12 confidence_avg | 13 image_path | 14 difficulty
+                //  12 confidence_avg | 13 image_path | 14 difficulty |
+                //  15 consecutive_fails | 16 consecutive_hards |
+                //  17 scaffold_state | 18 scaffold_passes | 19 weak_spans |
+                //  20 scaffold_pass_date
                 "SELECT id, card_id, position, kind, prompt, answer, due_at,
                         interval_days, ease, last_reviewed_at, lapses, review_count,
-                        confidence_avg, image_path, difficulty
+                        confidence_avg, image_path, difficulty,
+                        consecutive_fails, consecutive_hards,
+                        scaffold_state, scaffold_passes, weak_spans, scaffold_pass_date
                  FROM items WHERE card_id=?1 ORDER BY position ASC",
             )
             .context("prepare load_items")?;
@@ -425,6 +469,9 @@ impl Store {
                 let due: String              = row.get(6)?;
                 let last: Option<String>     = row.get(9)?;
                 let image_path: Option<String> = row.get(13)?;
+                let scaffold_state: String   = row.get(17)?;
+                let weak_spans: String       = row.get(19)?;
+                let scaffold_pass_date: Option<String> = row.get(20)?;
                 Ok(Item {
                     id:               row.get(0)?,
                     card_id:          row.get(1)?,
@@ -441,6 +488,13 @@ impl Store {
                     confidence_avg:   row.get(12)?,
                     image_path,
                     difficulty:       row.get(14)?,
+                    consecutive_fails: row.get(15)?,
+                    consecutive_hards: row.get(16)?,
+                    scaffold_state:   scaffold_state.parse().unwrap_or_default(),
+                    scaffold_passes:  row.get(18)?,
+                    weak_spans:       parse_weak_spans(&weak_spans),
+                    scaffold_pass_date: scaffold_pass_date
+                        .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
                 })
             })
             .context("query items")?;
@@ -494,14 +548,16 @@ impl Store {
         confidence: u8,
         duration: Duration,
         chain_reexposure: bool,
-    ) -> Result<()> {
+    ) -> Result<LeechStatus> {
         // load current item state
         let item = self
             .conn
             .query_row(
                 "SELECT id, card_id, position, kind, prompt, answer, due_at,
                         interval_days, ease, last_reviewed_at, lapses, review_count,
-                        confidence_avg, image_path, difficulty
+                        confidence_avg, image_path, difficulty,
+                        consecutive_fails, consecutive_hards,
+                        scaffold_state, scaffold_passes, weak_spans, scaffold_pass_date
                  FROM items WHERE id=?1",
                 params![item_id],
                 |row| {
@@ -509,6 +565,9 @@ impl Store {
                     let due: String              = row.get(6)?;
                     let last: Option<String>     = row.get(9)?;
                     let image_path: Option<String> = row.get(13)?;
+                    let scaffold_state: String   = row.get(17)?;
+                    let weak_spans: String       = row.get(19)?;
+                    let scaffold_pass_date: Option<String> = row.get(20)?;
                     Ok(Item {
                         id:               row.get(0)?,
                         card_id:          row.get(1)?,
@@ -525,6 +584,13 @@ impl Store {
                         confidence_avg:   row.get(12)?,
                         image_path,
                         difficulty:       row.get(14)?,
+                        consecutive_fails: row.get(15)?,
+                        consecutive_hards: row.get(16)?,
+                        scaffold_state:   scaffold_state.parse().unwrap_or_default(),
+                        scaffold_passes:  row.get(18)?,
+                        weak_spans:       parse_weak_spans(&weak_spans),
+                        scaffold_pass_date: scaffold_pass_date
+                            .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
                     })
                 },
             )
@@ -542,6 +608,14 @@ impl Store {
         let is_daily = mode_str == "daily";
 
         let prev_interval = item.interval_days;
+        // snapshot before `item` is moved into the branches below (they
+        // each consume it by value, either via `..item` or apply_confidence)
+        let prev_fails              = item.consecutive_fails;
+        let prev_hards              = item.consecutive_hards;
+        let is_scaffolded           = item.scaffold_state.is_scaffolded();
+        let prev_scaffold_state     = item.scaffold_state;
+        let prev_scaffold_passes    = item.scaffold_passes;
+        let prev_scaffold_pass_date = item.scaffold_pass_date;
         let now = Utc::now();
 
         let updated = if is_daily {
@@ -550,11 +624,10 @@ impl Store {
             let n       = item.review_count + 1;
             let new_avg = rolling_avg(item.confidence_avg, item.review_count, confidence);
             Item { review_count: n, confidence_avg: new_avg, last_reviewed_at: Some(now), ..item }
-        } else if chain_reexposure {
-            // chain re-exposure: this step was already fully scheduled earlier
-            // this session. so update analytics only which leave FSRS state (stability,
-            // difficulty, interval_days, due_at, lapses) completely unchanged so
-            // the schedule reflects the *first* honest recall this session
+        } else if chain_reexposure || is_scaffolded {
+            // chain re-exposure OR a scaffolded rating, both are weaker
+            // FSRS state (stability, difficulty, interval_days, due_at,
+            // lapses) left completely untouched only analytics update
             let n       = item.review_count + 1;
             let new_avg = rolling_avg(item.confidence_avg, item.review_count, confidence);
             Item { review_count: n, confidence_avg: new_avg, last_reviewed_at: Some(now), ..item }
@@ -563,12 +636,53 @@ impl Store {
             scheduler::apply_confidence(item, confidence, now)
         };
 
+        // weak-step handling rolling consecutive-fail/hard counters
+        //   Again (1)   -> consecutive_fails += 1, consecutive_hards = 0
+        //   Hard  (2)   -> consecutive_hards += 1, consecutive_fails untouched
+        //   Good+ (>=3) -> both reset to 0
+        // chain_reexposure and scaffolded reviews are both weaker evidence
+        // already fully scheduled once this session, or hint-assisted
+        // the leech prompt while the chosen intervention is still active
+        let (new_fails, new_hards) = if chain_reexposure || is_scaffolded {
+            (prev_fails, prev_hards)
+        } else if confidence == 1 {
+            (prev_fails + 1, 0)
+        } else if confidence == 2 {
+            (prev_fails, prev_hards + 1)
+        } else {
+            (0, 0)
+        };
+
+        // scaffold graduation bookkeeping
+        let (new_scaffold_state, new_scaffold_passes, new_scaffold_pass_date) = if is_scaffolded {
+            if confidence >= 3 {
+                // scaffolded pass, Daily-capped: only the first pass
+                let today = now.date_naive();
+                let already_today = prev_scaffold_pass_date == Some(today);
+                let passes = if already_today { prev_scaffold_passes } else { prev_scaffold_passes + 1 };
+
+                if passes as u32 >= scheduler::LEECH_STREAK_THRESHOLD {
+                    // Graduate immediately
+                    (ScaffoldState::Normal, passes, Some(today))
+                } else {
+                    (ScaffoldState::Scaffolded, passes, Some(today))
+                }
+            } else {
+                // Scaffolded fail: reset progress toward graduation
+                (ScaffoldState::Scaffolded, 0, None)
+            }
+        } else {
+            (prev_scaffold_state, prev_scaffold_passes, prev_scaffold_pass_date)
+        };
+
         self.conn
             .execute(
                 "UPDATE items
                  SET due_at=?1, interval_days=?2, ease=?3, difficulty=?4,
-                     last_reviewed_at=?5, lapses=?6, review_count=?7, confidence_avg=?8
-                 WHERE id=?9",
+                     last_reviewed_at=?5, lapses=?6, review_count=?7, confidence_avg=?8,
+                     consecutive_fails=?9, consecutive_hards=?10,
+                     scaffold_state=?11, scaffold_passes=?12, scaffold_pass_date=?13
+                 WHERE id=?14",
                 params![
                     updated.due_at.to_rfc3339(),
                     updated.interval_days,
@@ -578,6 +692,11 @@ impl Store {
                     updated.lapses,
                     updated.review_count,
                     updated.confidence_avg,
+                    new_fails,
+                    new_hards,
+                    new_scaffold_state.as_str(),
+                    new_scaffold_passes,
+                    new_scaffold_pass_date.map(|d| d.format("%Y-%m-%d").to_string()),
                     updated.id,
                 ],
             )
@@ -624,6 +743,97 @@ impl Store {
             )
             .context("insert review_log")?;
 
+        // weak-step handling: while actively scaffolded, suppress the leech
+        if is_scaffolded {
+            Ok(LeechStatus::None)
+        } else {
+            self.leech_status_for(item_id, new_fails, new_hards)
+        }
+    }
+
+    /// primary trigger: `fails >= LEECH_STREAK_THRESHOLD` -> `Leech`
+    /// secondary trigger: 4+ fails-or-hards within the last
+    /// `LEECH_LOOKBACK_EVENTS` rating events (from `review_log`), to catch
+    /// an oscillating Again/Hard pattern that never produces a clean
+    /// consecutive streak of either kind alone -> `Leech`
+    fn leech_status_for(&self, item_id: &str, fails: i32, hards: i32) -> Result<LeechStatus> {
+        if fails as u32 >= scheduler::LEECH_STREAK_THRESHOLD {
+            return Ok(LeechStatus::Leech);
+        }
+
+        let recent_weak: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                    SELECT confidence FROM review_log
+                    WHERE item_id = ?1
+                    ORDER BY reviewed_at DESC
+                    LIMIT ?2
+                 ) WHERE confidence <= 2",
+                params![item_id, scheduler::LEECH_LOOKBACK_EVENTS as i64],
+                |r| r.get(0),
+            )
+            .context("query recent leech pattern")?;
+
+        if recent_weak as u32 >= scheduler::LEECH_STREAK_THRESHOLD {
+            return Ok(LeechStatus::Leech);
+        }
+
+        if hards as u32 >= scheduler::LEECH_STREAK_THRESHOLD {
+            return Ok(LeechStatus::HardStreak);
+        }
+
+        Ok(LeechStatus::None)
+    }
+
+    /// from the leech-intervention prompt's "Enable scaffolding" option
+    /// resets the Phase 1 counters to 0 alongside the scaffold fields so
+    /// that a future graduation-then-relapse cycle starts clean rather than
+    /// immediately re-triggering the leech prompt on stale counter values.
+    pub fn enter_scaffold_mode(&self, item_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE items
+                 SET scaffold_state='scaffolded', scaffold_passes=0, scaffold_pass_date=NULL,
+                     consecutive_fails=0, consecutive_hards=0
+                 WHERE id=?1",
+                params![item_id],
+            )
+            .context("enter scaffold mode")?;
+        Ok(())
+    }
+
+    /// increments the existing entrys weight if phrase is already in pool
+    /// otherwise inserts it with weight 1. No-ops on an empty phrase
+    pub fn add_weak_span(&self, item_id: &str, phrase: &str) -> Result<()> {
+        let phrase = phrase.trim();
+        if phrase.is_empty() {
+            return Ok(());
+        }
+
+        let raw: String = self
+            .conn
+            .query_row(
+                "SELECT weak_spans FROM items WHERE id=?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .context("load weak_spans")?;
+
+        let mut spans = parse_weak_spans(&raw);
+        if let Some(existing) = spans.iter_mut().find(|s| s.phrase == phrase) {
+            existing.weight += 1;
+        } else {
+            spans.push(WeakSpan { phrase: phrase.to_string(), weight: 1 });
+        }
+
+        let serialized = serde_json::to_string(&spans).context("serialize weak_spans")?;
+        self.conn
+            .execute(
+                "UPDATE items SET weak_spans=?1 WHERE id=?2",
+                params![serialized, item_id],
+            )
+            .context("save weak_spans")?;
         Ok(())
     }
 
@@ -788,6 +998,12 @@ impl Store {
                     item.lapses           = 0;
                     item.review_count     = 0;
                     item.confidence_avg   = 0.0;
+                    item.consecutive_fails = 0;
+                    item.consecutive_hards = 0;
+                    item.scaffold_state    = ScaffoldState::Normal;
+                    item.scaffold_passes   = 0;
+                    item.scaffold_pass_date = None;
+                    item.weak_spans        = Vec::new();
                 }
             }
             export_cards.push(ExportCard { card, items });
@@ -862,13 +1078,17 @@ impl Store {
             self.set_card_tags(&ic.card.id, &ic.card.tags)?;
 
             for item in ic.items {
+                let weak_spans_json = serde_json::to_string(&item.weak_spans)
+                    .unwrap_or_else(|_| "[]".to_string());
                 self.conn
                     .execute(
                         "INSERT OR REPLACE INTO items
                             (id, card_id, position, kind, prompt, answer, due_at,
                             interval_days, ease, last_reviewed_at,
-                            lapses, review_count, confidence_avg, image_path, difficulty)
-                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                            lapses, review_count, confidence_avg, image_path, difficulty,
+                            consecutive_fails, consecutive_hards,
+                            scaffold_state, scaffold_passes, weak_spans, scaffold_pass_date)
+                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                         params![
                             item.id,
                             item.card_id,
@@ -885,6 +1105,12 @@ impl Store {
                             item.confidence_avg,
                             item.image_path,
                             item.difficulty,
+                            item.consecutive_fails,
+                            item.consecutive_hards,
+                            item.scaffold_state.as_str(),
+                            item.scaffold_passes,
+                            weak_spans_json,
+                            item.scaffold_pass_date.map(|d| d.format("%Y-%m-%d").to_string()),
                         ],
                     )
                     .context("upsert item")?;
@@ -1166,6 +1392,13 @@ fn rolling_avg(prev_avg: f64, prev_count: i32, new_value: u8) -> f64 {
     } else {
         (prev_avg * prev_count as f64 + new_value as f64) / n
     }
+}
+
+/// parse the `weak_spans` TEXT column (JSON array of `WeakSpan`)
+/// or empty content degrades to an empty pool rather than erroring, the
+/// fallback-to-random-words render path already handles an empty pool
+fn parse_weak_spans(raw: &str) -> Vec<WeakSpan> {
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 fn new_id() -> String {

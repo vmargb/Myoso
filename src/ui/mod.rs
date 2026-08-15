@@ -20,7 +20,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use rfd::FileDialog;
 
 use crate::db::Store;
-use crate::models::{ReviewMode, SessionLimits};
+use crate::models::{CardKind, ItemKind, ReviewMode, SessionLimits};
 
 use state::{
     AddCardState, AddKind, AddPhase, AppState, ClickTarget, ExportFocus, ImportFocus,
@@ -177,6 +177,82 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
     let is_done = app.review.as_ref().map_or(true, |r| r.is_done());
     let phase   = app.review.as_ref().map(|r| r.phase);
 
+    // weak-step handling, blocking leech-intervention prompt takes
+    // over the review screens keys entirely until resolved
+    let leech_is_step = app.review.as_ref()
+        .and_then(|r| r.leech_prompt.as_ref())
+        .map(|p| p.is_step);
+    if let Some(is_step) = leech_is_step {
+        match code {
+            KeyCode::Char('1') => launch_leech_editor(app, false)?,
+            // split only makes sense for multi-card steps so chain isn't broken
+            KeyCode::Char('2') if is_step => launch_leech_editor(app, true)?,
+            KeyCode::Char('3') => {
+                let item_id = app.review.as_ref()
+                    .and_then(|r| r.leech_prompt.as_ref())
+                    .map(|p| p.item_id.clone());
+                if let Some(id) = item_id {
+                    store.enter_scaffold_mode(&id)?;
+                }
+                if let Some(rs) = app.review.as_mut() {
+                    rs.resolve_leech_prompt(store)?;
+                }
+            }
+            KeyCode::Char('c') | KeyCode::Esc | KeyCode::Enter => {
+                if let Some(rs) = app.review.as_mut() {
+                    rs.resolve_leech_prompt(store)?;
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // weak-step handling
+    if app.review.as_ref().and_then(|r| r.weak_span_prompt.as_ref()).is_some() {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(rs) = app.review.as_mut() { rs.weak_span_move_cursor(1); }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(rs) = app.review.as_mut() { rs.weak_span_move_cursor(-1); }
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                if let Some(rs) = app.review.as_mut() { rs.weak_span_move_cursor(-1); }
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                if let Some(rs) = app.review.as_mut() { rs.weak_span_move_cursor(1); }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(rs) = app.review.as_mut() { rs.weak_span_toggle_cursor(); }
+            }
+            KeyCode::Enter => {
+                if let Some(rs) = app.review.as_mut() { rs.weak_span_commit(store)?; }
+            }
+            KeyCode::Esc => {
+                if let Some(rs) = app.review.as_mut() { rs.resolve_weak_span_prompt(store)?; }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // scaffolded item has no reveal gate
+    // cloze-blanked answer is already on screen) and only accepts pass/fail
+    // ([1]/[3]) : [2]/[4] are visibly disabled in the footer and ignored here
+    let is_scaffolded = app.review.as_ref()
+        .filter(|r| !r.is_done())
+        .map(|r| r.session[r.card_idx].items[r.item_idx].scaffold_state.is_scaffolded())
+        .unwrap_or(false);
+    if is_scaffolded {
+        if let KeyCode::Char(c @ ('1' | '3')) = code {
+            if let Some(r) = app.review.as_mut() {
+                r.rate(store, c as u8 - b'0')?;
+            }
+            return Ok(());
+        }
+    }
+
     match code {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.go_back();
@@ -273,6 +349,12 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                 app.add_card = None;
                 if from_review {
                     app.screen = Screen::Review;
+                    // cancelling out of a leech-prompt deep-link
+                    // the intervention is handle it or explicitly move on
+                    let store = app.store;
+                    if let Some(rs) = app.review.as_mut() {
+                        rs.resolve_leech_prompt(store)?;
+                    }
                 } else {
                     app.go_back();
                 }
@@ -442,6 +524,9 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
+                                // Rename/Split resolves the leech prompt that
+                                // sent us here, resuming the rating that was paused on it
+                                rs.resolve_leech_prompt(app.store)?;
                             }
                         } else {
                             app.go_back();
@@ -1206,6 +1291,18 @@ fn on_click(app: &mut AppState, col: u16, row: u16) -> anyhow::Result<()> {
         ClickTarget::ReviewRate(n) => {
             on_review(app, KeyCode::Char((b'0' + n) as char))?;
         }
+        ClickTarget::LeechRename => {
+            on_review(app, KeyCode::Char('1'))?;
+        }
+        ClickTarget::LeechSplit => {
+            on_review(app, KeyCode::Char('2'))?;
+        }
+        ClickTarget::LeechScaffold => {
+            on_review(app, KeyCode::Char('3'))?;
+        }
+        ClickTarget::LeechContinue => {
+            on_review(app, KeyCode::Char('c'))?;
+        }
 
         ClickTarget::DecksList => {
             if let Some(ld) = app.list_decks.as_mut() {
@@ -1269,6 +1366,50 @@ fn on_click(app: &mut AppState, col: u16, row: u16) -> anyhow::Result<()> {
             on_import(app, KeyCode::Enter)?;
         }
     }
+    Ok(())
+}
+
+// ~~~ weak-step handling: leech intervention ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// step editor No new editor logic both reuse `AddCardState` exactly
+/// as the normal "edit step" flow does.
+fn launch_leech_editor(app: &mut AppState, split: bool) -> anyhow::Result<()> {
+    let (item_id, card_id) = match app.review.as_ref().and_then(|r| r.leech_prompt.as_ref()) {
+        Some(p) => (p.item_id.clone(), p.card_id.clone()),
+        None => return Ok(()),
+    };
+
+    let card  = app.store.load_card(&card_id)?;
+    let items = app.store.load_items(&card_id)?;
+    let tags  = app.store.get_card_tags(&card_id)?;
+    let decks = app.store.list_decks().unwrap_or_default();
+    let mut edit_state = AddCardState::for_edit(&card, &items, decks, tags);
+    edit_state.editing_from_review = true;
+
+    if card.kind == CardKind::Multi {
+        if let Some(idx) = items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Step)
+            .position(|i| i.id == item_id)
+        {
+            edit_state.step_list_state.select(Some(idx));
+            if split {
+                edit_state.insert_step_after_selected();
+            } else if let Some((name, answer, img)) = edit_state.steps.get(idx).cloned() {
+                edit_state.step_name_buf    = name;
+                edit_state.step_buf         = answer;
+                edit_state.step_image_path  = img;
+                edit_state.editing_step_idx = Some(idx);
+                edit_state.focused          = 2; // Step Name field
+            }
+        }
+    } else {
+        // simple card: "rename" means editing the question only, no split feature
+        edit_state.focused = 1;
+    }
+
+    app.add_card = Some(edit_state);
+    app.go_to(Screen::AddCard);
     Ok(())
 }
 

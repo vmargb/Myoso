@@ -10,7 +10,10 @@ use std::time::Instant;
 use ratatui::{layout::Rect, widgets::ListState};
 
 use crate::db::Store;
-use crate::models::{Card, CardKind, CardSummary, Item, ItemKind, ReviewCard, ReviewMode, Stats, SessionLimits};
+use crate::models::{
+    Card, CardKind, CardSummary, Item, ItemKind, LeechStatus, ReviewCard, ReviewMode, Stats,
+    SessionLimits,
+};
 
 // ~~~ Screens ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -34,6 +37,61 @@ pub enum ReviewPhase {
     Revealed,
 }
 
+// ~~~ leech intervention ~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// when a rating pushes a steps leech status to `Leech`, the review UI must
+// block on a rename/split intervention prompt before the normal
+// advance/chain-fail logic runs.
+pub struct LeechPrompt {
+    pub item_id:      String,
+    pub card_id:      String,
+    pub prompt_text:  String,
+    pub answer_text:  String,
+    pub is_step:      bool,
+    pub is_last_item: bool,
+    pub confidence:   u8,
+}
+
+// ~~~ weak-span marking ~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// fires after any confidence <= 2 rating (regardless of current scaffold
+// state), offering a lightweight, entirely skippable way to tag the exact
+// words that tripped the user up. Carries the same
+// finish_rating() fields as LeechPrompt for the same reason, it can appear
+// either directly from rate(), or chained after a leech prompt
+pub struct WeakSpanPrompt {
+    pub item_id:      String,
+    pub card_id:      String,
+    pub is_step:      bool,
+    pub is_last_item: bool,
+    pub confidence:   u8,
+    // the answer, tokenized on whitespace in original order
+    pub words:        Vec<String>,
+    // indices into `words` currently toggled on, building up one phrase
+    pub selected:      HashSet<usize>,
+    // list-navigation cursor
+    pub cursor:        usize,
+    // true once at least one phrase has been committed this prompt, purely
+    // for the "marked!" confirmation flash in the footer
+    pub committed_any: bool,
+}
+
+impl WeakSpanPrompt {
+    fn new(item_id: String, card_id: String, is_step: bool, is_last_item: bool, confidence: u8, answer: &str) -> Self {
+        Self {
+            item_id,
+            card_id,
+            is_step,
+            is_last_item,
+            confidence,
+            words: answer.split_whitespace().map(str::to_string).collect(),
+            selected: HashSet::new(),
+            cursor: 0,
+            committed_any: false,
+        }
+    }
+}
+
 pub struct ReviewState {
     pub session:           Vec<ReviewCard>,
     pub card_idx:          usize,
@@ -49,6 +107,12 @@ pub struct ReviewState {
     // any later rating of the same item (aka chain re-exposure) will only
     // update analytics, leaving the schedule unchanged
     pub session_rated:     HashSet<String>,
+    pub leech_prompt:      Option<LeechPrompt>,
+    // Passive, non-blocking note shown when a step's consecutive-hard
+    // streak (but not fail streak) crosses the threshold
+    pub hard_nudge:        Option<String>,
+    // either directly or chained after a leech prompt resolves
+    pub weak_span_prompt:  Option<WeakSpanPrompt>,
 }
 
 impl ReviewState {
@@ -66,6 +130,9 @@ impl ReviewState {
             finished_duration: None,
             answer_scroll: 0,
             session_rated: HashSet::new(),
+            leech_prompt: None,
+            hard_nudge: None,
+            weak_span_prompt: None,
         }
     }
 
@@ -97,13 +164,16 @@ impl ReviewState {
     }
 
     pub fn rate(&mut self, store: &Store, confidence: u8) -> anyhow::Result<()> {
-        if self.is_done() {
+        // ignore rating input while a blocking leech intervention, or the
+        if self.is_done() || self.leech_prompt.is_some() || self.weak_span_prompt.is_some() {
             return Ok(());
         }
 
         // snapshot of what we need before state mutation
         let item         = &self.session[self.card_idx].items[self.item_idx];
         let item_id      = item.id.clone();
+        let prompt_text  = item.prompt.clone();
+        let answer_text  = item.answer.clone();
         let is_step      = item.kind == ItemKind::Step;
         let is_last_item = self.item_idx == self.session[self.card_idx].items.len() - 1;
         let card_id      = self.session[self.card_idx].card.id.clone();
@@ -113,7 +183,9 @@ impl ReviewState {
         // forward/reverse items are never re-shown within a session
         let chain_reexposure = is_step && self.session_rated.contains(&item_id);
 
-        store.record_review(&item_id, confidence, self.item_started_at.elapsed(), chain_reexposure)?;
+        let leech_status = store.record_review(
+            &item_id, confidence, self.item_started_at.elapsed(), chain_reexposure,
+        )?;
 
         // mark this item as having received its first full update this session
         // later appearances (chain re-exposures) will skip rescheduling
@@ -121,6 +193,43 @@ impl ReviewState {
 
         self.done_items += 1;
 
+        match leech_status {
+            LeechStatus::Leech => {
+                // The step that triggered the session must always be a
+                // full-weight test
+                self.hard_nudge = None;
+                self.leech_prompt = Some(LeechPrompt {
+                    item_id, card_id, prompt_text, answer_text, is_step, is_last_item, confidence,
+                });
+                return Ok(());
+            }
+            LeechStatus::HardStreak => {
+                self.hard_nudge = Some(format!(
+                    "\"{prompt_text}\" has needed extra effort {} times in a row, consider renaming or splitting it. (press [e] to edit)",
+                    crate::scheduler::LEECH_STREAK_THRESHOLD,
+                ));
+            }
+            LeechStatus::None => {}
+        }
+
+        if confidence <= 2 {
+            self.weak_span_prompt = Some(WeakSpanPrompt::new(
+                item_id, card_id, is_step, is_last_item, confidence, &answer_text,
+            ));
+            return Ok(());
+        }
+
+        self.finish_rating(store, &card_id, confidence, is_step, is_last_item)
+    }
+
+    fn finish_rating(
+        &mut self,
+        store: &Store,
+        card_id: &str,
+        confidence: u8,
+        is_step: bool,
+        is_last_item: bool,
+    ) -> anyhow::Result<()> {
         if is_step && confidence == 1 {
             // failure: skip remaining steps, jump to next card
             let skipped_items = self.session[self.card_idx].items.len() - self.item_idx - 1;
@@ -132,14 +241,14 @@ impl ReviewState {
 
             // db just set all subsequent steps' due_at = now, so re-add this
             // card at the tail of the session if it now has due items
-            self.requeue_if_due(store, &card_id)?;
+            self.requeue_if_due(store, card_id)?;
         } else {
             self.advance();
 
             // after completing the last step of a multi card, the next step in
             // the chain may already be due (all brand-new steps start past-due)
             if is_last_item && is_step {
-                self.requeue_if_due(store, &card_id)?;
+                self.requeue_if_due(store, card_id)?;
             }
         }
 
@@ -151,11 +260,76 @@ impl ReviewState {
         Ok(())
     }
 
+    /// Resolve a pending leech intervention (rename, split, enable scaffold)
+    pub fn resolve_leech_prompt(&mut self, store: &Store) -> anyhow::Result<()> {
+        if let Some(p) = self.leech_prompt.take() {
+            if p.confidence <= 2 {
+                self.weak_span_prompt = Some(WeakSpanPrompt::new(
+                    p.item_id, p.card_id, p.is_step, p.is_last_item, p.confidence, &p.answer_text,
+                ));
+                return Ok(());
+            }
+            self.finish_rating(store, &p.card_id, p.confidence, p.is_step, p.is_last_item)?;
+        }
+        Ok(())
+    }
+
+    // ~~ weak-span marking interaction (Phase 2) ~~~~~~~~~~~
+
+    pub fn weak_span_move_cursor(&mut self, delta: i32) {
+        if let Some(p) = self.weak_span_prompt.as_mut() {
+            if p.words.is_empty() {
+                return;
+            }
+            let len = p.words.len() as i32;
+            let new = (p.cursor as i32 + delta).rem_euclid(len);
+            p.cursor = new as usize;
+        }
+    }
+
+    pub fn weak_span_toggle_cursor(&mut self) {
+        if let Some(p) = self.weak_span_prompt.as_mut() {
+            if p.words.is_empty() {
+                return;
+            }
+            if !p.selected.remove(&p.cursor) {
+                p.selected.insert(p.cursor);
+            }
+        }
+    }
+
+    /// Commit the currently-toggled words as one phrase
+    pub fn weak_span_commit(&mut self, store: &Store) -> anyhow::Result<()> {
+        if let Some(p) = self.weak_span_prompt.as_mut() {
+            if p.selected.is_empty() {
+                return Ok(());
+            }
+            let mut idxs: Vec<usize> = p.selected.iter().copied().collect();
+            idxs.sort_unstable();
+            let phrase = idxs.iter().map(|&i| p.words[i].as_str())
+                .collect::<Vec<_>>().join(" ");
+
+            store.add_weak_span(&p.item_id, &phrase)?;
+            p.selected.clear();
+            p.committed_any = true;
+        }
+        Ok(())
+    }
+
+    /// Finish the weak-span prompt
+    pub fn resolve_weak_span_prompt(&mut self, store: &Store) -> anyhow::Result<()> {
+        if let Some(p) = self.weak_span_prompt.take() {
+            self.finish_rating(store, &p.card_id, p.confidence, p.is_step, p.is_last_item)?;
+        }
+        Ok(())
+    }
+
     pub fn advance(&mut self) {
         self.item_idx += 1;
         self.phase = ReviewPhase::Thinking;
         self.item_started_at = Instant::now();
         self.answer_scroll = 0; // reset scroll on advance
+        self.hard_nudge = None; // passive nudge only applies to the item just rated
         if let Some(card) = self.session.get(self.card_idx) {
             if self.item_idx >= card.items.len() {
                 self.card_idx += 1;
@@ -740,6 +914,10 @@ pub enum ClickTarget {
     DeckSuggestions,
     ReviewCard,
     ReviewRate(u8),
+    LeechRename,
+    LeechSplit,
+    LeechScaffold,
+    LeechContinue,
     DecksList,
     CardsList,
     TagPickerList,
