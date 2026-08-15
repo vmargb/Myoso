@@ -80,10 +80,6 @@ pub enum LeechStatus {
     None,
     /// Consecutive-fail streak
     Leech,
-    /// Consecutive-hard streak only: the step is known but effortful, not
-    /// forgotten. Surfaces a passive, non-blocking rename/split nudge
-    /// never the blocking prompt, and never offers scaffolding
-    HardStreak,
 }
 
 // ~~~ weak-step handling: scaffolding ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

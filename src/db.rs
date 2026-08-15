@@ -747,7 +747,7 @@ impl Store {
         if is_scaffolded {
             Ok(LeechStatus::None)
         } else {
-            self.leech_status_for(item_id, new_fails, new_hards)
+            self.leech_status_for(item_id, new_fails)
         }
     }
 
@@ -756,31 +756,30 @@ impl Store {
     /// `LEECH_LOOKBACK_EVENTS` rating events (from `review_log`), to catch
     /// an oscillating Again/Hard pattern that never produces a clean
     /// consecutive streak of either kind alone -> `Leech`
-    fn leech_status_for(&self, item_id: &str, fails: i32, hards: i32) -> Result<LeechStatus> {
+    fn leech_status_for(&self, item_id: &str, fails: i32) -> Result<LeechStatus> {
         if fails as u32 >= scheduler::LEECH_STREAK_THRESHOLD {
             return Ok(LeechStatus::Leech);
         }
 
-        let recent_weak: i64 = self
+        let (recent_weak, recent_fails): (i64, i64) = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM (
+                "SELECT
+                    SUM(CASE WHEN confidence <= 2 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN confidence = 1  THEN 1 ELSE 0 END)
+                 FROM (
                     SELECT confidence FROM review_log
                     WHERE item_id = ?1
                     ORDER BY reviewed_at DESC
                     LIMIT ?2
-                 ) WHERE confidence <= 2",
+                 )",
                 params![item_id, scheduler::LEECH_LOOKBACK_EVENTS as i64],
-                |r| r.get(0),
+                |r| Ok((r.get::<_, Option<i64>>(0)?.unwrap_or(0), r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
             )
             .context("query recent leech pattern")?;
 
-        if recent_weak as u32 >= scheduler::LEECH_STREAK_THRESHOLD {
+        if recent_weak as u32 >= scheduler::LEECH_STREAK_THRESHOLD && recent_fails >= 2 {
             return Ok(LeechStatus::Leech);
-        }
-
-        if hards as u32 >= scheduler::LEECH_STREAK_THRESHOLD {
-            return Ok(LeechStatus::HardStreak);
         }
 
         Ok(LeechStatus::None)
@@ -790,7 +789,7 @@ impl Store {
     /// resets the Phase 1 counters to 0 alongside the scaffold fields so
     /// that a future graduation-then-relapse cycle starts clean rather than
     /// immediately re-triggering the leech prompt on stale counter values.
-    pub fn enter_scaffold_mode(&self, item_id: &str) -> Result<()> {
+    fn enter_scaffold_mode(&self, item_id: &str) -> Result<()> {
         self.conn
             .execute(
                 "UPDATE items
@@ -811,12 +810,12 @@ impl Store {
             return Ok(());
         }
 
-        let raw: String = self
+        let (raw, scaffold_state): (String, String) = self
             .conn
             .query_row(
-                "SELECT weak_spans FROM items WHERE id=?1",
+                "SELECT weak_spans, scaffold_state FROM items WHERE id=?1",
                 params![item_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .context("load weak_spans")?;
 
@@ -834,6 +833,11 @@ impl Store {
                 params![serialized, item_id],
             )
             .context("save weak_spans")?;
+
+        if scaffold_state != "scaffolded" {
+            self.enter_scaffold_mode(item_id)?;
+        }
+
         Ok(())
     }
 

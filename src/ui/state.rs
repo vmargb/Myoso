@@ -108,9 +108,6 @@ pub struct ReviewState {
     // update analytics, leaving the schedule unchanged
     pub session_rated:     HashSet<String>,
     pub leech_prompt:      Option<LeechPrompt>,
-    // Passive, non-blocking note shown when a step's consecutive-hard
-    // streak (but not fail streak) crosses the threshold
-    pub hard_nudge:        Option<String>,
     // either directly or chained after a leech prompt resolves
     pub weak_span_prompt:  Option<WeakSpanPrompt>,
 }
@@ -131,7 +128,6 @@ impl ReviewState {
             answer_scroll: 0,
             session_rated: HashSet::new(),
             leech_prompt: None,
-            hard_nudge: None,
             weak_span_prompt: None,
         }
     }
@@ -197,17 +193,10 @@ impl ReviewState {
             LeechStatus::Leech => {
                 // The step that triggered the session must always be a
                 // full-weight test
-                self.hard_nudge = None;
                 self.leech_prompt = Some(LeechPrompt {
                     item_id, card_id, prompt_text, answer_text, is_step, is_last_item, confidence,
                 });
                 return Ok(());
-            }
-            LeechStatus::HardStreak => {
-                self.hard_nudge = Some(format!(
-                    "\"{prompt_text}\" has needed extra effort {} times in a row, consider renaming or splitting it. (press [e] to edit)",
-                    crate::scheduler::LEECH_STREAK_THRESHOLD,
-                ));
             }
             LeechStatus::None => {}
         }
@@ -218,6 +207,22 @@ impl ReviewState {
         // leech, want to pin down the exact words?" tool, not a prompt on
         // every low rating.
         self.finish_rating(store, &card_id, confidence, is_step, is_last_item)
+    }
+
+    /// Resolve a pending leech intervention.
+    /// `mark_blind_spot == true`: chain into the weak-span prompt so the
+    /// `mark_blind_spot == false`: "Ignore": just finish the rating as normal.
+    pub fn resolve_leech_prompt(&mut self, store: &Store, mark_blind_spot: bool) -> anyhow::Result<()> {
+        if let Some(p) = self.leech_prompt.take() {
+            if mark_blind_spot {
+                self.weak_span_prompt = Some(WeakSpanPrompt::new(
+                    p.item_id, p.card_id, p.is_step, p.is_last_item, p.confidence, &p.answer_text,
+                ));
+                return Ok(());
+            }
+            self.finish_rating(store, &p.card_id, p.confidence, p.is_step, p.is_last_item)?;
+        }
+        Ok(())
     }
 
     fn finish_rating(
@@ -255,20 +260,6 @@ impl ReviewState {
             self.finished_duration = Some(self.started_at.elapsed());
         }
 
-        Ok(())
-    }
-
-    /// Resolve a pending leech intervention (rename, split, enable scaffold)
-    pub fn resolve_leech_prompt(&mut self, store: &Store) -> anyhow::Result<()> {
-        if let Some(p) = self.leech_prompt.take() {
-            if p.confidence <= 2 {
-                self.weak_span_prompt = Some(WeakSpanPrompt::new(
-                    p.item_id, p.card_id, p.is_step, p.is_last_item, p.confidence, &p.answer_text,
-                ));
-                return Ok(());
-            }
-            self.finish_rating(store, &p.card_id, p.confidence, p.is_step, p.is_last_item)?;
-        }
         Ok(())
     }
 
@@ -327,7 +318,6 @@ impl ReviewState {
         self.phase = ReviewPhase::Thinking;
         self.item_started_at = Instant::now();
         self.answer_scroll = 0; // reset scroll on advance
-        self.hard_nudge = None; // passive nudge only applies to the item just rated
         if let Some(card) = self.session.get(self.card_idx) {
             if self.item_idx >= card.items.len() {
                 self.card_idx += 1;
@@ -912,10 +902,8 @@ pub enum ClickTarget {
     DeckSuggestions,
     ReviewCard,
     ReviewRate(u8),
-    LeechRename,
-    LeechSplit,
-    LeechScaffold,
-    LeechContinue,
+    LeechMarkBlindSpot,
+    LeechIgnore,
     DecksList,
     CardsList,
     TagPickerList,

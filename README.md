@@ -85,6 +85,7 @@ cargo run
 - **Image preview**: Insert path to images locally into an answer/step (handwritten work or screenshot)
 - **Subdecks**: Organise decks into 'sub-decks', allowing clear separation (e.g., vocabulary, grammar)
 - **Tags**: Organise cards even further by adding tags, allowing easy search filtering
+- **Leach detection**: Automatically flags steps you keep failing and offers some interventions to handle them
 
 ### Daily cards
 
@@ -116,3 +117,20 @@ Intervals are calculated to target a 90% recall probability at review time, and 
 > Reserving it only for **rare** occassions for optimal recall performance.
 
 Additionally, `Myoso` handles a unique *re-exposure* problem where you repeatedly rate a step as `good` or `easy` because you had just recently saw it(from rebuilding the steps again in the **same session**). This would artificially *inflate* the cards schedule because you stacked multiple `easy`'s on the same steps. Therefore, any *re-exposure* ratings now introduce a **tapering effect** against the SRS algorithm to prevent this inflation.
+
+---
+
+## Weak-step handling
+
+Some steps just don't stick, with multiple `again` and `hard` ratings. In standard flashcards these are called **leaches**, which are usually removed out of the review queue. However, Myoso can't simply remove an intermediary step in a chain. Instead it offers a couple alternatives to pick from:
+
+- **cloze-deletions**: highlight the exact word, formula or phrase in the answer that's actually tripping you up
+- **split into two steps**: If a step is too difficult, you may need to split it to make recall easier
+
+**Mark blind spot (cloze deletion)**
+
+Marking a blind spot does two things at once: it remembers the exact phrase you picked, and it switches that step into a lighter review mode where the answer is shown in full with just that phrase blanked out, everything else stays as context, so your job is purely to recall the part that actually trips you up, not the whole answer. That's still real recall, just aimed at the right target instead of the whole step.
+
+If you recall the *clozed* parts right enough times, the step graduates back to normal full-recall review. These lighter reviews don't touch your normal schedule, they exist purely to rebuild the specific bit of recall that was missing.
+
+Both leech detection and blind-spot marking run per **step** (or per simple-card item), not per card, so a single stubborn step in an overall solid card gets a little help without dragging the rest of the chain into it.

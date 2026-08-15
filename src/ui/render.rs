@@ -312,11 +312,6 @@ fn select_cloze_phrases(item: &Item) -> Vec<String> {
 
     let mut phrases: Vec<String> = spans.into_iter().take(3).map(|s| s.phrase.clone()).collect();
 
-    if phrases.is_empty() {
-        let words: Vec<&str> = item.answer.split_whitespace().collect();
-        phrases = fallback_random_words(&item.id, &words, 2);
-    }
-
     phrases.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
     phrases
 }
@@ -388,31 +383,7 @@ fn highlight_lines(answer: &str, phrases: &[String]) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Deterministic (per item, stable across re-renders within a session)
-/// pseudo-random word, enough variety so that
-/// two scaffolded items don't always blank "the" or the first word
-fn fallback_random_words(item_id: &str, words: &[&str], count: usize) -> Vec<String> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
 
-    if words.is_empty() {
-        return Vec::new();
-    }
-    let mut hasher = DefaultHasher::new();
-    item_id.hash(&mut hasher);
-    let mut seed = hasher.finish().max(1);
-
-    let n = words.len();
-    let want = count.min(n);
-    let mut picked = std::collections::HashSet::new();
-    while picked.len() < want {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        picked.insert((seed as usize) % n);
-    }
-    picked.into_iter().map(|i| words[i].to_string()).collect()
-}
 
 pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) {
     let size = f.area();
@@ -818,25 +789,6 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         v[2],
     );
 
-    // passive hard-streak nudge, shown as a
-    // dismissible-by-nature (clears on next item) note just above the card
-    if let Some(nudge) = rs.hard_nudge.as_ref() {
-        let nudge_area = Rect {
-            x: v[1].x,
-            y: v[1].y,
-            width: v[1].width,
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("  ⚠ {nudge}"),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
-            )))
-            .alignment(Alignment::Center),
-            nudge_area,
-        );
-    }
-
     if let Some(prompt) = rs.leech_prompt.as_ref() {
         render_leech_prompt(f, prompt, size, clicks);
     }
@@ -847,14 +799,14 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
 
 /// Blocking rename/split intervention prompt
 fn render_leech_prompt(f: &mut Frame, prompt: &LeechPrompt, size: Rect, clicks: &mut Clicks) {
-    let height = if prompt.is_step { 11 } else { 9 };
+    let height = 9;
     let area = centered_rect(60, height, size);
     f.render_widget(Clear, area);
 
     let title: String = prompt.prompt_text.chars().take(40).collect();
     let ellipsis = if prompt.prompt_text.chars().count() > 40 { "…" } else { "" };
 
-    let mut lines = vec![
+    let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             " This step keeps giving you trouble ",
@@ -869,28 +821,16 @@ fn render_leech_prompt(f: &mut Frame, prompt: &LeechPrompt, size: Rect, clicks: 
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         )),
         Line::from(""),
+        Line::from(vec![
+            Span::styled(" [1] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Mark blind spot  "),
+            Span::styled("(tag the exact words that tripped you up)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled(" [c] ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+            Span::raw("Ignore"),
+        ]),
     ];
-    lines.push(Line::from(vec![
-        Span::styled(" [1] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw("Rename step  "),
-        Span::styled("(fix a vague title)", Style::default().fg(Color::DarkGray)),
-    ]));
-    if prompt.is_step {
-        lines.push(Line::from(vec![
-            Span::styled(" [2] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Split step  "),
-            Span::styled("(redistribute the content)", Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        Span::styled(" [3] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw("Enable scaffolding  "),
-        Span::styled("(hint-assisted practice for a while)", Style::default().fg(Color::DarkGray)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" [c] ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
-        Span::raw("Continue as-is"),
-    ]));
 
     f.render_widget(
         Paragraph::new(lines)
@@ -907,16 +847,8 @@ fn render_leech_prompt(f: &mut Frame, prompt: &LeechPrompt, size: Rect, clicks: 
 
     // click regions, one row each starting after the 5-line header
     let base_y = area.y + 6;
-    let mut row = 0u16;
-    clicks.push((Rect { x: area.x, y: base_y + row, width: area.width, height: 1 }, ClickTarget::LeechRename));
-    row += 1;
-    if prompt.is_step {
-        clicks.push((Rect { x: area.x, y: base_y + row, width: area.width, height: 1 }, ClickTarget::LeechSplit));
-        row += 1;
-    }
-    clicks.push((Rect { x: area.x, y: base_y + row, width: area.width, height: 1 }, ClickTarget::LeechScaffold));
-    row += 1;
-    clicks.push((Rect { x: area.x, y: base_y + row, width: area.width, height: 1 }, ClickTarget::LeechContinue));
+    clicks.push((Rect { x: area.x, y: base_y, width: area.width, height: 1 }, ClickTarget::LeechMarkBlindSpot));
+    clicks.push((Rect { x: area.x, y: base_y + 1, width: area.width, height: 1 }, ClickTarget::LeechIgnore));
 }
 
 /// Weak-span marking prompt. Entirely skippable
