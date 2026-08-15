@@ -212,13 +212,11 @@ impl ReviewState {
             LeechStatus::None => {}
         }
 
-        if confidence <= 2 {
-            self.weak_span_prompt = Some(WeakSpanPrompt::new(
-                item_id, card_id, is_step, is_last_item, confidence, &answer_text,
-            ));
-            return Ok(());
-        }
-
+        // Weak-span marking is only offered as a follow-on to an actual
+        // leech trigger (see resolve_leech_prompt below), never on a plain
+        // Again/Hard rating by itself — it's a "you've now got a confirmed
+        // leech, want to pin down the exact words?" tool, not a prompt on
+        // every low rating.
         self.finish_rating(store, &card_id, confidence, is_step, is_last_item)
     }
 

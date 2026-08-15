@@ -244,12 +244,16 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         .filter(|r| !r.is_done())
         .map(|r| r.session[r.card_idx].items[r.item_idx].scaffold_state.is_scaffolded())
         .unwrap_or(false);
-    if is_scaffolded {
-        if let KeyCode::Char(c @ ('1' | '3')) = code {
-            if let Some(r) = app.review.as_mut() {
-                r.rate(store, c as u8 - b'0')?;
+    if is_scaffolded && phase == Some(ReviewPhase::Revealed) {
+        match code {
+            KeyCode::Char(c @ ('1' | '3')) => {
+                if let Some(r) = app.review.as_mut() {
+                    r.rate(store, c as u8 - b'0')?;
+                }
+                return Ok(());
             }
-            return Ok(());
+            KeyCode::Char('2') | KeyCode::Char('4') => return Ok(()), // disabled while scaffolded
+            _ => {}
         }
     }
 

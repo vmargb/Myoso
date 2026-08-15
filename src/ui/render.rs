@@ -299,9 +299,10 @@ pub(super) fn render_stats(f: &mut Frame, app: &AppState) {
 
 // ~~ Review ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-/// weak-step handling, build the cloze-blanked answer text shown
-/// for a scaffolded item. Prefers the user's own weight-sorted weak spans
-fn build_cloze_text(item: &Item) -> String {
+/// Weak-step handling Phase 2: pick which phrases get cloze-blanked (and
+/// later highlighted on reveal) for a scaffolded item. Prefers the user's
+/// own weight-sorted weak spans 
+fn select_cloze_phrases(item: &Item) -> Vec<String> {
     let mut spans: Vec<&crate::models::WeakSpan> = item
         .weak_spans
         .iter()
@@ -316,11 +317,15 @@ fn build_cloze_text(item: &Item) -> String {
         phrases = fallback_random_words(&item.id, &words, 2);
     }
 
-    // longest phrase first, so a shorter phrase that happens to be a
     phrases.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+    phrases
+}
 
-    let mut out = item.answer.clone();
-    for p in &phrases {
+/// Pre-reveal: the answer with each selected phrase replaced by a blank of
+/// matching visual width.
+fn blank_text(answer: &str, phrases: &[String]) -> String {
+    let mut out = answer.to_string();
+    for p in phrases {
         if p.is_empty() {
             continue;
         }
@@ -328,6 +333,59 @@ fn build_cloze_text(item: &Item) -> String {
         out = out.replace(p.as_str(), &blank);
     }
     out
+}
+
+/// Post-reveal: the full, un-blanked answer with the tested phrases
+/// highlighted, so the user can directly check their recall against what
+/// was actually asked, the whole point of a reveal step.
+fn highlight_lines(answer: &str, phrases: &[String]) -> Vec<Line<'static>> {
+    answer
+        .lines()
+        .map(|line| {
+            let mut segments: Vec<(String, bool)> = vec![(line.to_string(), false)];
+            for p in phrases {
+                if p.is_empty() {
+                    continue;
+                }
+                let mut next = Vec::new();
+                for (seg, hl) in segments {
+                    if hl {
+                        next.push((seg, hl));
+                        continue;
+                    }
+                    let mut rest = seg.as_str();
+                    while let Some(idx) = rest.find(p.as_str()) {
+                        if idx > 0 {
+                            next.push((rest[..idx].to_string(), false));
+                        }
+                        next.push((p.clone(), true));
+                        rest = &rest[idx + p.len()..];
+                    }
+                    if !rest.is_empty() {
+                        next.push((rest.to_string(), false));
+                    }
+                }
+                segments = next;
+            }
+            let spans: Vec<Span<'static>> = segments
+                .into_iter()
+                .map(|(text, hl)| {
+                    if hl {
+                        Span::styled(
+                            text,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::styled(text, Style::default().fg(Color::White))
+                    }
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Deterministic (per item, stable across re-renders within a session)
@@ -520,7 +578,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
     // ONE stable card for BOTH phases, same position/size always, so revealing
     // never repositions or resizes anything, it only grows the content inside
     let card = centered_rect(80, v[1].height.saturating_sub(2).max(10), v[1]);
-    if !is_scaffolded && rs.phase == ReviewPhase::Thinking {
+    if rs.phase == ReviewPhase::Thinking {
         clicks.push((card, ClickTarget::ReviewCard));
     }
 
@@ -563,13 +621,30 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
                 Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("— pass {}/{} today to graduate", item.scaffold_passes.max(0), crate::scheduler::LEECH_STREAK_THRESHOLD),
+                format!(" pass {}/{} today to graduate", item.scaffold_passes.max(0), crate::scheduler::LEECH_STREAK_THRESHOLD),
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
             ),
         ]));
         lines.push(Line::from(""));
-        for l in build_cloze_text(item).lines() {
-            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))));
+
+        let phrases = select_cloze_phrases(item);
+        match rs.phase {
+            ReviewPhase::Thinking => {
+                // Cloze rendering is plain text (not markdown-rendered)
+                for l in blank_text(&item.answer, &phrases).lines() {
+                    lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  [ Space / Enter to reveal ]",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                )));
+            }
+            ReviewPhase::Revealed => {
+                // Full answer, with the tested phrase(s) highlighted so the
+                // user can directly confirm their recall was right.
+                lines.extend(highlight_lines(&item.answer, &phrases));
+            }
         }
     } else {
         match rs.phase {
@@ -640,9 +715,25 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         card,
     );
 
-    let footer = if is_scaffolded {
-        // weak-step handling Phase 2: grading is pass/fail only while
-        // scaffolded [1] Fail and [3] Good/Pass reuse the existing
+    let footer = if is_scaffolded && rs.phase == ReviewPhase::Thinking {
+        Line::from(vec![
+            Span::styled(
+                " [Space] ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Reveal  "),
+            Span::styled(
+                " (blanks stay hidden until you reveal)  ",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ),
+            Span::styled(" [q] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw("Quit"),
+        ])
+    } else if is_scaffolded {
+        // Weak-step handling Phase 2: grading is pass/fail only while
+        // scaffolded, [1] Fail and [3] Good/Pass reuse the existing
+        // Again/Good confidence semantics end-to-end (chain de-unlock,
+        // review_log, rolling averages), just with [2]/[4] not offered.
         let spans = vec![
             Span::styled(" [1] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Span::raw("Fail  "),
@@ -766,7 +857,7 @@ fn render_leech_prompt(f: &mut Frame, prompt: &LeechPrompt, size: Rect, clicks: 
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            " This step keeps giving you trouble —",
+            " This step keeps giving you trouble ",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
@@ -871,7 +962,7 @@ fn render_weak_span_prompt(f: &mut Frame, prompt: &WeakSpanPrompt, size: Rect) {
     lines.push(Line::from(""));
     if prompt.committed_any {
         lines.push(Line::from(Span::styled(
-            " ✓ marked — select more, or press esc when done",
+            " ✓ marked, select more, or press esc when done",
             Style::default().fg(Color::Green),
         )));
     }
