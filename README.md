@@ -129,8 +129,6 @@ Some steps just don't stick, with multiple `again` and `hard` ratings. In standa
 
 **Mark blind spot (cloze deletion)**
 
-Marking a blind spot does two things at once: it remembers the exact phrase you picked, and it switches that step into a lighter review mode where the answer is shown in full with just that phrase blanked out, everything else stays as context, so your job is purely to recall the part that actually trips you up, not the whole answer. That's still real recall, just aimed at the right target instead of the whole step.
-
 If you recall the *clozed* parts right enough times, the step graduates back to normal full-recall review. These lighter reviews don't touch your normal schedule, they exist purely to rebuild the specific bit of recall that was missing.
 
 Both leech detection and blind-spot marking run per **step** (or per simple-card item), not per card, so a single stubborn step in an overall solid card gets a little help without dragging the rest of the chain into it.
