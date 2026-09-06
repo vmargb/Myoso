@@ -86,6 +86,7 @@ cargo run
 - **Subdecks**: Organise decks into 'sub-decks', allowing clear separation (e.g., vocabulary, grammar)
 - **Tags**: Organise cards even further by adding tags, allowing easy search filtering
 - **Leach detection**: Automatically flags steps you keep failing and offers some interventions to handle them
+- **Feynman Step**: Optional Feynman technique step before revealing a card to compare your answer.
 
 ### Daily cards
 
@@ -116,19 +117,15 @@ Intervals are calculated to target a 90% recall probability at review time, and 
 > It is highly recommended to avoid the `4` option.
 > Reserving it only for **rare** occassions for optimal recall performance.
 
-Additionally, `Myoso` handles a unique *re-exposure* problem where you repeatedly rate a step as `good` or `easy` because you had just recently saw it(from rebuilding the steps again in the **same session**). This would artificially *inflate* the cards schedule because you stacked multiple `easy`'s on the same steps. Therefore, any *re-exposure* ratings now introduce a **tapering effect** against the SRS algorithm to prevent this inflation.
+Additionally, `Myoso` handles a unique problem of *re-exposure* where repeatedly rating a step as `good` or `easy` because you had just recently seen it(from rebuilding the same steps in the **same session**). This would artificially *inflate* the cards schedule because you stacked multiple positive ratings on the same steps. Therefore, any *re-exposure* ratings now introduce a **tapering effect** against the SRS algorithm to prevent this inflation.
 
 ---
 
-## Weak-step handling
+## Leach detection & intervention
 
-Some steps just don't stick, with multiple `again` and `hard` ratings. In standard flashcards these are called **leaches**, which are usually removed out of the review queue. However, Myoso can't simply remove an intermediary step in a chain. Instead it offers a couple alternatives to pick from:
+Some steps just don't stick, with multiple stacking `again` and `hard` ratings. In `anki` these are called **leaches**, which are usually removed out of the review queue. However, Myoso can't simply remove an intermediary step from a chain. Instead it offers a couple alternatives to pick from:
 
-- **cloze-deletions**: highlight the exact word, formula or phrase in the answer that's actually tripping you up
-- **split into two steps**: If a step is too difficult, you may need to split it to make recall easier
+- **(cloze-tests)[https://en.wikipedia.org/wiki/Cloze_test]**: highlight the exact word, formula or phrase in the answer that's actually tripping you up
+- **split in two**: If a step is too difficult, you can split the step into two smaller steps to make recall easier.
 
-**Mark blind spot (cloze deletion)**
-
-If you recall the *clozed* parts right enough times, the step graduates back to normal full-recall review. These lighter reviews don't touch your normal schedule, they exist purely to rebuild the specific bit of recall that was missing.
-
-Both leech detection and blind-spot marking run per **step** (or per simple-card item), not per card, so a single stubborn step in an overall solid card gets a little help without dragging the rest of the chain into it.
+cloze-deletions end up graduating back to normal full-recall review. These lighter reviews don't touch your normal schedule, they exist purely to rebuild the specific bit of recall that was missing.
