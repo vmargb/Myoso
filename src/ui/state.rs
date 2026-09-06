@@ -92,6 +92,16 @@ impl WeakSpanPrompt {
     }
 }
 
+// ~~~ Feynman scratchpad ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// never touches the DB or import/export
+// persists while stepping through a multi-step chain, and is wiped on next card
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewFocus {
+    Card,
+    Scratchpad,
+}
+
 pub struct ReviewState {
     pub session:           Vec<ReviewCard>,
     pub card_idx:          usize,
@@ -110,6 +120,9 @@ pub struct ReviewState {
     pub leech_prompt:      Option<LeechPrompt>,
     // either directly or chained after a leech prompt resolves
     pub weak_span_prompt:  Option<WeakSpanPrompt>,
+    pub scratchpad:        String, // feynman technique
+    pub scratchpad_open:   bool,
+    pub focus:             ReviewFocus,
 }
 
 impl ReviewState {
@@ -129,6 +142,9 @@ impl ReviewState {
             session_rated: HashSet::new(),
             leech_prompt: None,
             weak_span_prompt: None,
+            scratchpad: String::new(),
+            scratchpad_open: false,
+            focus: ReviewFocus::Card,
         }
     }
 
@@ -241,6 +257,7 @@ impl ReviewState {
             self.item_idx = 0;
             self.phase = ReviewPhase::Thinking;
             self.item_started_at = Instant::now();
+            self.clear_scratchpad();
 
             // db just set all subsequent steps' due_at = now, so re-add this
             // card at the tail of the session if it now has due items
@@ -314,6 +331,7 @@ impl ReviewState {
     }
 
     pub fn advance(&mut self) {
+        let prev_card_idx = self.card_idx;
         self.item_idx += 1;
         self.phase = ReviewPhase::Thinking;
         self.item_started_at = Instant::now();
@@ -324,7 +342,10 @@ impl ReviewState {
                 self.item_idx = 0;
             }
         }
-        // Snapshot the elapsed time the moment the last item is rated.
+        if self.card_idx != prev_card_idx {
+            self.clear_scratchpad();
+        }
+        // snapshot the elapsed time the moment the last item is rated
         if self.is_done() && self.finished_duration.is_none() {
             self.finished_duration = Some(self.started_at.elapsed());
         }
@@ -335,6 +356,58 @@ impl ReviewState {
             1.0
         } else {
             self.done_items as f64 / self.total_items as f64
+        }
+    }
+
+    // ~~ Feynman scratchpad ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    fn clear_scratchpad(&mut self) {
+        self.scratchpad.clear();
+        self.scratchpad_open = false;
+        self.focus = ReviewFocus::Card;
+    }
+
+    /// `[f]` only fires while focus is on the card, but if focus is on the
+    /// scratchpad itself, 'f' is just a character being typed into it
+    pub fn toggle_scratchpad(&mut self) {
+        if self.focus != ReviewFocus::Card {
+            return;
+        }
+        if self.scratchpad_open {
+            self.scratchpad_open = false; // hide but keep content
+        } else {
+            self.scratchpad_open = true;
+            self.focus = ReviewFocus::Scratchpad; // jump straight into typing
+        }
+    }
+
+    /// `[Tab]` while the pad is open, swap between typing in the pad and
+    /// controlling the card (reveal/rate/scroll), without closing it
+    pub fn cycle_review_focus(&mut self) {
+        if !self.scratchpad_open {
+            return;
+        }
+        self.focus = match self.focus {
+            ReviewFocus::Card       => ReviewFocus::Scratchpad,
+            ReviewFocus::Scratchpad => ReviewFocus::Card,
+        };
+    }
+
+    pub fn scratchpad_push_char(&mut self, c: char) {
+        if self.focus == ReviewFocus::Scratchpad {
+            self.scratchpad.push(c);
+        }
+    }
+
+    pub fn scratchpad_newline(&mut self) {
+        if self.focus == ReviewFocus::Scratchpad {
+            self.scratchpad.push('\n');
+        }
+    }
+
+    pub fn scratchpad_backspace(&mut self) {
+        if self.focus == ReviewFocus::Scratchpad {
+            self.scratchpad.pop();
         }
     }
 }

@@ -24,7 +24,8 @@ use crate::models::{ReviewMode, SessionLimits};
 
 use state::{
     AddCardState, AddKind, AddPhase, AppState, ClickTarget, ExportFocus, ImportFocus,
-    ListCardsState, ListDecksState, MENU_ITEMS, ReviewPhase, ReviewState, Screen, SearchScope,
+    ListCardsState, ListDecksState, MENU_ITEMS, ReviewFocus, ReviewPhase, ReviewState, Screen,
+    SearchScope,
 };
 use render::row_to_list_index;
 
@@ -228,6 +229,31 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // a digit or 'q' typed while jotting notes doesnt accidentally
+    // rate a card or quit the session. [Tab]/[Esc] hand focus back
+    // to the card without closing the pad or losing whats written
+    let scratchpad_focused = app.review.as_ref()
+        .map(|r| r.focus == ReviewFocus::Scratchpad)
+        .unwrap_or(false);
+    if scratchpad_focused {
+        match code {
+            KeyCode::Tab | KeyCode::Esc => {
+                if let Some(rs) = app.review.as_mut() { rs.cycle_review_focus(); }
+            }
+            KeyCode::Enter => {
+                if let Some(rs) = app.review.as_mut() { rs.scratchpad_newline(); }
+            }
+            KeyCode::Backspace => {
+                if let Some(rs) = app.review.as_mut() { rs.scratchpad_backspace(); }
+            }
+            KeyCode::Char(c) => {
+                if let Some(rs) = app.review.as_mut() { rs.scratchpad_push_char(c); }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // scaffolded item has no reveal gate
     // cloze-blanked answer is already on screen) and only accepts pass/fail
     // ([1]/[3]) : [2]/[4] are visibly disabled in the footer and ignored here
@@ -251,6 +277,12 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.go_back();
+        }
+        KeyCode::Char('f') if !is_done => {
+            if let Some(rs) = app.review.as_mut() { rs.toggle_scratchpad(); }
+        }
+        KeyCode::Tab if !is_done => {
+            if let Some(rs) = app.review.as_mut() { rs.cycle_review_focus(); }
         }
         KeyCode::Enter | KeyCode::Char(' ') if !is_done => {
             if let Some(r) = app.review.as_mut() { r.reveal(); }

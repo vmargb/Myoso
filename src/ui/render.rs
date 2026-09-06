@@ -14,7 +14,7 @@ use ratatui::{
 
 use super::state::{
     AddCardState, AddKind, AddPhase, AppState, ClickTarget, ExportFocus, ImportFocus,
-    LeechPrompt, ListCardsState, MENU_ITEMS, ReviewPhase, WeakSpanPrompt,
+    LeechPrompt, ListCardsState, MENU_ITEMS, ReviewFocus, ReviewPhase, WeakSpanPrompt,
 };
 use crate::models::{CardKind, Item, ItemKind, ReviewMode};
 
@@ -100,6 +100,23 @@ fn text_style(focused: bool) -> Style {
         Style::default().fg(Color::White)
     } else {
         Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// small trailing footer hint for the Feynman pad
+fn feynman_footer_hint(scratchpad_open: bool) -> Vec<Span<'static>> {
+    if scratchpad_open {
+        vec![
+            Span::raw("   "),
+            Span::styled(" [Tab] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::raw("Pad/card focus"),
+        ]
+    } else {
+        vec![
+            Span::raw("   "),
+            Span::styled(" [f] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::raw("Feynman pad"),
+        ]
     }
 }
 
@@ -548,7 +565,18 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // ONE stable card for BOTH phases, same position/size always, so revealing
     // never repositions or resizes anything, it only grows the content inside
-    let card = centered_rect(80, v[1].height.saturating_sub(2).max(10), v[1]);
+    // when the Feynman scratchpad is open, the review area is split side-by-side
+    let (card, pad_area) = if rs.scratchpad_open {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(v[1]);
+        let card = centered_rect(92, cols[0].height.saturating_sub(2).max(10), cols[0]);
+        (card, Some(cols[1]))
+    } else {
+        let card = centered_rect(80, v[1].height.saturating_sub(2).max(10), v[1]);
+        (card, None)
+    };
     if rs.phase == ReviewPhase::Thinking {
         clicks.push((card, ClickTarget::ReviewCard));
     }
@@ -686,6 +714,30 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         card,
     );
 
+    if let Some(pad_rect) = pad_area {
+        let pad_focused = rs.focus == ReviewFocus::Scratchpad;
+        let border_color = if pad_focused { Color::Cyan } else { Color::DarkGray };
+        let title = if pad_focused {
+            " Feynman pad | explain it in your own words "
+        } else {
+            " Feynman pad "
+        };
+        let text = with_cursor(&rs.scratchpad, pad_focused);
+        f.render_widget(
+            Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(border_color))
+                        .title(title),
+                )
+                .style(Style::default().fg(if pad_focused { Color::White } else { Color::DarkGray }))
+                .wrap(Wrap { trim: false }),
+            pad_rect,
+        );
+    }
+
     let footer = if is_scaffolded && rs.phase == ReviewPhase::Thinking {
         Line::from(vec![
             Span::styled(
@@ -780,6 +832,8 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         ]);
         Line::from(spans)
     };
+    let mut footer = footer;
+    footer.spans.extend(feynman_footer_hint(rs.scratchpad_open));
     f.render_widget(
         Paragraph::new(footer)
             .block(Block::default()
