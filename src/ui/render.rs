@@ -94,10 +94,11 @@ fn with_cursor(s: &str, focused: bool) -> String {
     if focused { format!("{}\u{258C}", s) } else { s.to_owned() }
 }
 
-/// White when focused, dark-grey otherwise.
+/// Default terminal foreground when focused (adapts to light/dark themes)
+/// dark-grey (dimmed) otherwise
 fn text_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::White)
+        Style::default()
     } else {
         Style::default().fg(Color::DarkGray)
     }
@@ -391,7 +392,7 @@ fn highlight_lines(answer: &str, phrases: &[String]) -> Vec<Line<'static>> {
                                 .add_modifier(Modifier::BOLD),
                         )
                     } else {
-                        Span::styled(text, Style::default().fg(Color::White))
+                        Span::styled(text, Style::default())
                     }
                 })
                 .collect();
@@ -585,7 +586,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
     for l in display_prompt.lines() {
         lines.push(Line::from(Span::styled(
             l.to_string(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().add_modifier(Modifier::BOLD),
         )));
     }
     lines.push(Line::from(""));
@@ -620,7 +621,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
                 Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" pass {}/{} today to graduate", item.scaffold_passes.max(0), crate::scheduler::LEECH_STREAK_THRESHOLD),
+                format!(" pass {}/{} to graduate", item.scaffold_passes.max(0), crate::scheduler::LEECH_STREAK_THRESHOLD),
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
             ),
         ]));
@@ -631,7 +632,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
             ReviewPhase::Thinking => {
                 // Cloze rendering is plain text (not markdown-rendered)
                 for l in blank_text(&item.answer, &phrases).lines() {
-                    lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))));
+                    lines.push(Line::from(Span::styled(l.to_string(), Style::default())));
                 }
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
@@ -732,7 +733,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
                         .border_style(Style::default().fg(border_color))
                         .title(title),
                 )
-                .style(Style::default().fg(if pad_focused { Color::White } else { Color::DarkGray }))
+                .style(if pad_focused { Style::default() } else { Style::default().fg(Color::DarkGray) })
                 .wrap(Wrap { trim: false }),
             pad_rect,
         );
@@ -935,7 +936,7 @@ fn render_weak_span_prompt(f: &mut Frame, prompt: &WeakSpanPrompt, size: Rect) {
             (true, true)  => Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
             (true, false) => Style::default().fg(Color::Black).bg(Color::Cyan),
             (false, true) => Style::default().fg(Color::Yellow).add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
-            (false, false)=> Style::default().fg(Color::White),
+            (false, false)=> Style::default(),
         };
         cur.push(Span::styled(format!("{w} "), style));
         if (i + 1) % 8 == 0 {
@@ -989,7 +990,7 @@ fn render_nothing_due(f: &mut Frame, app: &AppState, size: Rect) {
             Span::styled(" Next   ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("\"{q}{ellipsis}\""),
-                Style::default().fg(Color::White),
+                Style::default(),
             ),
             Span::styled(
                 format!("  [{}]", deck),
@@ -1113,7 +1114,7 @@ fn render_pick_type(f: &mut Frame, s: &AddCardState, size: Rect, clicks: &mut Cl
                             .bg(Color::Cyan)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default()
                     },
                 )),
                 Line::from(Span::styled(desc, Style::default().fg(Color::DarkGray))),
@@ -1627,7 +1628,7 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState, clicks: &mut 
                 );
                 let q_tag = Span::styled(
                     c.question.chars().take(40).collect::<String>(),
-                    Style::default().fg(Color::White),
+                    Style::default(),
                 );
                 let n_tag = Span::styled(
                     format!(
@@ -1719,7 +1720,7 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState, clicks: &mut 
                 Span::styled(": ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!("{}▌", lc.search_query),
-                    Style::default().fg(Color::White),
+                    Style::default(),
                 ),
             ]),
             Line::from(Span::styled(
@@ -1774,7 +1775,7 @@ fn render_tag_picker(f: &mut Frame, lc: &mut ListCardsState, size: Rect, clicks:
             if active {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default()
             },
         )))
     }).collect();
@@ -1870,7 +1871,7 @@ pub(super) fn render_list_decks(f: &mut Frame, app: &mut AppState, clicks: &mut 
         vec![
             Line::from(vec![
                 Span::styled(" Search: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("{}▌", ld.search_query), Style::default().fg(Color::White)),
+                Span::styled(format!("{}▌", ld.search_query), Style::default()),
             ]),
             Line::from(Span::styled(
                 " [j/k] navigate  │  [Esc] cancel search  │  [Enter/r] review",
@@ -1937,7 +1938,7 @@ pub(super) fn render_export(f: &mut Frame, app: &mut AppState, clicks: &mut Clic
     let (check, check_col) = if ex.reset_metadata {
         ("[✓ ] Reset SRS metadata  ", Color::Yellow)
     } else {
-        ("[ ] Reset SRS metadata  ", Color::White)
+        ("[ ] Reset SRS metadata  ", Color::Reset)
     };
     let desc = if ex.reset_metadata {
         "state wiped: share with a friend or start over"
