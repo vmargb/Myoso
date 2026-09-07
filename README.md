@@ -4,13 +4,24 @@
 
 ---
 
-<p align="center">
-  <img src="screenshots/menu.png" alt="Menu" width="45%" />
-  <img src="screenshots/addcard.png" alt="Add Card" width="45%" />
-</p>
-<p align="center">
-  <img src="screenshots/examplereview.png" alt="Review Session" width="90%" />
-</p>
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="screenshots/addcard.png" alt="Add Card" width="100%"/>
+      <br><b>Add Card</b>
+    </td>
+    <td align="center">
+      <img src="screenshots/examplereview.png" alt="Review Session" width="100%"/>
+      <br><b>Review Session</b>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="screenshots/menuscreen.png" alt="Menu" width="90%"/>
+      <br><b>Main Menu</b>
+    </td>
+  </tr>
+</table>
 
 ---
 
