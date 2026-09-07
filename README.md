@@ -139,4 +139,4 @@ Some steps just don't stick, with multiple stacking `again` and `hard` ratings. 
 - **cloze-tests**: highlight the exact word, formula or phrase in the answer that's actually tripping you up
 - **split in two**: If a step is too difficult, you can split the step into two smaller steps to make recall easier.
 
-(cloze-tests)[https://en.wikipedia.org/wiki/Cloze_test] end up graduating back to normal full-recall review. These lighter reviews don't touch your normal schedule, they exist purely to rebuild the specific bit of recall that was missing.
+[https://en.wikipedia.org/wiki/Cloze_test](cloze-tests) end up graduating back to normal full-recall review. These lighter reviews don't touch your normal schedule, they exist purely to rebuild the specific bit of recall that was missing.
