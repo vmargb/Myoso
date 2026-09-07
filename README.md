@@ -5,11 +5,11 @@
 ---
 
 <p align="center">
-    <img src="screenshots/menu.png" alt="menu" width="45%" />
-    <img src="screenshots/cards.png" alt="cards" width="45%" />
+  <img src="screenshots/menu.png" alt="Menu" width="45%" />
+  <img src="screenshots/addcard.png" alt="Add Card" width="45%" />
 </p>
 <p align="center">
-    <img src="screenshots/multi.png" alt="multi cards" width="90%" />
+  <img src="screenshots/examplereview.png" alt="Review Session" width="90%" />
 </p>
 
 ---
@@ -125,7 +125,7 @@ Additionally, `Myoso` handles a unique problem of *re-exposure* where repeatedly
 
 Some steps just don't stick, with multiple stacking `again` and `hard` ratings. In `anki` these are called **leaches**, which are usually removed out of the review queue. However, Myoso can't simply remove an intermediary step from a chain. Instead it offers a couple alternatives to pick from:
 
-- **(cloze-tests)[https://en.wikipedia.org/wiki/Cloze_test]**: highlight the exact word, formula or phrase in the answer that's actually tripping you up
+- **cloze-tests**: highlight the exact word, formula or phrase in the answer that's actually tripping you up
 - **split in two**: If a step is too difficult, you can split the step into two smaller steps to make recall easier.
 
-cloze-deletions end up graduating back to normal full-recall review. These lighter reviews don't touch your normal schedule, they exist purely to rebuild the specific bit of recall that was missing.
+(cloze-tests)[https://en.wikipedia.org/wiki/Cloze_test] end up graduating back to normal full-recall review. These lighter reviews don't touch your normal schedule, they exist purely to rebuild the specific bit of recall that was missing.
