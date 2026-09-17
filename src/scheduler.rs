@@ -62,10 +62,13 @@ const W: [f64; 19] = [
 
 // internal algorithm
 
-/// P(recall at time `t` days | memory stability `s` days)
-/// Power-law forgetting curve shared by FSRS-4.5 and FSRS-5
-/// Clamped to a small positive floor so downstream callers never see zero
-fn retrievability(t: f64, s: f64) -> f64 {
+/// P(recall at time `t` days, memory stability `s` days)
+/// Power-law forgetting curve
+/// clamped to a small positive floor so downstream callers never see zero
+///
+/// `db::due_session` calls this directly to order the review queue by
+/// ascending retrievability (most-likely-forgotten first)
+pub(crate) fn retrievability(t: f64, s: f64) -> f64 {
     ((1.0 + FACTOR * t / s).powf(DECAY)).max(0.0001)
 }
 

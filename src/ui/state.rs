@@ -257,6 +257,7 @@ impl ReviewState {
             self.item_idx = 0;
             self.phase = ReviewPhase::Thinking;
             self.item_started_at = Instant::now();
+            self.answer_scroll = 0;
             self.clear_scratchpad();
 
             // db just set all subsequent steps' due_at = now, so re-add this
@@ -335,7 +336,6 @@ impl ReviewState {
         self.item_idx += 1;
         self.phase = ReviewPhase::Thinking;
         self.item_started_at = Instant::now();
-        self.answer_scroll = 0; // reset scroll on advance
         if let Some(card) = self.session.get(self.card_idx) {
             if self.item_idx >= card.items.len() {
                 self.card_idx += 1;
@@ -343,6 +343,7 @@ impl ReviewState {
             }
         }
         if self.card_idx != prev_card_idx {
+            self.answer_scroll = 0; // fresh card: don't carry over old scroll
             self.clear_scratchpad();
         }
         // snapshot the elapsed time the moment the last item is rated

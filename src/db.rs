@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rand::seq::SliceRandom;
+use rand::{rng, RngExt};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::time::Duration;
@@ -368,6 +370,27 @@ impl Store {
                 sr_reviews.push(ReviewCard { card, items: selected });
             }
         }
+
+        // order the review bucket by *ascending retrievability* or
+        // most likely to have been forgotten goes first
+        // small random jitter is added to each score before sorting so
+        // cards with almost identical urgency don't always come together
+        //
+        // new cards have no review history yet, so retrievability doesn't
+        // apply to them yet, they are shuffled instead, mirroring anki
+        let mut rng = rng();
+
+        let mut scored: Vec<(f64, ReviewCard)> = sr_reviews
+            .into_iter()
+            .map(|rc| {
+                let jitter = rng.random_range(-0.03..0.03);
+                (target_retrievability(&rc, now) + jitter, rc)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut sr_reviews: Vec<ReviewCard> = scored.into_iter().map(|(_, rc)| rc).collect();
+
+        sr_new.shuffle(&mut rng);
 
         // Apply caps then merge: reviews before new cards
         sr_reviews.truncate(limits.max_reviews);
@@ -1386,6 +1409,24 @@ fn due_items_for_card(kind: &CardKind, items: &[Item], now: DateTime<Utc>) -> Ve
         },
         CardKind::Simple => items.iter().filter(|it| it.due_at <= now).cloned().collect(),
     }
+}
+
+/// Items that have never been reviewed by FSRS carry the same
+/// stability == 0.0 bootstrap `scheduler::apply_confidence`
+/// checks. There's no retrievability signal yet for those dividing by a
+/// zero stability is undefined, so they're treated as maximally urgent (R = 0.0)
+fn target_retrievability(rc: &ReviewCard, now: DateTime<Utc>) -> f64 {
+    let Some(target) = rc.items.last() else {
+        return 0.0; // due_items_for_card never returns an empty selection here
+    };
+    if target.stability <= 0.0 {
+        return 0.0;
+    }
+    let days_elapsed = target
+        .last_reviewed_at
+        .map(|t| (now - t).num_days().max(0) as f64)
+        .unwrap_or(0.0);
+    scheduler::retrievability(days_elapsed, target.stability)
 }
 
 /// increment a running average without keeping a running sum

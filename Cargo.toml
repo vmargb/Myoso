@@ -1,6 +1,6 @@
 [package]
 name = "myoso"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Multi-step spaced-repetition flashcards in the terminal"
 
@@ -32,3 +32,4 @@ pulldown-cmark = "0.12"
 syntect = "5"
 # open image previews
 open = "5"
+rand = "0.10"
