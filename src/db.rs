@@ -4,11 +4,13 @@ use rand::seq::SliceRandom;
 use rand::{rng, RngExt};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
 
 use crate::models::*;
 use crate::scheduler;
+use crate::tree::{self, StepTree};
 
 // ~~~ Store ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -42,6 +44,9 @@ impl Store {
                 reversible  INTEGER NOT NULL DEFAULT 0,
                 show_chain  INTEGER NOT NULL DEFAULT 1,
                 review_mode TEXT NOT NULL DEFAULT 'spaced_repetition',
+                -- 0 = legacy linear chain (parent = previous step by position)
+                -- 1 = step tree (items.parent_id is authoritative), see tree.rs
+                is_tree     INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
@@ -50,6 +55,10 @@ impl Store {
                 id               TEXT PRIMARY KEY,
                 card_id          TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
                 position         INTEGER NOT NULL,
+                -- tree cards only, NULL = attached to the cards question
+                -- deliberately NO `ON DELETE` action, deleting a step that still has
+                -- children must fail loudly
+                parent_id        TEXT REFERENCES items(id),
                 kind             TEXT NOT NULL,
                 prompt           TEXT NOT NULL,
                 answer           TEXT NOT NULL,
@@ -162,11 +171,27 @@ impl Store {
             "ALTER TABLE items ADD COLUMN scaffold_pass_date TEXT",
             [],
         );
+        // SQLite allows ADD COLUMN with REFERENCES as long as the default is NULL
+        let _ = self.conn.execute(
+            "ALTER TABLE cards ADD COLUMN is_tree INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN parent_id TEXT REFERENCES items(id)",
+            [],
+        );
+        // after the ALTERs, so old databases have the column when this runs
+        self.conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_items_parent ON items(parent_id)",
+                [],
+            )
+            .context("create parent index")?;
 
         Ok(())
     }
 
-    // ~~ Card creation ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    // ~~ Card creation
 
     pub fn add_simple_card(
         &self,
@@ -195,40 +220,96 @@ impl Store {
         Ok(card_id)
     }
 
-    // steps: (step name, answer, optional image path)
+    /// the drafts may be a plain chain or a tree. Blank-answer steps are dropped
+    /// (their children move up), and cards are always stored as tree cards
+    /// (`is_tree = 1`) with `position` = DFS order, so a linear card is simply a
+    /// tree in which every step has one child
     pub fn add_multi_card(
         &self,
         deck: &str,
         question: &str,
-        steps: &[(String, String, Option<String>)],
+        steps: &[StepDraft],
         show_chain: bool,
         review_mode: &crate::models::ReviewMode,
     ) -> Result<String> {
-        if steps.is_empty() {
+        let drafts = tree::prune_blank(steps);
+        if drafts.is_empty() {
             anyhow::bail!("multi-step cards need at least one step");
         }
+        tree::check_branch_names(&drafts).map_err(|e| anyhow::anyhow!(e))?;
+
         let card_id = new_id();
         let now = Utc::now();
         let ts = now.to_rfc3339();
+
+        let tx = self.conn.unchecked_transaction().context("begin add multi card")?;
+        self.conn
+            .execute_batch("PRAGMA defer_foreign_keys = ON;")
+            .context("defer foreign keys")?;
         self.conn
             .execute(
-                "INSERT INTO cards(id,deck,kind,question,reversible,show_chain,review_mode,created_at,updated_at)
-                VALUES(?1,?2,'multi',?3,0,?4,?5,?6,?7)",
+                "INSERT INTO cards(id,deck,kind,question,reversible,show_chain,review_mode,is_tree,created_at,updated_at)
+                VALUES(?1,?2,'multi',?3,0,?4,?5,1,?6,?7)",
                 params![card_id, deck, question, show_chain as i32, review_mode.as_str(), ts, ts],
             )
             .context("insert multi card")?;
-
-        let mut pos = 0usize;
-        for (name, answer, img) in steps.iter().filter(|(_, a, _)| !a.trim().is_empty()) {
-            pos += 1;
-            let label = if name.trim().is_empty() {
-                format!("Step {pos}")
-            } else {
-                name.trim().to_string()
-            };
-            self.insert_item(&card_id, pos as i32, "step", label.as_str(), answer, now, img.as_deref())?;
-        }
+        self.write_step_drafts(&card_id, &drafts, &HashSet::new(), now)?;
+        tx.commit().context("commit add multi card")?;
         Ok(card_id)
+    }
+
+    /// insert / update the step rows of one card from prepared drafts
+    /// returns the ids of every step row that now belongs to the card
+    /// must run inside a transaction with `defer_foreign_keys = ON`
+    fn write_step_drafts(
+        &self,
+        card_id: &str,
+        drafts: &[StepDraft],
+        existing: &HashSet<String>,
+        now: DateTime<Utc>,
+    ) -> Result<HashSet<String>> {
+        let depths = tree::draft_depths(drafts);
+
+        // resolve every draft to a row id up front so parent links can be
+        // written regardless of order, two drafts cant claim the same row
+        let mut used: HashSet<String> = HashSet::new();
+        let mut id_of: HashMap<u32, String> = HashMap::new();
+        for d in drafts {
+            let id = match &d.db_id {
+                Some(id) if existing.contains(id) && !used.contains(id) => id.clone(),
+                _ => new_id(),
+            };
+            used.insert(id.clone());
+            id_of.insert(d.key, id);
+        }
+
+        for (i, d) in drafts.iter().enumerate() {
+            let id = &id_of[&d.key];
+            let parent = d.parent.and_then(|p| id_of.get(&p)).map(String::as_str);
+            let pos = i as i32 + 1;
+            // an unnamed step is labelled by its place in its path, which is
+            // what review compares against to hide the redundant label
+            let label = if d.name.trim().is_empty() {
+                format!("Step {}", depths[i] + 1)
+            } else {
+                d.name.trim().to_string()
+            };
+            if existing.contains(id) {
+                self.conn
+                    .execute(
+                        "UPDATE items
+                         SET prompt=?1, answer=?2, image_path=?3, position=?4, parent_id=?5
+                         WHERE id=?6 AND card_id=?7",
+                        params![label, d.answer, d.image, pos, parent, id, card_id],
+                    )
+                    .context("update step item")?;
+            } else {
+                self.insert_item_full(
+                    id, card_id, pos, parent, "step", &label, &d.answer, now, d.image.as_deref(),
+                )?;
+            }
+        }
+        Ok(used)
     }
 
     fn insert_item(
@@ -241,7 +322,22 @@ impl Store {
         now: DateTime<Utc>,
         image_path: Option<&str>,
     ) -> Result<()> {
-        let id = new_id();
+        self.insert_item_full(&new_id(), card_id, pos, None, kind, prompt, answer, now, image_path)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_item_full(
+        &self,
+        id: &str,
+        card_id: &str,
+        pos: i32,
+        parent_id: Option<&str>,
+        kind: &str,
+        prompt: &str,
+        answer: &str,
+        now: DateTime<Utc>,
+        image_path: Option<&str>,
+    ) -> Result<()> {
         // due_at is set just before now so every new item is immediately reviewable
         // interval_days, ease (stability), and difficulty all start at 0.0, so the
         // scheduler treats difficulty == 0.0 as "never reviewed by FSRS" and will
@@ -252,10 +348,10 @@ impl Store {
                 "INSERT INTO items(id,card_id,position,kind,prompt,answer,due_at,
                                    interval_days,ease,lapses,review_count,confidence_avg,image_path,difficulty,
                                    consecutive_fails,consecutive_hards,
-                                   scaffold_state,scaffold_passes,weak_spans,scaffold_pass_date)
+                                   scaffold_state,scaffold_passes,weak_spans,scaffold_pass_date,parent_id)
                  VALUES(?1,?2,?3,?4,?5,?6,?7, 0.0,0.0,0,0,0.0,?8,0.0, 0,0,
-                        'normal',0,'[]',NULL)",
-                params![id, card_id, pos, kind, prompt, answer, due, image_path],
+                        'normal',0,'[]',NULL,?9)",
+                params![id, card_id, pos, kind, prompt, answer, due, image_path, parent_id],
             )
             .context("insert item")?;
         Ok(())
@@ -336,13 +432,8 @@ impl Store {
         // include ALL items, skip card only if every item was reviewed today
         for card in daily_cards {
             let items = self.load_items(&card.id)?;
-            let needs_review = items.iter().any(|it| {
-                it.last_reviewed_at
-                    .map(|t| t.format("%Y-%m-%d").to_string() != today)
-                    .unwrap_or(true)
-            });
-            if needs_review {
-                session.push(ReviewCard { card, items });
+            for path in daily_paths(&card, &items, &today) {
+                session.push(ReviewCard { card: card.clone(), items: path });
             }
         }
 
@@ -356,18 +447,25 @@ impl Store {
         // The "is new" test looks at all items, not just the due subset, so a
         // multi-step card where step 1 has been reviewed but step 2 is newly due
         // is correctly classified as a review card, not a new card
-        let mut sr_reviews: Vec<ReviewCard> = Vec::new();
-        let mut sr_new:     Vec<ReviewCard> = Vec::new();
+        //
+        // each bucket entry is the cards whole group of paths kept together
+        let mut sr_reviews: Vec<Vec<ReviewCard>> = Vec::new();
+        let mut sr_new:     Vec<Vec<ReviewCard>> = Vec::new();
 
         for card in sr_cards {
-            let items    = self.load_items(&card.id)?;
-            let selected = due_items_for_card(&card.kind, &items, now);
-            if selected.is_empty() { continue; }
+            let items = self.load_items(&card.id)?;
+            let paths = due_paths_for_card(&card, &items, now);
+            if paths.is_empty() { continue; }
+
+            let group: Vec<ReviewCard> = paths
+                .into_iter()
+                .map(|path| ReviewCard { card: card.clone(), items: path })
+                .collect();
 
             if items.iter().all(|it| it.review_count == 0) {
-                sr_new.push(ReviewCard { card, items: selected });
+                sr_new.push(group);
             } else {
-                sr_reviews.push(ReviewCard { card, items: selected });
+                sr_reviews.push(group);
             }
         }
 
@@ -375,29 +473,34 @@ impl Store {
         // most likely to have been forgotten goes first
         // small random jitter is added to each score before sorting so
         // cards with almost identical urgency don't always come together
+        // a card's score is its most urgent path
         //
         // new cards have no review history yet, so retrievability doesn't
         // apply to them yet, they are shuffled instead, mirroring anki
         let mut rng = rng();
 
-        let mut scored: Vec<(f64, ReviewCard)> = sr_reviews
+        let mut scored: Vec<(f64, Vec<ReviewCard>)> = sr_reviews
             .into_iter()
-            .map(|rc| {
+            .map(|group| {
                 let jitter = rng.random_range(-0.03..0.03);
-                (target_retrievability(&rc, now) + jitter, rc)
+                let urgency = group
+                    .iter()
+                    .map(|rc| target_retrievability(rc, now))
+                    .fold(f64::INFINITY, f64::min);
+                (urgency + jitter, group)
             })
             .collect();
         scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let mut sr_reviews: Vec<ReviewCard> = scored.into_iter().map(|(_, rc)| rc).collect();
+        let mut sr_reviews: Vec<Vec<ReviewCard>> = scored.into_iter().map(|(_, g)| g).collect();
 
         sr_new.shuffle(&mut rng);
 
-        // Apply caps then merge: reviews before new cards
+        // Apply caps (per card, not per path) then merge: reviews before new cards
         sr_reviews.truncate(limits.max_reviews);
         sr_new.truncate(limits.new_cards);
 
-        session.extend(sr_reviews);
-        session.extend(sr_new);
+        session.extend(sr_reviews.into_iter().flatten());
+        session.extend(sr_new.into_iter().flatten());
 
         Ok(session)
     }
@@ -407,7 +510,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id,kind,deck,question,reversible,show_chain,created_at,updated_at,review_mode
+                "SELECT id,kind,deck,question,reversible,show_chain,created_at,updated_at,review_mode,is_tree
                 FROM cards WHERE (?1='' OR deck=?1 OR deck LIKE ?1 || '::%') ORDER BY created_at ASC",
             )
             .context("prepare load_cards_for_session")?;
@@ -420,6 +523,7 @@ impl Store {
                 let ca: String   = row.get(6)?;
                 let ua: String   = row.get(7)?;
                 let rm: String   = row.get(8)?;
+                let tree: i32    = row.get(9)?;
                 Ok(Card {
                     id:          row.get(0)?,
                     kind:        kind.parse().unwrap_or(CardKind::Simple),
@@ -431,6 +535,7 @@ impl Store {
                     updated_at:  ua.parse().unwrap_or_else(|_| Utc::now()),
                     review_mode: rm.parse().unwrap_or_default(),
                     tags:        vec![],
+                    is_tree:     tree != 0,
                 })
             })
             .context("query cards for session")?;
@@ -439,87 +544,38 @@ impl Store {
             .context("collect cards for session")
     }
 
-    // Re-check a single card after a rating: returns an updated ReviewCard if the
-    // card now has due items, or None if nothing is due. UI then dynamically
+    // re-check a single card after a rating, returns a ReviewCard for every path
+    // that now needs review (empty if nothing is due). A linear card yields at
+    // most one, a branching card yields one per due branch. UI then dynamically
     // extends the running session queue
-    pub fn review_card_if_due(&self, card_id: &str) -> Result<Option<ReviewCard>> {
+    pub fn review_card_if_due(&self, card_id: &str) -> Result<Vec<ReviewCard>> {
         let now   = Utc::now();
         let card  = self.load_card(card_id)?;
         let items = self.load_items(card_id)?;
 
-        if card.review_mode.is_daily() {
+        let paths = if card.review_mode.is_daily() {
             let today = now.format("%Y-%m-%d").to_string();
-            let needs = items.iter().any(|it| {
-                it.last_reviewed_at
-                    .map(|t| t.format("%Y-%m-%d").to_string() != today)
-                    .unwrap_or(true)
-            });
-            return Ok(if needs { Some(ReviewCard { card, items }) } else { None });
-        }
-
-        let selected = due_items_for_card(&card.kind, &items, now);
-        if selected.is_empty() {
-            Ok(None) // if nothing is due make no changes
+            daily_paths(&card, &items, &today)
         } else {
-            Ok(Some(ReviewCard { card, items: selected }))
-        }
+            due_paths_for_card(&card, &items, now)
+        };
+
+        Ok(paths
+            .into_iter()
+            .map(|path| ReviewCard { card: card.clone(), items: path })
+            .collect())
     }
 
     pub fn load_items(&self, card_id: &str) -> Result<Vec<Item>> {
         let mut stmt = self
             .conn
-            .prepare(
-                // Column indices (0-based):
-                //  0 id | 1 card_id | 2 position | 3 kind | 4 prompt | 5 answer |
-                //  6 due_at | 7 interval_days | 8 ease(stability) |
-                //  9 last_reviewed_at | 10 lapses | 11 review_count |
-                //  12 confidence_avg | 13 image_path | 14 difficulty |
-                //  15 consecutive_fails | 16 consecutive_hards |
-                //  17 scaffold_state | 18 scaffold_passes | 19 weak_spans |
-                //  20 scaffold_pass_date
-                "SELECT id, card_id, position, kind, prompt, answer, due_at,
-                        interval_days, ease, last_reviewed_at, lapses, review_count,
-                        confidence_avg, image_path, difficulty,
-                        consecutive_fails, consecutive_hards,
-                        scaffold_state, scaffold_passes, weak_spans, scaffold_pass_date
-                 FROM items WHERE card_id=?1 ORDER BY position ASC",
-            )
+            .prepare(&format!(
+                "SELECT {ITEM_COLS} FROM items WHERE card_id=?1 ORDER BY position ASC"
+            ))
             .context("prepare load_items")?;
 
         let rows = stmt
-            .query_map(params![card_id], |row| {
-                let kind: String             = row.get(3)?;
-                let due: String              = row.get(6)?;
-                let last: Option<String>     = row.get(9)?;
-                let image_path: Option<String> = row.get(13)?;
-                let scaffold_state: String   = row.get(17)?;
-                let weak_spans: String       = row.get(19)?;
-                let scaffold_pass_date: Option<String> = row.get(20)?;
-                Ok(Item {
-                    id:               row.get(0)?,
-                    card_id:          row.get(1)?,
-                    position:         row.get(2)?,
-                    kind:             kind.parse().unwrap_or(ItemKind::Forward),
-                    prompt:           row.get(4)?,
-                    answer:           row.get(5)?,
-                    due_at:           due.parse().unwrap_or_else(|_| Utc::now()),
-                    interval_days:    row.get(7)?,
-                    stability:        row.get(8)?,
-                    last_reviewed_at: last.and_then(|s| s.parse().ok()),
-                    lapses:           row.get(10)?,
-                    review_count:     row.get(11)?,
-                    confidence_avg:   row.get(12)?,
-                    image_path,
-                    difficulty:       row.get(14)?,
-                    consecutive_fails: row.get(15)?,
-                    consecutive_hards: row.get(16)?,
-                    scaffold_state:   scaffold_state.parse().unwrap_or_default(),
-                    scaffold_passes:  row.get(18)?,
-                    weak_spans:       parse_weak_spans(&weak_spans),
-                    scaffold_pass_date: scaffold_pass_date
-                        .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
-                })
-            })
+            .query_map(params![card_id], item_from_row)
             .context("query items")?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -529,7 +585,7 @@ impl Store {
     pub fn load_card(&self, card_id: &str) -> Result<Card> {
         self.conn
             .query_row(
-                "SELECT id,deck,kind,question,reversible,show_chain,created_at,updated_at,review_mode
+                "SELECT id,deck,kind,question,reversible,show_chain,created_at,updated_at,review_mode,is_tree
                 FROM cards WHERE id=?1",
                 params![card_id],
                 |row| {
@@ -539,6 +595,7 @@ impl Store {
                     let ca: String   = row.get(6)?;
                     let ua: String   = row.get(7)?;
                     let rm: String   = row.get(8)?;
+                    let tree: i32    = row.get(9)?;
                     Ok(Card {
                         id:          row.get(0)?,
                         deck:        row.get(1)?,
@@ -550,6 +607,7 @@ impl Store {
                         updated_at:  ua.parse().unwrap_or_else(|_| Utc::now()),
                         review_mode: rm.parse().unwrap_or_default(),
                         tags:        vec![],
+                        is_tree:     tree != 0,
                     })
                 },
             )
@@ -576,59 +634,23 @@ impl Store {
         let item = self
             .conn
             .query_row(
-                "SELECT id, card_id, position, kind, prompt, answer, due_at,
-                        interval_days, ease, last_reviewed_at, lapses, review_count,
-                        confidence_avg, image_path, difficulty,
-                        consecutive_fails, consecutive_hards,
-                        scaffold_state, scaffold_passes, weak_spans, scaffold_pass_date
-                 FROM items WHERE id=?1",
+                &format!("SELECT {ITEM_COLS} FROM items WHERE id=?1"),
                 params![item_id],
-                |row| {
-                    let kind: String             = row.get(3)?;
-                    let due: String              = row.get(6)?;
-                    let last: Option<String>     = row.get(9)?;
-                    let image_path: Option<String> = row.get(13)?;
-                    let scaffold_state: String   = row.get(17)?;
-                    let weak_spans: String       = row.get(19)?;
-                    let scaffold_pass_date: Option<String> = row.get(20)?;
-                    Ok(Item {
-                        id:               row.get(0)?,
-                        card_id:          row.get(1)?,
-                        position:         row.get(2)?,
-                        kind:             kind.parse().unwrap_or(ItemKind::Forward),
-                        prompt:           row.get(4)?,
-                        answer:           row.get(5)?,
-                        due_at:           due.parse().unwrap_or_else(|_| Utc::now()),
-                        interval_days:    row.get(7)?,
-                        stability:        row.get(8)?,
-                        last_reviewed_at: last.and_then(|s| s.parse().ok()),
-                        lapses:           row.get(10)?,
-                        review_count:     row.get(11)?,
-                        confidence_avg:   row.get(12)?,
-                        image_path,
-                        difficulty:       row.get(14)?,
-                        consecutive_fails: row.get(15)?,
-                        consecutive_hards: row.get(16)?,
-                        scaffold_state:   scaffold_state.parse().unwrap_or_default(),
-                        scaffold_passes:  row.get(18)?,
-                        weak_spans:       parse_weak_spans(&weak_spans),
-                        scaffold_pass_date: scaffold_pass_date
-                            .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
-                    })
-                },
+                item_from_row,
             )
             .context("load item for review")?;
 
-        // Check whether this card is in daily mode
-        let mode_str: String = self
+        // check whether this card is in daily mode / uses a step tree
+        let (mode_str, tree_flag): (String, i32) = self
             .conn
             .query_row(
-                "SELECT review_mode FROM cards WHERE id=?1",
+                "SELECT review_mode, is_tree FROM cards WHERE id=?1",
                 params![&item.card_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .unwrap_or_else(|_| "spaced_repetition".to_string());
+            .unwrap_or_else(|_| ("spaced_repetition".to_string(), 0));
         let is_daily = mode_str == "daily";
+        let is_tree  = tree_flag != 0;
 
         let prev_interval = item.interval_days;
         // snapshot before `item` is moved into the branches below (they
@@ -640,6 +662,14 @@ impl Store {
         let prev_scaffold_passes    = item.scaffold_passes;
         let prev_scaffold_pass_date = item.scaffold_pass_date;
         let now = Utc::now();
+
+        // A re-exposure is a step being re-shown as *context* that is already
+        // scheduled ahead. A step that is due right now must get a real rating
+        // even if it was already rated earlier this session. That happens when a
+        // later Again/Hard on an ancestor re-locked it (see the de-unlock below)
+        // Treating that rating as a re-exposure would leave it due forever, and the
+        // session would keep requeueing it, endlessly, even if every rating is a 3
+        let chain_reexposure = chain_reexposure && item.due_at > now;
 
         let updated = if is_daily {
             // daily mode, FSRS state is frozen, so only update analytics so that
@@ -725,26 +755,37 @@ impl Store {
             )
             .context("update item")?;
 
-        // step-chain de-unlock
+        // step de-unlock
         // when a step is rated Again(1) or Hard(2) it was not recalled well
-        // enough. So all subsequent steps from it are immediately due so the user
-        // must rebuild the full chain from this point on their next session
+        // enough. So every step BELOW it becomes immediately due and the user
+        // must rebuild from this point on their next session
+        // in a tree it is the steps descendants across all of its branches,
+        // and not the siblings or ancestors (forgetting the SSD path doesn't reset HDD)
         // This only applies to SR cards (never daily mode) (obviously)
         if !is_daily && updated.kind == ItemKind::Step && confidence <= 2 {
-            self.conn
-                .execute(
-                    "UPDATE items
-                     SET due_at = ?1
-                     WHERE card_id = ?2
-                       AND position > ?3
-                       AND kind = 'step'",
-                    params![
-                        now.to_rfc3339(),
-                        &updated.card_id,
-                        updated.position,
-                    ],
-                )
-                .context("de-unlock subsequent steps")?;
+            let items = self.load_items(&updated.card_id)?;
+            let tree  = StepTree::new(is_tree, &items);
+            if let Some(idx) = tree.index_of(&updated.id) {
+                let below: Vec<&str> = tree
+                    .descendants(idx)
+                    .into_iter()
+                    .map(|i| tree.item(i).id.as_str())
+                    .collect();
+                if !below.is_empty() {
+                    let tx = self.conn.unchecked_transaction().context("begin de-unlock")?;
+                    {
+                        let mut upd = self
+                            .conn
+                            .prepare("UPDATE items SET due_at = ?1 WHERE id = ?2")
+                            .context("prepare de-unlock")?;
+                        for id in below {
+                            upd.execute(params![now.to_rfc3339(), id])
+                                .context("de-unlock subsequent steps")?;
+                        }
+                    }
+                    tx.commit().context("commit de-unlock")?;
+                }
+            }
         }
 
         self.conn
@@ -1066,6 +1107,16 @@ impl Store {
         let file: ImportFile =
             serde_json::from_slice(data).context("parse import JSON")?;
 
+        // check every step tree up front so a bad file is rejected as a whole,
+        // before anything is written
+        for ic in &file.cards {
+            if ic.card.kind == CardKind::Multi && ic.card.is_tree {
+                tree::validate(&ic.items).with_context(|| {
+                    format!("card {} has an invalid step tree", ic.card.id)
+                })?;
+            }
+        }
+
         let mut summary = ImportSummary::default();
 
         for ic in file.cards {
@@ -1080,11 +1131,18 @@ impl Store {
                 .unwrap_or(0)
                 > 0;
 
+            // one card = one transaction, with foreign keys checked at commit so
+            // the order steps are written in cant trip the parent_id constraint
+            let tx = self.conn.unchecked_transaction().context("begin import card")?;
+            self.conn
+                .execute_batch("PRAGMA defer_foreign_keys = ON;")
+                .context("defer foreign keys")?;
+
             self.conn
                 .execute(
                     "INSERT OR REPLACE INTO cards
-                        (id, deck, kind, question, reversible, show_chain, review_mode, created_at, updated_at)
-                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                        (id, deck, kind, question, reversible, show_chain, review_mode, is_tree, created_at, updated_at)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                     params![
                         ic.card.id,
                         ic.card.deck,
@@ -1093,6 +1151,7 @@ impl Store {
                         ic.card.reversible as i32,
                         ic.card.show_chain as i32,
                         ic.card.review_mode.as_str(),
+                        ic.card.is_tree as i32,
                         ic.card.created_at.to_rfc3339(),
                         ic.card.updated_at.to_rfc3339(),
                     ],
@@ -1104,9 +1163,21 @@ impl Store {
             // restore tags. ic.card.tags is an empty vec if the JSON predates tags support
             self.set_card_tags(&ic.card.id, &ic.card.tags)?;
 
-            for item in ic.items {
+            // parents before children to keep organised
+            let is_tree = ic.card.kind == CardKind::Multi && ic.card.is_tree;
+            let order: Vec<usize> = if is_tree {
+                StepTree::new(true, &ic.items).dfs_order()
+            } else {
+                (0..ic.items.len()).collect()
+            };
+
+            for idx in order {
+                let item = &ic.items[idx];
                 let weak_spans_json = serde_json::to_string(&item.weak_spans)
                     .unwrap_or_else(|_| "[]".to_string());
+                // parent_id only means something on tree cards, a legacy card
+                // carrying a stray one must not have it stored
+                let parent_id = if is_tree { item.parent_id.as_deref() } else { None };
                 self.conn
                     .execute(
                         "INSERT OR REPLACE INTO items
@@ -1114,8 +1185,9 @@ impl Store {
                             interval_days, ease, last_reviewed_at,
                             lapses, review_count, confidence_avg, image_path, difficulty,
                             consecutive_fails, consecutive_hards,
-                            scaffold_state, scaffold_passes, weak_spans, scaffold_pass_date)
-                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                            scaffold_state, scaffold_passes, weak_spans, scaffold_pass_date,
+                            parent_id)
+                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
                         params![
                             item.id,
                             item.card_id,
@@ -1138,11 +1210,14 @@ impl Store {
                             item.scaffold_passes,
                             weak_spans_json,
                             item.scaffold_pass_date.map(|d| d.format("%Y-%m-%d").to_string()),
+                            parent_id,
                         ],
                     )
                     .context("upsert item")?;
                 summary.items_imported += 1;
             }
+
+            tx.commit().context("commit import card")?;
         }
 
         Ok(summary)
@@ -1218,71 +1293,63 @@ impl Store {
         Ok(())
     }
 
-    /// Update an existing multi-step card's content in-place.
-    ///
-    /// SRS state is preserved for steps whose **position** is unchanged.
-    /// New steps are inserted fresh; steps that no longer exist are deleted.
+    /// update an existing multi-step card's content in-place from editor drafts
+    /// SRS state follows each step's **identity** (`StepDraft::db_id`), not its
+    /// position, so steps can be inserted, reordered or re-parented without
+    /// their schedules being attached to the wrong content
     pub fn update_multi_card(
         &self,
         card_id: &str,
         deck: &str,
         question: &str,
-        steps: &[(String, String, Option<String>)],
+        steps: &[StepDraft],
         show_chain: bool,
         review_mode: &crate::models::ReviewMode,
     ) -> Result<()> {
+        let drafts = tree::prune_blank(steps);
+        if drafts.is_empty() {
+            anyhow::bail!("multi-step cards need at least one step");
+        }
+        tree::check_branch_names(&drafts).map_err(|e| anyhow::anyhow!(e))?;
+
         let now = Utc::now();
         let ts  = now.to_rfc3339();
+
+        let tx = self.conn.unchecked_transaction().context("begin update multi card")?;
+        // parents and children are rewritten in one go, check the tree only at commit
+        self.conn
+            .execute_batch("PRAGMA defer_foreign_keys = ON;")
+            .context("defer foreign keys")?;
+
         self.conn
             .execute(
-                "UPDATE cards SET deck=?1, question=?2, show_chain=?3, review_mode=?4, updated_at=?5 WHERE id=?6",
+                "UPDATE cards SET deck=?1, question=?2, show_chain=?3, review_mode=?4,
+                                  is_tree=1, updated_at=?5 WHERE id=?6",
                 params![deck, question, show_chain as i32, review_mode.as_str(), ts, card_id],
             )
             .context("update multi card")?;
 
-        let existing_count: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM items WHERE card_id=?1 AND kind='step'",
-                params![card_id],
-                |r| r.get(0),
-            )
-            .context("count step items")?;
+        let existing: HashSet<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM items WHERE card_id=?1 AND kind='step'")
+                .context("prepare existing steps")?;
+            let rows = stmt
+                .query_map(params![card_id], |r| r.get::<_, String>(0))
+                .context("query existing steps")?;
+            rows.collect::<rusqlite::Result<_>>().context("collect existing steps")?
+        };
 
-        let valid: Vec<&(String, String, Option<String>)> = steps
-            .iter()
-            .filter(|(_, a, _)| !a.trim().is_empty())
-            .collect();
+        let kept = self.write_step_drafts(card_id, &drafts, &existing, now)?;
 
-        for (i, (name, answer, img)) in valid.iter().enumerate() {
-            let pos = (i + 1) as i32;
-            let label = if name.trim().is_empty() {
-                format!("Step {}", i + 1)
-            } else {
-                name.trim().to_string()
-            };
-            if (i as i64) < existing_count {
-                self.conn
-                    .execute(
-                        "UPDATE items SET prompt=?1, answer=?2, image_path=?3
-                         WHERE card_id=?4 AND position=?5 AND kind='step'",
-                        params![label, answer, img, card_id, pos],
-                    )
-                    .context("update step item")?;
-            } else {
-                self.insert_item(card_id, pos, "step", label.as_str(), answer, now, img.as_deref())?;
-            }
+        // remove steps that were deleted in the editor
+        for id in existing.difference(&kept) {
+            self.conn
+                .execute("DELETE FROM items WHERE id=?1", params![id])
+                .context("delete removed step")?;
         }
 
-        // Remove steps that were deleted.
-        let new_count = valid.len() as i32;
-        self.conn
-            .execute(
-                "DELETE FROM items WHERE card_id=?1 AND kind='step' AND position > ?2",
-                params![card_id, new_count],
-            )
-            .context("delete extra step items")?;
-
+        tx.commit().context("commit update multi card")?;
         Ok(())
     }
 
@@ -1394,20 +1461,38 @@ impl Store {
 
 // ~~~ Helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-// Determine which items from a card should appear in a review session
-// For `Simple` cards every individually-due item is included
-//
-// For `Multi` cards the logic is find the earliest due step by position, then
-// include ALL steps up to and including it.  This forces the learner to rebuild
-// the full reasoning chain from the start, not just practise the due step in
-// isolation
-fn due_items_for_card(kind: &CardKind, items: &[Item], now: DateTime<Utc>) -> Vec<Item> {
-    match kind {
-        CardKind::Multi => match items.iter().position(|it| it.due_at <= now) {
-            Some(idx) => items[..=idx].to_vec(),
-            None => vec![],
-        },
-        CardKind::Simple => items.iter().filter(|it| it.due_at <= now).cloned().collect(),
+// determine which items from a card should appear in a review session, as a
+// list of *paths*. Each path becomes one `ReviewCard`, walked front to back,
+// and its LAST item is the one being tested
+fn due_paths_for_card(card: &Card, items: &[Item], now: DateTime<Utc>) -> Vec<Vec<Item>> {
+    match card.kind {
+        CardKind::Multi => StepTree::new(card.is_tree, items).due_paths(now),
+        CardKind::Simple => {
+            let due: Vec<Item> = items.iter().filter(|it| it.due_at <= now).cloned().collect();
+            if due.is_empty() { vec![] } else { vec![due] }
+        }
+    }
+}
+
+// daily-mode paths. A daily card ignores schedulingt
+fn daily_paths(card: &Card, items: &[Item], today: &str) -> Vec<Vec<Item>> {
+    let not_today = |it: &Item| {
+        it.last_reviewed_at
+            .map(|t| t.format("%Y-%m-%d").to_string() != today)
+            .unwrap_or(true)
+    };
+    match card.kind {
+        CardKind::Simple => {
+            if items.iter().any(not_today) { vec![items.to_vec()] } else { vec![] }
+        }
+        CardKind::Multi => {
+            let tree = StepTree::new(card.is_tree, items);
+            tree.leaf_paths()
+                .into_iter()
+                .filter(|p| p.iter().any(|&i| not_today(tree.item(i))))
+                .map(|p| p.into_iter().map(|i| tree.item(i).clone()).collect())
+                .collect()
+        }
     }
 }
 
@@ -1429,6 +1514,55 @@ fn target_retrievability(rc: &ReviewCard, now: DateTime<Utc>) -> f64 {
     scheduler::retrievability(days_elapsed, target.stability)
 }
 
+///  0 id | 1 card_id | 2 position | 3 kind | 4 prompt | 5 answer |
+///  6 due_at | 7 interval_days | 8 ease(stability) |
+///  9 last_reviewed_at | 10 lapses | 11 review_count |
+///  12 confidence_avg | 13 image_path | 14 difficulty |
+///  15 consecutive_fails | 16 consecutive_hards |
+///  17 scaffold_state | 18 scaffold_passes | 19 weak_spans |
+///  20 scaffold_pass_date | 21 parent_id
+const ITEM_COLS: &str = "id, card_id, position, kind, prompt, answer, due_at,
+                        interval_days, ease, last_reviewed_at, lapses, review_count,
+                        confidence_avg, image_path, difficulty,
+                        consecutive_fails, consecutive_hards,
+                        scaffold_state, scaffold_passes, weak_spans, scaffold_pass_date,
+                        parent_id";
+
+fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
+    let kind: String                       = row.get(3)?;
+    let due: String                        = row.get(6)?;
+    let last: Option<String>               = row.get(9)?;
+    let image_path: Option<String>         = row.get(13)?;
+    let scaffold_state: String             = row.get(17)?;
+    let weak_spans: String                 = row.get(19)?;
+    let scaffold_pass_date: Option<String> = row.get(20)?;
+    Ok(Item {
+        id:               row.get(0)?,
+        card_id:          row.get(1)?,
+        position:         row.get(2)?,
+        parent_id:        row.get(21)?,
+        kind:             kind.parse().unwrap_or(ItemKind::Forward),
+        prompt:           row.get(4)?,
+        answer:           row.get(5)?,
+        due_at:           due.parse().unwrap_or_else(|_| Utc::now()),
+        interval_days:    row.get(7)?,
+        stability:        row.get(8)?,
+        last_reviewed_at: last.and_then(|s| s.parse().ok()),
+        lapses:           row.get(10)?,
+        review_count:     row.get(11)?,
+        confidence_avg:   row.get(12)?,
+        image_path,
+        difficulty:       row.get(14)?,
+        consecutive_fails: row.get(15)?,
+        consecutive_hards: row.get(16)?,
+        scaffold_state:   scaffold_state.parse().unwrap_or_default(),
+        scaffold_passes:  row.get(18)?,
+        weak_spans:       parse_weak_spans(&weak_spans),
+        scaffold_pass_date: scaffold_pass_date
+            .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
+    })
+}
+
 /// increment a running average without keeping a running sum
 fn rolling_avg(prev_avg: f64, prev_count: i32, new_value: u8) -> f64 {
     let n = (prev_count + 1) as f64;
@@ -1448,4 +1582,572 @@ fn parse_weak_spans(raw: &str) -> Vec<WeakSpan> {
 
 fn new_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+
+// ~~~ Tests ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    fn mem() -> Store {
+        Store::open(":memory:").unwrap()
+    }
+
+    fn draft(key: u32, parent: Option<u32>, name: &str, answer: &str) -> StepDraft {
+        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None }
+    }
+
+    /// t1 - t2 -+- a1 - a2      (branch names A / B)
+    ///          +- b1
+    fn fork_drafts() -> Vec<StepDraft> {
+        vec![
+            draft(0, None,    "",  "t1"),
+            draft(1, Some(0), "",  "t2"),
+            draft(2, Some(1), "A", "a1"),
+            draft(3, Some(2), "",  "a2"),
+            draft(4, Some(1), "B", "b1"),
+        ]
+    }
+
+    /// two root paths, as in "SSD or HDD?":   s1 - s2     h1 - h2
+    fn root_fork_drafts() -> Vec<StepDraft> {
+        vec![
+            draft(0, None,    "SSD", "s1"),
+            draft(1, Some(0), "",    "s2"),
+            draft(2, None,    "HDD", "h1"),
+            draft(3, Some(2), "",    "h2"),
+        ]
+    }
+
+    fn chain_drafts(answers: &[&str]) -> Vec<StepDraft> {
+        answers
+            .iter()
+            .enumerate()
+            .map(|(i, a)| draft(i as u32, if i == 0 { None } else { Some(i as u32 - 1) }, "", a))
+            .collect()
+    }
+
+    fn add(store: &Store, drafts: &[StepDraft]) -> String {
+        store
+            .add_multi_card("Deck", "Q?", drafts, true, &ReviewMode::SpacedRepetition)
+            .unwrap()
+    }
+
+    fn by_answer(store: &Store, card: &str, answer: &str) -> Item {
+        store
+            .load_items(card)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.answer == answer)
+            .unwrap_or_else(|| panic!("no item with answer {answer}"))
+    }
+
+    fn rate(store: &Store, card: &str, answer: &str, confidence: u8) {
+        let id = by_answer(store, card, answer).id;
+        store.record_review(&id, confidence, Duration::from_secs(1), false).unwrap();
+    }
+
+    fn is_due(store: &Store, card: &str, answer: &str) -> bool {
+        by_answer(store, card, answer).due_at <= Utc::now()
+    }
+
+    fn answers(path: &[Item]) -> Vec<&str> {
+        path.iter().map(|i| i.answer.as_str()).collect()
+    }
+
+    fn fk_violations(store: &Store) -> usize {
+        let mut stmt = store.conn.prepare("PRAGMA foreign_key_check").unwrap();
+        stmt.query_map([], |_| Ok(())).unwrap().count()
+    }
+
+    /// make a card look like it predates branching
+    fn make_legacy(store: &Store, card: &str) {
+        store.conn.execute("UPDATE cards SET is_tree=0 WHERE id=?1", params![card]).unwrap();
+        store.conn.execute("UPDATE items SET parent_id=NULL WHERE card_id=?1", params![card]).unwrap();
+    }
+
+    // ~~ linear behaviour is unchanged ~~
+
+    // the rule before this feature, verbatim
+    fn old_due_items_for_multi(items: &[Item], now: DateTime<Utc>) -> Vec<Item> {
+        match items.iter().position(|it| it.due_at <= now) {
+            Some(idx) => items[..=idx].to_vec(),
+            None => vec![],
+        }
+    }
+
+    #[test]
+    fn legacy_chain_selection_matches_the_old_rule_for_every_due_pattern() {
+        let store = mem();
+        let card_id = add(&store, &chain_drafts(&["s1", "s2", "s3", "s4", "s5"]));
+        make_legacy(&store, &card_id);
+        let card = store.load_card(&card_id).unwrap();
+        assert!(!card.is_tree);
+
+        let now = Utc::now();
+        for mask in 0u32..32 {
+            for (i, it) in store.load_items(&card_id).unwrap().iter().enumerate() {
+                let due = if mask & (1 << i) != 0 { now - ChronoDuration::minutes(5) }
+                          else { now + ChronoDuration::days(2) };
+                store.conn
+                    .execute("UPDATE items SET due_at=?1 WHERE id=?2", params![due.to_rfc3339(), it.id])
+                    .unwrap();
+            }
+            let items = store.load_items(&card_id).unwrap();
+            let want = old_due_items_for_multi(&items, now);
+            let got  = due_paths_for_card(&card, &items, now);
+            if want.is_empty() {
+                assert!(got.is_empty(), "mask {mask:05b}");
+            } else {
+                assert_eq!(got.len(), 1, "mask {mask:05b}");
+                assert_eq!(answers(&got[0]), answers(&want), "mask {mask:05b}");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_chain_deunlock_hits_exactly_the_later_steps() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2", "s3", "s4"]));
+        make_legacy(&store, &id);
+        for a in ["s1", "s2", "s3", "s4"] { rate(&store, &id, a, 3); }
+        assert!(["s1", "s2", "s3", "s4"].iter().all(|a| !is_due(&store, &id, a)));
+
+        rate(&store, &id, "s2", 1);
+        assert!(!is_due(&store, &id, "s1"));
+        assert!(!is_due(&store, &id, "s2"), "the failed step itself is rescheduled");
+        assert!(is_due(&store, &id, "s3"));
+        assert!(is_due(&store, &id, "s4"));
+    }
+
+    // ~~ new: root fork from root question
+
+    #[test]
+    fn root_fork_surfaces_both_paths_then_unlocks_each_independently() {
+        let store = mem();
+        let id = add(&store, &root_fork_drafts());
+        assert!(store.load_card(&id).unwrap().is_tree);
+
+        let session = store.due_session(None, &SessionLimits::default()).unwrap();
+        assert_eq!(session.len(), 2, "one review path per root");
+        assert!(session.iter().all(|rc| rc.card.id == id && rc.items.len() == 1));
+        let mut targets: Vec<&str> = session.iter().map(|rc| rc.items[0].answer.as_str()).collect();
+        targets.sort();
+        assert_eq!(targets, ["h1", "s1"]);
+
+        // passing SSD step 1 unlocks SSD step 2 (with step 1 as context) and leaves HDD as it was
+        rate(&store, &id, "s1", 3);
+        let next = store.review_card_if_due(&id).unwrap();
+        let paths: Vec<Vec<&str>> = next.iter().map(|rc| answers(&rc.items)).collect();
+        assert_eq!(paths, vec![vec!["s1", "s2"], vec!["h1"]]);
+    }
+
+    #[test]
+    fn failing_one_root_path_does_not_disturb_the_other() {
+        let store = mem();
+        let id = add(&store, &root_fork_drafts());
+        for a in ["s1", "s2", "h1", "h2"] { rate(&store, &id, a, 3); }
+
+        rate(&store, &id, "s1", 1); // forget the first SSD step
+        assert!(is_due(&store, &id, "s2"), "below the failure");
+        assert!(!is_due(&store, &id, "h1") && !is_due(&store, &id, "h2"), "other path untouched");
+    }
+
+    // ~~ new: fork in the middle creating a new branch
+
+    #[test]
+    fn deunlock_is_scoped_to_descendants() {
+        let store = mem();
+        let id = add(&store, &fork_drafts());
+        for a in ["t1", "t2", "a1", "a2", "b1"] { rate(&store, &id, a, 3); }
+        assert!(["t1", "t2", "a1", "a2", "b1"].iter().all(|a| !is_due(&store, &id, a)));
+
+        // forgetting a leaf-side step only re-locks what is below it
+        rate(&store, &id, "a1", 1);
+        assert!(is_due(&store, &id, "a2"));
+        assert!(!is_due(&store, &id, "b1"), "sibling branch untouched");
+        assert!(!is_due(&store, &id, "t2") && !is_due(&store, &id, "t1"), "ancestors untouched");
+
+        // forgetting the trunk re-locks BOTH branches
+        rate(&store, &id, "t2", 2);
+        assert!(is_due(&store, &id, "a1") && is_due(&store, &id, "a2") && is_due(&store, &id, "b1"));
+        assert!(!is_due(&store, &id, "t1"));
+
+        // and the next session targets the two children of t2, each after its trunk
+        let next = store.review_card_if_due(&id).unwrap();
+        let paths: Vec<Vec<&str>> = next.iter().map(|rc| answers(&rc.items)).collect();
+        assert_eq!(paths, vec![vec!["t1", "t2", "a1"], vec!["t1", "t2", "b1"]]);
+    }
+
+    #[test]
+    fn a_due_item_below_a_not_due_trunk_is_reached_through_the_trunk() {
+        let store = mem();
+        let id = add(&store, &fork_drafts());
+        for a in ["t1", "t2", "a1", "a2", "b1"] { rate(&store, &id, a, 3); }
+        store.conn
+            .execute("UPDATE items SET due_at=?1 WHERE answer='a2'",
+                     params![(Utc::now() - ChronoDuration::minutes(1)).to_rfc3339()])
+            .unwrap();
+        let next = store.review_card_if_due(&id).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(answers(&next[0].items), ["t1", "t2", "a1", "a2"]);
+    }
+
+    #[test]
+    fn card_caps_count_cards_not_paths() {
+        let store = mem();
+        for _ in 0..3 { add(&store, &root_fork_drafts()); }
+        let limits = SessionLimits { max_reviews: 200, new_cards: 2 };
+        let session = store.due_session(None, &limits).unwrap();
+        assert_eq!(session.len(), 4, "2 cards x 2 paths");
+    }
+
+    #[test]
+    fn daily_tree_offers_each_path_and_skips_the_ones_done_today() {
+        let store = mem();
+        let id = store
+            .add_multi_card("Deck", "Q?", &fork_drafts(), true, &ReviewMode::Daily)
+            .unwrap();
+        let session = store.due_session(None, &SessionLimits::default()).unwrap();
+        let paths: Vec<Vec<&str>> = session.iter().map(|rc| answers(&rc.items)).collect();
+        assert_eq!(paths, vec![vec!["t1", "t2", "a1", "a2"], vec!["t1", "t2", "b1"]]);
+
+        // review the first path today (daily mode only stamps last_reviewed_at)
+        for a in ["t1", "t2", "a1", "a2"] { rate(&store, &id, a, 3); }
+        let again = store.review_card_if_due(&id).unwrap();
+        let paths: Vec<Vec<&str>> = again.iter().map(|rc| answers(&rc.items)).collect();
+        assert_eq!(paths, vec![vec!["t1", "t2", "b1"]], "only the branch not yet reviewed today");
+
+        rate(&store, &id, "b1", 3);
+        assert!(store.review_card_if_due(&id).unwrap().is_empty());
+    }
+
+    // ~~ editing keeps SRS state with the step, not the position
+
+    #[test]
+    fn inserting_a_step_mid_chain_keeps_the_other_steps_schedules() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2", "s3"]));
+        make_legacy(&store, &id);
+        for a in ["s1", "s2", "s3"] { rate(&store, &id, a, 3); }
+        let (s2_before, s3_before) = (by_answer(&store, &id, "s2"), by_answer(&store, &id, "s3"));
+
+        // what the editor does: derive drafts from the (legacy) card, splice a step in, save
+        let card  = store.load_card(&id).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let mut drafts = tree::drafts_from_items(card.is_tree, &items);
+        tree::insert_after(&mut drafts, 0, draft(0, None, "", "X"));
+        store.update_multi_card(&id, "Deck", "Q?", &drafts, true, &ReviewMode::SpacedRepetition).unwrap();
+
+        let items = store.load_items(&id).unwrap();
+        assert_eq!(answers(&items), ["s1", "X", "s2", "s3"], "position follows the chain");
+        let s2 = by_answer(&store, &id, "s2");
+        let s3 = by_answer(&store, &id, "s3");
+        assert_eq!((s2.id.as_str(), s2.stability, s2.due_at), (s2_before.id.as_str(), s2_before.stability, s2_before.due_at));
+        assert_eq!((s3.id.as_str(), s3.stability, s3.due_at), (s3_before.id.as_str(), s3_before.stability, s3_before.due_at));
+        let x = by_answer(&store, &id, "X");
+        assert_eq!(x.review_count, 0);
+        assert!(x.due_at <= Utc::now(), "a new step is immediately due");
+
+        let by = |a: &str| items.iter().find(|i| i.answer == a).unwrap();
+        assert_eq!(by("X").parent_id.as_deref(), Some(by("s1").id.as_str()));
+        assert_eq!(by("s2").parent_id.as_deref(), Some(by("X").id.as_str()));
+        assert!(store.load_card(&id).unwrap().is_tree, "converted on save");
+        // labels are by depth: s2 is now the third step of its path
+        assert_eq!(by("s2").prompt, "Step 3");
+        assert_eq!(fk_violations(&store), 0);
+    }
+
+    #[test]
+    fn removing_a_branch_deletes_only_that_subtree() {
+        let store = mem();
+        let id = add(&store, &fork_drafts());
+        let card  = store.load_card(&id).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let mut drafts = tree::drafts_from_items(card.is_tree, &items);
+        let a1 = drafts.iter().position(|d| d.answer == "a1").unwrap();
+        tree::remove_subtree(&mut drafts, a1);
+        store.update_multi_card(&id, "Deck", "Q?", &drafts, true, &ReviewMode::SpacedRepetition).unwrap();
+
+        let left = store.load_items(&id).unwrap();
+        assert_eq!(answers(&left), ["t1", "t2", "b1"]);
+        assert_eq!(fk_violations(&store), 0);
+    }
+
+    #[test]
+    fn splice_removing_a_step_keeps_its_children_and_their_history() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2", "s3"]));
+        for a in ["s1", "s2", "s3"] { rate(&store, &id, a, 3); }
+        let s3_before = by_answer(&store, &id, "s3");
+
+        let card  = store.load_card(&id).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let mut drafts = tree::drafts_from_items(card.is_tree, &items);
+        tree::remove_splice(&mut drafts, 1); // drop s2
+        store.update_multi_card(&id, "Deck", "Q?", &drafts, true, &ReviewMode::SpacedRepetition).unwrap();
+
+        let items = store.load_items(&id).unwrap();
+        assert_eq!(answers(&items), ["s1", "s3"]);
+        let s3 = by_answer(&store, &id, "s3");
+        assert_eq!((s3.stability, s3.review_count), (s3_before.stability, s3_before.review_count));
+        assert_eq!(s3.parent_id.as_deref(), Some(by_answer(&store, &id, "s1").id.as_str()));
+        assert_eq!(fk_violations(&store), 0);
+    }
+
+    #[test]
+    fn saving_a_fork_without_branch_names_is_refused() {
+        let store = mem();
+        let mut d = fork_drafts();
+        d[2].name.clear(); // the two children of t2 need names
+        assert!(store.add_multi_card("Deck", "Q?", &d, true, &ReviewMode::SpacedRepetition).is_err());
+        let id = add(&store, &fork_drafts());
+        assert!(store.update_multi_card(&id, "Deck", "Q?", &d, true, &ReviewMode::SpacedRepetition).is_err());
+    }
+
+    // ~~ referential integrity
+
+    #[test]
+    fn deleting_a_step_that_still_has_children_is_refused() {
+        let store = mem();
+        let id = add(&store, &fork_drafts());
+        let t1 = by_answer(&store, &id, "t1").id;
+        assert!(store.conn.execute("DELETE FROM items WHERE id=?1", params![t1]).is_err());
+    }
+
+    #[test]
+    fn deleting_a_tree_card_removes_everything() {
+        let store = mem();
+        let id = add(&store, &fork_drafts());
+        store.delete_card(&id).unwrap();
+        let n: i64 = store.conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // ~~ export / import
+
+    fn structure(store: &Store, card: &str) -> Vec<(String, Option<String>)> {
+        let items = store.load_items(card).unwrap();
+        let id_to_answer: HashMap<String, String> =
+            items.iter().map(|i| (i.id.clone(), i.answer.clone())).collect();
+        items
+            .iter()
+            .map(|i| (i.answer.clone(), i.parent_id.as_ref().map(|p| id_to_answer[p].clone())))
+            .collect()
+    }
+
+    #[test]
+    fn export_import_roundtrip_preserves_the_tree_even_if_children_come_first() {
+        let src = mem();
+        let id = add(&src, &fork_drafts());
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&src.export_json(None, false).unwrap()).unwrap();
+        json["cards"][0]["items"].as_array_mut().unwrap().reverse(); // children before parents
+
+        let dst = mem();
+        let summary = dst.import_json(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!((summary.cards_imported, summary.items_imported), (1, 5));
+        assert!(dst.load_card(&id).unwrap().is_tree);
+        let mut want = structure(&src, &id);
+        let mut got  = structure(&dst, &id);
+        want.sort();
+        got.sort();
+        assert_eq!(got, want);
+        assert_eq!(fk_violations(&dst), 0);
+
+        // importing the same file again replaces in place without error
+        let again = dst.import_json(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(again.cards_replaced, 1);
+        assert_eq!(fk_violations(&dst), 0);
+        let mut got2 = structure(&dst, &id);
+        got2.sort();
+        assert_eq!(got2, want);
+    }
+
+    #[test]
+    fn import_rejects_cycles_and_foreign_parents_without_writing_anything() {
+        let src = mem();
+        let id = add(&src, &fork_drafts());
+        let good: serde_json::Value =
+            serde_json::from_slice(&src.export_json(None, false).unwrap()).unwrap();
+        let items = good["cards"][0]["items"].as_array().unwrap();
+        let idof = |a: &str| items.iter().find(|i| i["answer"] == a).unwrap()["id"].clone();
+
+        // cycle: t1's parent becomes a2 (which descends from t1)
+        let mut cyc = good.clone();
+        for it in cyc["cards"][0]["items"].as_array_mut().unwrap() {
+            if it["answer"] == "t1" { it["parent_id"] = idof("a2"); }
+        }
+        // parent that isn't in the card
+        let mut foreign = good.clone();
+        for it in foreign["cards"][0]["items"].as_array_mut().unwrap() {
+            if it["answer"] == "t1" { it["parent_id"] = "not-in-this-card".into(); }
+        }
+
+        for bad in [cyc, foreign] {
+            let dst = mem();
+            let err = dst.import_json(&serde_json::to_vec(&bad).unwrap());
+            assert!(err.is_err());
+            let n: i64 = dst.conn.query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "nothing written");
+        }
+        let _ = id;
+    }
+
+    #[test]
+    fn import_of_a_pre_branching_export_is_a_linear_card() {
+        let src = mem();
+        let id = add(&src, &chain_drafts(&["s1", "s2", "s3"]));
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&src.export_json(None, false).unwrap()).unwrap();
+        // an old export has neither field
+        json["cards"][0]["card"].as_object_mut().unwrap().remove("is_tree");
+        for it in json["cards"][0]["items"].as_array_mut().unwrap() {
+            it.as_object_mut().unwrap().remove("parent_id");
+        }
+
+        let dst = mem();
+        dst.import_json(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(!dst.load_card(&id).unwrap().is_tree);
+        let session = dst.due_session(None, &SessionLimits::default()).unwrap();
+        assert_eq!(session.len(), 1);
+        assert_eq!(answers(&session[0].items), ["s1"]);
+        rate(&dst, &id, "s1", 3);
+        let next = dst.review_card_if_due(&id).unwrap();
+        assert_eq!(answers(&next[0].items), ["s1", "s2"]);
+    }
+
+    // ~~ upgrading a database created before this feature
+
+    #[test]
+    fn opening_a_pre_branching_database_migrates_in_place() {
+        let path = std::env::temp_dir().join(format!("myoso-migrate-{}.db", new_id()));
+        let path_str = path.to_str().unwrap().to_string();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(OLD_SCHEMA).unwrap();
+            let now = Utc::now();
+            let due = (now - ChronoDuration::seconds(5)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO cards(id,deck,kind,question,created_at,updated_at)
+                 VALUES('c1','Old','multi','Old question',?1,?1)",
+                params![now.to_rfc3339()],
+            ).unwrap();
+            for (i, a) in ["one", "two", "three"].iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO items(id,card_id,position,kind,prompt,answer,due_at)
+                     VALUES(?1,'c1',?2,'step',?3,?4,?5)",
+                    params![format!("i{}", i + 1), i as i32 + 1, format!("Step {}", i + 1), a, due],
+                ).unwrap();
+            }
+        }
+
+        let store = Store::open(&path_str).unwrap();
+        let card = store.load_card("c1").unwrap();
+        assert!(!card.is_tree, "existing cards stay linear");
+        let items = store.load_items("c1").unwrap();
+        assert!(items.iter().all(|i| i.parent_id.is_none()));
+
+        // opens again without complaint (ALTERs are idempotent)
+        drop(store);
+        let store = Store::open(&path_str).unwrap();
+
+        // behaves like the chain it always was
+        let session = store.due_session(None, &SessionLimits::default()).unwrap();
+        assert_eq!(session.len(), 1);
+        assert_eq!(answers(&session[0].items), ["one"]);
+        store.record_review("i1", 3, Duration::from_secs(1), false).unwrap();
+        let next = store.review_card_if_due("c1").unwrap();
+        assert_eq!(answers(&next[0].items), ["one", "two"]);
+
+        // and can be branched by editing it
+        let items = store.load_items("c1").unwrap();
+        let mut drafts = tree::drafts_from_items(false, &items);
+        let root_key = drafts[0].key;
+        tree::add_child(&mut drafts, Some(root_key), draft(0, None, "Alt", "one-b"));
+        drafts[1].name = "Main".into();
+        store.update_multi_card("c1", "Old", "Old question", &drafts, true, &ReviewMode::SpacedRepetition).unwrap();
+        assert!(store.load_card("c1").unwrap().is_tree);
+        assert_eq!(fk_violations(&store), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    const OLD_SCHEMA: &str = r#"
+            CREATE TABLE IF NOT EXISTS cards (
+                id          TEXT PRIMARY KEY,
+                deck        TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                question    TEXT NOT NULL,
+                reversible  INTEGER NOT NULL DEFAULT 0,
+                show_chain  INTEGER NOT NULL DEFAULT 1,
+                review_mode TEXT NOT NULL DEFAULT 'spaced_repetition',
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS items (
+                id               TEXT PRIMARY KEY,
+                card_id          TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+                position         INTEGER NOT NULL,
+                kind             TEXT NOT NULL,
+                prompt           TEXT NOT NULL,
+                answer           TEXT NOT NULL,
+                due_at           TEXT NOT NULL,
+                interval_days    REAL NOT NULL DEFAULT 0.0,
+                -- 'ease' column now stores FSRS memory stability (S) instead
+                -- the column is kept as 'ease' just for schema compatibility
+                ease             REAL NOT NULL DEFAULT 0.0,
+                last_reviewed_at TEXT,
+                lapses           INTEGER NOT NULL DEFAULT 0,
+                review_count     INTEGER NOT NULL DEFAULT 0,
+                confidence_avg   REAL NOT NULL DEFAULT 0.0,
+                image_path       TEXT,
+                -- FSRS item difficulty (D) 0.0 = never reviewed by FSRS
+                -- bootstrapped fresh on next rating
+                difficulty       REAL NOT NULL DEFAULT 0.0,
+                -- weak-step handling rolling consecutive-rating
+                -- counters, distinct from lifetime lapses
+                -- scheduler::LEECH_STREAK_THRESHOLD
+                consecutive_fails INTEGER NOT NULL DEFAULT 0,
+                consecutive_hards INTEGER NOT NULL DEFAULT 0,
+                -- weak-step handling (Phase 2): scaffolding
+                scaffold_state     TEXT NOT NULL DEFAULT 'normal',
+                scaffold_passes    INTEGER NOT NULL DEFAULT 0,
+                weak_spans         TEXT NOT NULL DEFAULT '[]',
+                scaffold_pass_date TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_items_card_pos ON items(card_id, position);
+            CREATE INDEX IF NOT EXISTS idx_items_due      ON items(due_at);
+
+            CREATE TABLE IF NOT EXISTS review_log (
+                id                     TEXT PRIMARY KEY,
+                item_id                TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                card_id                TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+                reviewed_at            TEXT NOT NULL,
+                confidence             INTEGER NOT NULL,
+                duration_ms            INTEGER NOT NULL,
+                previous_interval_days REAL NOT NULL,
+                new_interval_days      REAL NOT NULL,
+                chain_reexposure       INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS tags (
+                id   TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS card_tags (
+                card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+                tag_id  TEXT NOT NULL REFERENCES tags(id)  ON DELETE CASCADE,
+                PRIMARY KEY (card_id, tag_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_card_tags_card ON card_tags(card_id);
+            CREATE INDEX IF NOT EXISTS idx_card_tags_tag  ON card_tags(tag_id);
+
+    "#;
 }
