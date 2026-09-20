@@ -3,6 +3,7 @@ mod models;
 mod scheduler;
 mod ui;
 mod markdown;
+mod tree;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
