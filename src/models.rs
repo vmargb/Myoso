@@ -182,6 +182,9 @@ pub struct Card {
     pub review_mode: ReviewMode,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// cards are converted the first time they are saved from the tree-aware editor
+    #[serde(default)]
+    pub is_tree: bool,
 }
 
 fn default_show_chain() -> bool { true }
@@ -202,7 +205,14 @@ fn default_show_chain() -> bool { true }
 pub struct Item {
     pub id: String,
     pub card_id: String,
+    /// Display / sibling order. In a linear card this is the chain order. In a
+    /// tree card it only orders siblings and gives a stable DFS order
     pub position: i32,
+    /// Tree cards only `Card::is_tree` the step this one follows
+    /// `None` = attached directly to the card's question (a root path)
+    /// several items sharing one parent are alternative branches
+    #[serde(default)]
+    pub parent_id: Option<String>,
     pub kind: ItemKind,
     pub prompt: String,
     pub answer: String,
@@ -279,6 +289,43 @@ pub struct Stats {
     pub review_logs: i64,
     pub daily_cards: i64,
     pub daily_due: i64,
+}
+
+/// drafts are passed to `Store::add_multi_card` / `update_multi_card` as a
+/// slice *in DFS pre-order* (every step appears after its parent, and
+/// siblings appear in the order they should be displayed in)
+/// `key` is an editor-local identity used only to express `parent` inside
+/// the slice. `db_id` is the existing `items.id` when editing (so SRS state
+/// follows the step, not its position) and `None` for steps that are new
+#[derive(Debug, Clone, Default)]
+pub struct StepDraft {
+    pub key:    u32,
+    pub db_id:  Option<String>,
+    /// `key` of the parent draft, `None` = child of the card's question
+    pub parent: Option<u32>,
+    pub name:   String,
+    pub answer: String,
+    pub image:  Option<String>,
+}
+
+impl StepDraft {
+    /// build a plain linear chain (each step the child of the previous one)
+    /// from `(name, answer, image)` tuples, no `db_id`s
+    #[allow(dead_code)]
+    pub fn chain(steps: &[(String, String, Option<String>)]) -> Vec<StepDraft> {
+        steps
+            .iter()
+            .enumerate()
+            .map(|(i, (name, answer, image))| StepDraft {
+                key: i as u32,
+                db_id: None,
+                parent: if i == 0 { None } else { Some(i as u32 - 1) },
+                name: name.clone(),
+                answer: answer.clone(),
+                image: image.clone(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Default)]
