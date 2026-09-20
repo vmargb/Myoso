@@ -86,18 +86,11 @@ cargo run
 
 ## Features
 
-- **Analytics**: Simple statistics of deck/card data, current progress and currently due sessions.
-- **Reversible cards**: Support for making cards reversible, where q->a becomes a->q.
-- **Step-by-step cards**: Cards that require multiple steps towards the answers, where each step is rated individually.
-- **Import/Export**: Export a specific deck or all decks into `JSON` format, which can be imported by anyone else.
-- **External Editor Support**: Open any textbox in your default editor (e.g., Neovim, VS Code, Notepad) directly from the TUI. Works seamlessly across all operating systems. Close the editor to automatically return to the TUI with your updated text.
-- **Markdown Rendering**: All markdown formatting (e.g., bold, italics, lists) is now rendered during review sessions.
-- **Syntax Highlighting**: Code blocks in markdown are syntax-highlighted for any programming language.
-- **Image preview**: Insert path to images locally into an answer/step (handwritten work or screenshot)
-- **Subdecks**: Organise decks into 'sub-decks', allowing clear separation (e.g., vocabulary, grammar)
-- **Tags**: Organise cards even further by adding tags, allowing easy search filtering
-- **Leach detection**: Automatically flags steps you keep failing and offers some interventions to handle them
-- **Feynman Step**: Optional Feynman technique step before revealing a card to compare your answer.
+Myoso keeps simple things simple. A plain card can be made reversible so that question -> answer also works as answer -> question, and a step-by-step card lets you rate every step individually. When you want to see how you are doing, the analytics screen shows statistics for your decks and cards and what is currently due.
+
+Cards are organised with decks, and decks can be split into sub-decks such as vocabulary and grammar, while tags let you filter and search across them. Answers and steps support full markdown, including bold, italics and lists, and code blocks are syntax-highlighted for any programming language. If your working is on paper, you can attach the path of a local image, such as a handwritten derivation or a screenshot, to any answer or step and see it during review.
+
+Writing long answers in a tiny text box is painful, so any text box can be opened in your default editor, whether that is Neovim, VS Code or Notepad. Close the editor and you land back in the app with your updated text. Decks can be exported to JSON, either one at a time or all together and imported by anyone else. For the times you want to test yourself before peeking, an optional Feynman step asks you to explain the answer in your own words before revealing it, so you can compare the two.
 
 ### Daily cards
 
@@ -115,28 +108,25 @@ Once the demand is gone(e.g. after the exam), you can move those cards back into
 1. *stability* (how long the memory lasts)
 2. *difficulty* (how hard the item is for you personally)
 
-Intervals are calculated to target a 90% recall probability at review time, and both properties update after every rating.
+You rate each step with a single key:
 
-| Key | Action |
-|-----|--------|
-| `1` | **Again**: complete blank |
-| `2` | **Hard**: correct but with major effort |
-| `3` | **Good**: correct with some effort |
-| `4` | **Easy**: recalled instantly and effortlessly |
+| Key | Rating | Meaning |
+|-----|--------|---------|
+| `1` | **Again** | Complete blank |
+| `2` | **Hard** | Correct, but with major effort |
+| `3` | **Good** | Correct, with some effort |
+| `4` | **Easy** | Recalled instantly and effortlessly |
 
 > [!NOTE]
 > It is highly recommended to avoid the `4` option.
 > Reserving it only for **rare** occassions for optimal recall performance.
 
-Additionally, `Myoso` handles a unique problem of *re-exposure* where repeatedly rating a step as `good` or `easy` because you had just recently seen it(from rebuilding the same steps in the **same session**). This would artificially *inflate* the cards schedule because you stacked multiple positive ratings on the same steps. Therefore, any *re-exposure* ratings now introduce a **tapering effect** against the SRS algorithm to prevent this inflation.
+Additionally, `Myoso` handles a unique problem called *re-exposure*, triggered by repeatedly rating a step as `good` or `easy` after you had just recently seen it(from rebuilding the same steps in the **same session**). This would artificially *inflate* the cards schedule because you stacked multiple positive ratings on the same steps. Therefore, any *re-exposure* ratings now introduce a **tapering effect** against the SRS algorithm to prevent this inflation. The exception is a step that has just been marked as due again because something earlier was forgotten. That step needs a real rating, so its rating always counts.
 
 ---
 
-## Leach detection & intervention
+## Leech detection and intervention
 
-Some steps just don't stick, with multiple stacking `again` and `hard` ratings. In `anki` these are called **leaches**, which are usually removed out of the review queue. However, Myoso can't simply remove an intermediary step from a chain. Instead it offers a couple alternatives to pick from:
+Some steps just don't stick, and collect `again` and `hard` ratings over and over. In Anki these are called leeches and are usually pulled out of the review queue. Myoso can't simply remove a step from the middle of a chain, so it offers two alternatives instead.
 
-- **cloze-tests**: highlight the exact word, formula or phrase in the answer that's actually tripping you up
-- **split in two**: If a step is too difficult, you can split the step into two smaller steps to make recall easier.
-
-[cloze-tests](https://en.wikipedia.org/wiki/Cloze_test) end up graduating back to normal full-recall review. These lighter reviews don't touch your normal schedule, they exist purely to rebuild the specific bit of recall that was missing.
+A **cloze test** lets you highlight the exact word, formula or phrase that keeps tripping you up, and future reviews hide just that part. These lighter reviews never touch your normal schedule. They exist only to rebuild the specific piece of recall that was missing, and once it is back the step returns to normal full-recall review. If the whole step is too much to hold at once, you can instead **split it in two**, so that each half is easier to remember.
