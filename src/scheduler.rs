@@ -222,6 +222,7 @@ mod tests {
             id:               "test-id".into(),
             card_id:          "card-id".into(),
             position:         1,
+            parent_id:        None,
             kind:             ItemKind::Forward,
             prompt:           "q".into(),
             answer:           "a".into(),
