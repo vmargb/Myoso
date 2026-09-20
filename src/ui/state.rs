@@ -4,7 +4,7 @@
 //   Screen, ReviewState, AddCardState, ListCardsState, ListDecksState,
 //   ExportState, ImportState, AppState
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use ratatui::{layout::Rect, widgets::ListState};
@@ -12,8 +12,9 @@ use ratatui::{layout::Rect, widgets::ListState};
 use crate::db::Store;
 use crate::models::{
     Card, CardKind, CardSummary, Item, ItemKind, LeechStatus, ReviewCard, ReviewMode, Stats,
-    SessionLimits,
+    SessionLimits, StepDraft,
 };
+use crate::tree;
 
 // ~~~ Screens ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -157,21 +158,129 @@ impl ReviewState {
         self.answer_scroll = 0; // reset scroll on new reveal
     }
 
-    // appends card_id to the end of the session if it now has due items
-    // but only if it isn't already in the not-yet-reviewed portion (avoid duplicates)
+    // appends a review path to the end of the session for every branch of
+    // `card_id` that now has something due. A linear card has at most one path
+    // a branching card can have several (one per due branch)
+    //
+    // a path is identified by its target, the last item, so a card can have
+    // several paths queued at once, while the same path is never queued twice
+    // (only the not yet reviewed part of the session is checked, so a path
+    // that was just finished can come back if it is due again)
     pub fn requeue_if_due(&mut self, store: &Store, card_id: &str) -> anyhow::Result<()> {
-        let already_queued = self.session[self.card_idx..]
-            .iter()
-            .any(|rc| rc.card.id == card_id);
-        if already_queued {
-            return Ok(());
-        }
-
-        if let Some(review_card) = store.review_card_if_due(card_id)? {
+        for review_card in store.review_card_if_due(card_id)? {
+            let target = review_card.items.last().map(|it| it.id.as_str());
+            let already_queued = self
+                .session
+                .get(self.card_idx..)
+                .unwrap_or(&[])
+                .iter()
+                .any(|rc| {
+                    rc.card.id == card_id && rc.items.last().map(|it| it.id.as_str()) == target
+                });
+            if already_queued {
+                continue;
+            }
             self.total_items += review_card.items.len();
             self.session.push(review_card);
         }
 
+        Ok(())
+    }
+
+    /// bring the running session back in line with a card that was just
+    /// edited from inside the review (the [e] key). Steps may have been
+    /// added, deleted or moved, and a queued path that still names a deleted
+    /// step would fail the moment it is rated, so every not yet finished path
+    /// of the card is rebuilt from the database
+    ///  * steps that still exist get their fresh text/state, in the same order
+    ///  * steps that no longer exist are dropped from the paths
+    ///  * paths whose target step is gone (or that are left empty) are removed,
+    ///     and the cursor stays on the step on
+    ///     screen (or the next surviving one if that step was deleted)
+    /// anything newly due (like a step that was just added) is queued afterwards
+    pub fn refresh_card(&mut self, store: &Store, card_id: &str) -> anyhow::Result<()> {
+        let card = store.load_card(card_id)?;
+        let fresh: HashMap<String, Item> = store
+            .load_items(card_id)?
+            .into_iter()
+            .map(|it| (it.id.clone(), it))
+            .collect();
+
+        let mut i = self.card_idx;
+        while i < self.session.len() {
+            if self.session[i].card.id != card_id {
+                i += 1;
+                continue;
+            }
+
+            let is_current = i == self.card_idx;
+            let old_items = std::mem::take(&mut self.session[i].items);
+            // survivors among the steps already passed in the on-screen path
+            // decide where the cursor lands
+            let mut survivors_before_cursor = 0usize;
+            let mut kept: Vec<Item> = Vec::with_capacity(old_items.len());
+            for (k, it) in old_items.iter().enumerate() {
+                if let Some(f) = fresh.get(&it.id) {
+                    if is_current && k < self.item_idx {
+                        survivors_before_cursor += 1;
+                    }
+                    kept.push(f.clone());
+                }
+            }
+
+            let cursor_item_survived = is_current
+                && old_items
+                    .get(self.item_idx)
+                    .map_or(false, |it| fresh.contains_key(&it.id));
+
+            // a path exists to test its LAST step, so if that step was deleted the
+            // path goes, even if some of the steps leading to it survive
+            let target_gone = old_items.last().map_or(true, |it| !fresh.contains_key(&it.id));
+
+            if target_gone || kept.is_empty() || (is_current && survivors_before_cursor >= kept.len()) {
+                // nothing left to review in this path
+                self.session.remove(i);
+                if is_current {
+                    self.item_idx = 0;
+                    self.phase = ReviewPhase::Thinking;
+                    self.item_started_at = Instant::now();
+                    self.answer_scroll = 0;
+                    self.clear_scratchpad();
+                }
+                continue; // `i` now names the next entry
+            }
+
+            self.session[i].card = card.clone();
+            self.session[i].items = kept;
+            if is_current {
+                self.item_idx = survivors_before_cursor;
+                if !cursor_item_survived {
+                    // the step on screen is gone, so show the next one fresh
+                    self.phase = ReviewPhase::Thinking;
+                    self.item_started_at = Instant::now();
+                    self.answer_scroll = 0;
+                }
+            }
+            i += 1;
+        }
+
+        // keep the progress bar consistent, done + everything still ahead
+        let remaining: usize = self
+            .session
+            .get(self.card_idx..)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+            .map(|(n, rc)| if n == 0 { rc.items.len().saturating_sub(self.item_idx) } else { rc.items.len() })
+            .sum();
+        self.total_items = self.done_items + remaining;
+
+        if card.kind == CardKind::Multi {
+            self.requeue_if_due(store, card_id)?;
+        }
+        if self.is_done() && self.finished_duration.is_none() {
+            self.finished_duration = Some(self.started_at.elapsed());
+        }
         Ok(())
     }
 
@@ -440,10 +549,17 @@ pub struct AddCardState {
     pub answer:              String,
     pub reversible:          bool,
     pub show_chain:          bool, // multi only: show preceding step answers during review
-    // multi-only, each step is (optional_name, answer)
+    // multi-only, the steps form a tree (a plain chain is the common case) kept as
+    // a flat list in DFS order, each with its parent's key, StepDraft / tree.rs
+    // the list cursor (step_list_state) indexes into it one row per step
     pub answer_image_path:   Option<String>,
     pub step_image_path:     Option<String>,
-    pub steps:               Vec<(String, String, Option<String>)>, // (name, answer, img_path)
+    pub steps:               Vec<StepDraft>,
+    // where the NEXT new step attaches, set by [b] / [r] on the steps list
+    //   None              default: extend the selected step, or the end of the chain
+    //   Some(Some(key)) [b]   a child of that step (a new branch if it has children)
+    //   Some(None) [r]        a new top-level path, attached to the question itself
+    pub pending_parent:      Option<Option<u32>>,
     pub step_name_buf:       String,
     pub step_buf:            String,
     pub step_list_state:     ListState,
@@ -476,6 +592,7 @@ impl AddCardState {
             answer_image_path:   None,
             step_image_path:     None,
             steps:               Vec::new(),
+            pending_parent:      None,
             step_name_buf:       String::new(),
             step_buf:            String::new(),
             step_list_state:     ListState::default(),
@@ -575,6 +692,104 @@ impl AddCardState {
         if let Some(b) = self.active_buf_mut() { b.pop(); }
     }
 
+    // ~~ step tree editing
+
+    /// index of the highlighted step, if it is a valid row
+    pub fn selected_step(&self) -> Option<usize> {
+        self.step_list_state.selected().filter(|&i| i < self.steps.len())
+    }
+
+    /// where a new step goes when the user hasn't asked for a branch, after the
+    /// selected step if it is a leaf (extending its chain), otherwise at the end
+    /// of the outline. The last step in DFS order is always a leaf, so for a
+    /// plain chain this is simply "append"
+    fn default_parent(&self) -> Option<u32> {
+        match self.selected_step() {
+            Some(i) if tree::child_count(&self.steps, Some(self.steps[i].key)) == 0 => {
+                Some(self.steps[i].key)
+            }
+            _ => self.steps.last().map(|d| d.key),
+        }
+    }
+
+    /// [b] on the steps listm the next step becomes a child of the selected
+    /// step. If that step already has children this starts a new branch
+    pub fn begin_branch(&mut self) {
+        if let Some(i) = self.selected_step() {
+            self.pending_parent = Some(Some(self.steps[i].key));
+            self.editing_step_idx = None;
+            self.step_name_buf.clear();
+            self.step_buf.clear();
+            self.step_image_path = None;
+            self.focused = 2; // Step Name
+        }
+    }
+
+    /// [r] on the steps list, the next step starts a new top-level path,
+    /// an alternative answer to the question itself
+    pub fn begin_root_path(&mut self) {
+        self.pending_parent = Some(None);
+        self.editing_step_idx = None;
+        self.step_name_buf.clear();
+        self.step_buf.clear();
+        self.step_image_path = None;
+        self.focused = 2;
+    }
+
+    /// remove the selected step. `with_branch == false` removes just that step
+    /// and its children move up (nothing else is lost), `true` removes the step
+    /// and everything below it
+    pub fn delete_selected_step(&mut self, with_branch: bool) {
+        let Some(i) = self.selected_step() else { return };
+        if with_branch {
+            tree::remove_subtree(&mut self.steps, i);
+        } else {
+            tree::remove_splice(&mut self.steps, i);
+        }
+        let n = self.steps.len();
+        self.step_list_state.select(if n == 0 { None } else { Some(i.min(n - 1)) });
+        // indices moved, so a half-finished edit or pending target would point at the wrong step
+        self.editing_step_idx = None;
+        self.pending_parent = None;
+        self.step_name_buf.clear();
+        self.step_buf.clear();
+    }
+
+    /// short description of where the next new step will attach, for the
+    /// step Name box. `None` when there is nothing to say (first step, or editing)
+    pub fn attach_hint(&self) -> Option<String> {
+        if self.editing_step_idx.is_some() || self.steps.is_empty() {
+            return None;
+        }
+        let parent = match self.pending_parent {
+            Some(p) => p,
+            None => self.default_parent(),
+        };
+        let Some(key) = parent else {
+            return Some("new top-level path".to_string());
+        };
+        let i = self.steps.iter().position(|d| d.key == key)?;
+        let step_no = tree::outline(&self.steps)[i].step_no;
+        let d = &self.steps[i];
+        let label = if d.name.trim().is_empty() {
+            d.answer.lines().next().unwrap_or("").trim().to_string()
+        } else {
+            d.name.trim().to_string()
+        };
+        let label: String = if label.chars().count() > 22 {
+            label.chars().take(21).collect::<String>() + "…"
+        } else {
+            label
+        };
+        let has_kids = tree::child_count(&self.steps, Some(key)) > 0;
+        Some(format!(
+            "{} {}. {}",
+            if has_kids { "new branch under" } else { "after" },
+            step_no,
+            label
+        ))
+    }
+
     pub fn commit_step(&mut self) {
         let answer = self.step_buf.trim().to_string();
         let name   = self.step_name_buf.trim().to_string();
@@ -582,13 +797,24 @@ impl AddCardState {
         if !answer.is_empty() {
             if let Some(idx) = self.editing_step_idx {
                 if idx < self.steps.len() {
-                    self.steps[idx] = (name, answer, img);
+                    // edit in place, identity and position in the tree are kept
+                    self.steps[idx].name   = name;
+                    self.steps[idx].answer = answer;
+                    self.steps[idx].image  = img;
                 }
                 self.editing_step_idx = None;
                 self.focused = 5; // jump back to the list after editing
             } else {
-                self.steps.push((name, answer, img));
-                self.step_list_state.select(Some(self.steps.len() - 1));
+                let parent = match self.pending_parent.take() {
+                    Some(p) => p,
+                    None    => self.default_parent(),
+                };
+                let at = tree::add_child(
+                    &mut self.steps,
+                    parent,
+                    StepDraft { name, answer, image: img, ..StepDraft::default() },
+                );
+                self.step_list_state.select(Some(at));
                 self.focused = 3; // keep the cursor in the step editor for the next entry
             }
             // resets after commit
@@ -596,8 +822,9 @@ impl AddCardState {
             self.step_buf.clear();
         } else if let Some(idx) = self.editing_step_idx {
             // cancel edit if user submits blank answer
-            if idx < self.steps.len() && self.steps[idx].1.is_empty() {
-                self.steps.remove(idx);
+            if idx < self.steps.len() && self.steps[idx].answer.is_empty() {
+                // a step that was spliced in and never filled, take it back out
+                tree::remove_splice(&mut self.steps, idx);
                 let n = self.steps.len();
                 let sel = if n == 0 { None } else { Some(idx.min(n - 1)) };
                 self.step_list_state.select(sel);
@@ -621,8 +848,10 @@ impl AddCardState {
                 Err("Answer cannot be empty."),
             AddKind::Multi if self.steps.is_empty() =>
                 Err("Add at least one step (type in the step field, then press the Add step button)."),
-            AddKind::Multi if self.steps.iter().all(|(_, a, _)| a.trim().is_empty()) =>
+            AddKind::Multi if self.steps.iter().all(|d| d.answer.trim().is_empty()) =>
                 Err("Add at least one step with content."),
+            // sibling branches must be nameable in review
+            AddKind::Multi => tree::check_branch_names(&tree::prune_blank(&self.steps)),
             _ => Ok(()),
         }
     }
@@ -650,18 +879,15 @@ impl AddCardState {
                 s.kind  = AddKind::Multi;
                 s.multi_question = card.question.clone();
                 s.show_chain = card.show_chain;
-                s.steps = items
+                let step_items: Vec<Item> = items
                     .iter()
                     .filter(|i| i.kind == ItemKind::Step)
-                    .enumerate()
-                    .map(|(idx, i)| {
-                        // treat auto-generated "Step N" labels as unnamed so the
-                        // name field starts blank and the user isn't forced to clear it
-                        let auto = format!("Step {}", idx + 1);
-                        let name = if i.prompt == auto { String::new() } else { i.prompt.clone() };
-                        (name, i.answer.clone(), i.image_path.clone())
-                    })
+                    .cloned()
                     .collect();
+                // the same call handles a legacy chain (parents derived from
+                // position) and a tree card, auto-generated "Step N" labels become
+                // blank names so the name field starts empty
+                s.steps = tree::drafts_from_items(card.is_tree, &step_items);
                 if !s.steps.is_empty() {
                     s.step_list_state.select(Some(0));
                 }
@@ -670,16 +896,19 @@ impl AddCardState {
         s
     }
 
-    /// Insert a blank step immediately after the currently selected step
-    /// (or at the end if nothing is selected), then jump to the step-input
-    /// field so the user can type the new step content straight away
+    /// insert a blank step immediately after the currently selected step, it
+    /// takes that step's place in the chain and adopts its children, or at the
+    /// end if nothing is selected, then jump to the step-input field so the user
+    /// can type the new step content straight away
     pub fn insert_step_after_selected(&mut self) {
-        let insert_at = self
-            .step_list_state
-            .selected()
-            .map(|i| i + 1)
-            .unwrap_or(self.steps.len());
-        self.steps.insert(insert_at, (String::new(), String::new(), None));
+        let insert_at = match self.selected_step() {
+            Some(i) => tree::insert_after(&mut self.steps, i, StepDraft::default()),
+            None => {
+                let parent = self.default_parent();
+                tree::add_child(&mut self.steps, parent, StepDraft::default())
+            }
+        };
+        self.pending_parent = None;
         self.editing_step_idx = Some(insert_at);
         self.step_list_state.select(Some(insert_at));
         self.step_name_buf.clear();
@@ -1111,5 +1340,378 @@ impl<'a> AppState<'a> {
             _ => self.should_quit = true,
         }
         Ok(())
+    }
+}
+
+// ~~~ Tests 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem() -> Store {
+        Store::open(":memory:").unwrap()
+    }
+
+    fn draft(key: u32, parent: Option<u32>, name: &str, answer: &str) -> StepDraft {
+        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None }
+    }
+
+    /// t1 - t2 -+- a1 - a2   (branches "A" / "B")
+    ///          +- b1
+    fn fork() -> Vec<StepDraft> {
+        vec![
+            draft(0, None, "", "t1"),
+            draft(1, Some(0), "", "t2"),
+            draft(2, Some(1), "A", "a1"),
+            draft(3, Some(2), "", "a2"),
+            draft(4, Some(1), "B", "b1"),
+        ]
+    }
+
+    fn root_fork() -> Vec<StepDraft> {
+        vec![
+            draft(0, None, "SSD", "s1"),
+            draft(1, Some(0), "", "s2"),
+            draft(2, None, "HDD", "h1"),
+            draft(3, Some(2), "", "h2"),
+        ]
+    }
+
+    fn chain(answers: &[&str]) -> Vec<StepDraft> {
+        answers.iter().enumerate()
+            .map(|(i, a)| draft(i as u32, if i == 0 { None } else { Some(i as u32 - 1) }, "", a))
+            .collect()
+    }
+
+    fn add(store: &Store, d: &[StepDraft]) -> String {
+        store.add_multi_card("Deck", "Q?", d, true, &ReviewMode::SpacedRepetition).unwrap()
+    }
+
+    fn item(store: &Store, card: &str, answer: &str) -> Item {
+        store.load_items(card).unwrap().into_iter().find(|i| i.answer == answer).unwrap()
+    }
+
+    fn queued_paths(rs: &ReviewState) -> Vec<Vec<String>> {
+        rs.session[rs.card_idx..]
+            .iter()
+            .map(|rc| rc.items.iter().map(|i| i.answer.clone()).collect())
+            .collect()
+    }
+
+    fn run_to_end(rs: &mut ReviewState, store: &Store, confidence: u8) {
+        for _ in 0..100 {
+            if rs.is_done() { return; }
+            rs.rate(store, confidence).unwrap();
+        }
+        panic!("session never finished");
+    }
+
+    // ~~ review flow ~~
+
+    #[test]
+    fn a_root_fork_session_walks_both_paths_without_inflating_the_trunk() {
+        let store = mem();
+        let id = add(&store, &root_fork());
+        let mut rs = ReviewState::new(store.due_session(None, &SessionLimits::default()).unwrap());
+        assert_eq!(queued_paths(&rs), vec![vec!["s1"], vec!["h1"]]);
+
+        run_to_end(&mut rs, &store, 3);
+
+        for a in ["s1", "s2", "h1", "h2"] {
+            let it = item(&store, &id, a);
+            assert!(it.due_at > chrono::Utc::now(), "{a} should be scheduled ahead");
+            assert!(rs.session_rated.contains(&it.id), "{a} was rated");
+        }
+        // s1 / h1 were shown twice (alone, then as context for step 2), but the second
+        // showing is a re-exposure, still a first-Good interval, not a compounded one
+        let s1 = item(&store, &id, "s1");
+        assert_eq!(s1.review_count, 2);
+        assert_eq!(s1.interval_days, item(&store, &id, "s2").interval_days);
+        // progress bookkeeping ends consistent
+        assert_eq!(rs.done_items, rs.total_items);
+        assert!(store.due_session(None, &SessionLimits::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failing_a_trunk_step_queues_both_branches_for_rebuild() {
+        let store = mem();
+        let id = add(&store, &fork());
+        for a in ["t1", "t2", "a1", "a2", "b1"] {
+            store.record_review(&item(&store, &id, a).id, 3, std::time::Duration::from_secs(1), false).unwrap();
+        }
+        // make the trunk due again and fail it
+        store.record_review(&item(&store, &id, "t2").id, 1, std::time::Duration::from_secs(1), false).unwrap();
+        // t2 was rescheduled ahead but everything under it is now due
+        let mut rs = ReviewState::new(store.review_card_if_due(&id).unwrap());
+        assert_eq!(queued_paths(&rs), vec![vec!["t1", "t2", "a1"], vec!["t1", "t2", "b1"]]);
+
+        // fail t1 on screen mid-path, the rest of THIS path is skipped, and the card is requeued
+        rs.rate(&store, 3).unwrap(); // t1 (re-exposure of a well-known step)
+        rs.rate(&store, 3).unwrap(); // t2 (re-exposure)
+        rs.rate(&store, 1).unwrap(); // a1: fail
+        let queued = queued_paths(&rs);
+        assert!(queued.contains(&vec!["t1".into(), "t2".into(), "b1".into()]), "b1 path still queued: {queued:?}");
+        assert!(rs.total_items >= rs.done_items);
+        run_to_end(&mut rs, &store, 3);
+        assert!(rs.is_done());
+    }
+
+    #[test]
+    fn requeue_does_not_duplicate_a_queued_path_but_keeps_sibling_paths() {
+        let store = mem();
+        add(&store, &root_fork());
+        let mut rs = ReviewState::new(store.due_session(None, &SessionLimits::default()).unwrap());
+        rs.rate(&store, 3).unwrap(); // s1
+        // [h1] still queued, [s1,s2] appended
+        assert_eq!(queued_paths(&rs), vec![vec!["h1"], vec!["s1", "s2"]]);
+        rs.rate(&store, 3).unwrap(); // h1
+        assert_eq!(queued_paths(&rs), vec![vec!["s1", "s2"], vec!["h1", "h2"]]);
+    }
+
+    #[test]
+    fn linear_card_still_produces_one_growing_path() {
+        let store = mem();
+        add(&store, &chain(&["s1", "s2", "s3"]));
+        let mut rs = ReviewState::new(store.due_session(None, &SessionLimits::default()).unwrap());
+        assert_eq!(queued_paths(&rs), vec![vec!["s1"]]);
+        rs.rate(&store, 3).unwrap();
+        assert_eq!(queued_paths(&rs), vec![vec!["s1", "s2"]]);
+        rs.rate(&store, 3).unwrap();
+        rs.rate(&store, 3).unwrap();
+        assert_eq!(queued_paths(&rs), vec![vec!["s1", "s2", "s3"]]);
+        run_to_end(&mut rs, &store, 3);
+        assert!(rs.is_done());
+    }
+
+    // A single Hard on a step that is only being re-shown as context used to
+    // re-lock the steps below it, including ones already rated this session
+    // Those could never become un-due again (a re-exposure rating doesn't
+    // reschedule), so the session kept requeueing them forever, even with 3s only
+    fn assert_finishes_after_one_hard_on_context(draft: Vec<StepDraft>, hard_on: usize) {
+        let store = mem();
+        add(&store, &draft);
+        let mut rs = ReviewState::new(store.due_session(None, &SessionLimits::default()).unwrap());
+        let mut n = 0;
+        while !rs.is_done() {
+            assert!(n < 300, "session never finishes: queued now = {:?}", queued_paths(&rs));
+            // the hard_on-th rating overall is a Hard; every other one is a 3
+            let c = if n == hard_on { 2 } else { 3 };
+            rs.rate(&store, c).unwrap();
+            n += 1;
+        }
+    }
+
+    #[test]
+    fn one_hard_on_a_context_step_cannot_make_a_linear_session_endless() {
+        // ratings: s1 | s1 s2 | s1(HARD, context) ...
+        assert_finishes_after_one_hard_on_context(chain(&["s1", "s2", "s3"]), 3);
+    }
+
+    #[test]
+    fn one_hard_on_a_context_step_cannot_make_a_tree_session_endless() {
+        assert_finishes_after_one_hard_on_context(fork(), 3);
+        assert_finishes_after_one_hard_on_context(fork(), 6);
+        assert_finishes_after_one_hard_on_context(root_fork(), 3);
+    }
+
+    // ~~ editing a card from inside a session ~~
+
+    #[test]
+    fn refresh_card_survives_deleted_steps_mid_review() {
+        let store = mem();
+        let id = add(&store, &fork());
+        for a in ["t1", "t2"] {
+            store.record_review(&item(&store, &id, a).id, 3, std::time::Duration::from_secs(1), false).unwrap();
+        }
+        let mut rs = ReviewState::new(store.review_card_if_due(&id).unwrap());
+        assert_eq!(queued_paths(&rs), vec![vec!["t1", "t2", "a1"], vec!["t1", "t2", "b1"]]);
+        rs.item_idx = 1; // looking at t2
+
+        let edit = |mutate: &dyn Fn(&mut Vec<StepDraft>)| {
+            let card = store.load_card(&id).unwrap();
+            let items = store.load_items(&id).unwrap();
+            let mut d = crate::tree::drafts_from_items(card.is_tree, &items);
+            mutate(&mut d);
+            store.update_multi_card(&id, "Deck", "Q?", &d, true, &ReviewMode::SpacedRepetition).unwrap();
+        };
+
+        // delete branch B: its queued path goes, the on-screen path is untouched
+        edit(&|d| {
+            let i = d.iter().position(|x| x.answer == "b1").unwrap();
+            crate::tree::remove_subtree(d, i);
+        });
+        rs.refresh_card(&store, &id).unwrap();
+        assert_eq!(queued_paths(&rs), vec![vec!["t1", "t2", "a1"]]);
+        assert_eq!(rs.item_idx, 1);
+
+        // delete the step ON SCREEN (t2), the cursor lands on the next surviving step
+        edit(&|d| {
+            let i = d.iter().position(|x| x.answer == "t2").unwrap();
+            crate::tree::remove_splice(d, i);
+        });
+        rs.refresh_card(&store, &id).unwrap();
+        assert_eq!(queued_paths(&rs), vec![vec!["t1", "a1"]]);
+        assert_eq!(rs.item_idx, 1);
+        assert_eq!(rs.session[0].items[rs.item_idx].answer, "a1");
+        assert_eq!(rs.phase, ReviewPhase::Thinking);
+
+        // and the session can be finished without touching a deleted id
+        run_to_end(&mut rs, &store, 3);
+    }
+
+    #[test]
+    fn refresh_card_ends_the_session_cleanly_when_the_target_is_deleted() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2"]));
+        let mut rs = ReviewState::new(store.due_session(None, &SessionLimits::default()).unwrap());
+        assert_eq!(queued_paths(&rs), vec![vec!["s1"]]);
+
+        let card = store.load_card(&id).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let mut d = crate::tree::drafts_from_items(card.is_tree, &items);
+        d.remove(0); // delete s1 (splice): s2 becomes the only step
+        d[0].parent = None;
+        store.update_multi_card(&id, "Deck", "Q?", &d, true, &ReviewMode::SpacedRepetition).unwrap();
+
+        rs.refresh_card(&store, &id).unwrap();
+        // the old path's target is gone, and s2 is newly due, so it is queued instead
+        assert_eq!(queued_paths(&rs), vec![vec!["s2"]]);
+        run_to_end(&mut rs, &store, 3);
+    }
+
+    // ~~ the editor
+
+    fn editor_for(store: &Store, id: &str) -> AddCardState {
+        let card = store.load_card(id).unwrap();
+        let items = store.load_items(id).unwrap();
+        AddCardState::for_edit(&card, &items, vec![], vec![])
+    }
+
+    fn step_answers(s: &AddCardState) -> Vec<&str> {
+        s.steps.iter().map(|d| d.answer.as_str()).collect()
+    }
+
+    fn type_step(s: &mut AddCardState, name: &str, answer: &str) {
+        s.step_name_buf = name.into();
+        s.step_buf = answer.into();
+        s.commit_step();
+    }
+
+    #[test]
+    fn typing_steps_one_after_another_builds_a_chain_even_on_an_existing_card() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2", "s3"]));
+        let mut s = editor_for(&store, &id);
+        assert_eq!(s.step_list_state.selected(), Some(0)); // for_edit selects the first step
+        type_step(&mut s, "", "s4"); // must APPEND, not fork under s1
+        type_step(&mut s, "", "s5");
+        assert_eq!(step_answers(&s), ["s1", "s2", "s3", "s4", "s5"]);
+        assert!(crate::tree::is_linear(&s.steps));
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn branch_key_forks_under_the_selected_step_and_names_are_required() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2", "s3"]));
+        let mut s = editor_for(&store, &id);
+        s.step_list_state.select(Some(0));
+        s.begin_branch();
+        assert_eq!(s.focused, 2);
+        assert_eq!(s.attach_hint().as_deref(), Some("new branch under 1. s1"));
+        type_step(&mut s, "", "alt");
+
+        assert_eq!(step_answers(&s), ["s1", "s2", "s3", "alt"]);
+        assert_eq!(s.steps[3].parent, Some(s.steps[0].key));
+        assert!(s.validate().is_err(), "two children of s1, neither named");
+
+        s.steps[1].name = "Main".into();
+        s.steps[3].name = "Alt".into();
+        assert!(s.validate().is_ok());
+
+        // saving it produces a real fork
+        store.update_multi_card(&id, "Deck", "Q?", &s.steps, true, &ReviewMode::SpacedRepetition).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let s1 = items.iter().find(|i| i.answer == "s1").unwrap();
+        assert_eq!(items.iter().filter(|i| i.parent_id.as_deref() == Some(s1.id.as_str())).count(), 2);
+    }
+
+    #[test]
+    fn root_path_key_adds_an_alternative_answer_to_the_question() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2"]));
+        let mut s = editor_for(&store, &id);
+        s.begin_root_path();
+        assert_eq!(s.attach_hint().as_deref(), Some("new top-level path"));
+        type_step(&mut s, "Other way", "o1");
+        assert_eq!(crate::tree::child_count(&s.steps, None), 2);
+        assert!(s.validate().is_err(), "the two root paths need names");
+        s.steps[0].name = "First way".into();
+        assert!(s.validate().is_ok());
+        // the following step continues the NEW path (selection moved to it)
+        type_step(&mut s, "", "o2");
+        assert_eq!(s.steps.last().unwrap().parent, Some(s.steps[s.steps.len() - 2].key));
+    }
+
+    #[test]
+    fn navigating_the_list_cancels_a_pending_branch_target() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2"]));
+        let mut s = editor_for(&store, &id);
+        s.begin_branch();
+        assert!(s.pending_parent.is_some());
+        s.pending_parent = None; // what Up/Down do in the key handler
+        type_step(&mut s, "", "s3");
+        assert!(crate::tree::is_linear(&s.steps));
+    }
+
+    #[test]
+    fn delete_keys_remove_one_step_or_a_whole_branch() {
+        let store = mem();
+        let id = add(&store, &fork());
+        let mut s = editor_for(&store, &id);
+        let a1 = s.steps.iter().position(|d| d.answer == "a1").unwrap();
+
+        s.step_list_state.select(Some(a1));
+        s.delete_selected_step(false); // just a1: a2 moves up under t2
+        assert_eq!(step_answers(&s).len(), 4);
+        let a2 = s.steps.iter().find(|d| d.answer == "a2").unwrap();
+        let t2 = s.steps.iter().find(|d| d.answer == "t2").unwrap();
+        assert_eq!(a2.parent, Some(t2.key));
+
+        let t2_idx = s.steps.iter().position(|d| d.answer == "t2").unwrap();
+        s.step_list_state.select(Some(t2_idx));
+        s.delete_selected_step(true); // t2 and everything below it
+        assert_eq!(step_answers(&s), ["t1"]);
+        assert_eq!(s.step_list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn insert_then_cancel_restores_the_original_chain() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2", "s3"]));
+        let mut s = editor_for(&store, &id);
+        s.step_list_state.select(Some(0));
+        s.insert_step_after_selected();
+        assert_eq!(s.steps.len(), 4);
+        assert!(s.editing_step_idx.is_some());
+        s.commit_step(); // blank answer = cancel
+        assert_eq!(step_answers(&s), ["s1", "s2", "s3"]);
+        assert!(crate::tree::is_linear(&s.steps));
+        assert_eq!(s.steps[1].parent, Some(s.steps[0].key), "s2 re-attached to s1");
+    }
+
+    #[test]
+    fn a_saved_tree_reopens_in_the_editor_in_the_same_shape() {
+        let store = mem();
+        let id = add(&store, &fork());
+        let s = editor_for(&store, &id);
+        assert_eq!(step_answers(&s), ["t1", "t2", "a1", "a2", "b1"]);
+        let rows = crate::tree::outline(&s.steps);
+        assert_eq!(rows[2].branch, Some(false));
+        assert_eq!(rows[4].branch, Some(true));
+        assert_eq!(s.steps[2].name, "A");
+        assert!(s.steps[0].name.is_empty(), "auto label is not shown as a name");
     }
 }

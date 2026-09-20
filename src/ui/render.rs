@@ -1289,7 +1289,8 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
         (filtered.len() as u16 + 2).min(6)
     } else { 0 };
 
-    let steps_h = 6;
+    // room for branching outlines
+    let steps_h = 8;
     //  heading + deck + sugg + question + step_name + step_ans + add_btn + steps_list
     //  + show_chain + daily + tags + save + hint
     let total_h: u16 = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + steps_h + 3 + 3 + 3 + 3 + 1;
@@ -1369,9 +1370,14 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
     );
     clicks.push((v[3], ClickTarget::AddCardField(1)));
 
+    // say where the step being typed will attach (after / under / a new path)
+    let name_title = match s.attach_hint() {
+        Some(h) => format!(" Step Name  (optional)  →  {h} "),
+        None    => " Step Name  (optional, leave blank for 'Step N') ".to_string(),
+    };
     f.render_widget(
         Paragraph::new(with_cursor(&s.step_name_buf, s.focused == 2))
-            .block(field_block(" Step Name  (optional, leave blank for 'Step N') ", s.focused == 2))
+            .block(field_block(name_title.as_str(), s.focused == 2))
             .style(text_style(s.focused == 2)),
         v[4],
     );
@@ -1406,28 +1412,40 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         ))]
     } else {
+        // a plain chain reads normally 1 -> 2 -> 3
+        // a step that is one of several siblings is drawn as a branch and indented
+        // and the numbering is the steps place along ITS path (step N)
+        let rows = crate::tree::outline(&s.steps);
         s.steps.iter().enumerate()
-            .map(|(i, (name, answer, _))| {
-                let prefix = if Some(i) == s.editing_step_idx { " ✎ " } else { "  " };
-                let label = if name.trim().is_empty() {
-                    format!("{prefix}{}. {}", i + 1, answer)
+            .map(|(i, d)| {
+                let row = &rows[i];
+                let editing = Some(i) == s.editing_step_idx;
+                let marker = if editing { " ✎ " } else { "  " };
+                let first_line = d.answer.lines().next().unwrap_or("");
+                let text = if d.name.trim().is_empty() {
+                    format!("{}. {}", row.step_no, first_line)
                 } else {
-                    format!("{prefix}{}. [{}]  {}", i + 1, name, answer)
+                    format!("{}. [{}]  {}", row.step_no, d.name, first_line)
                 };
-                ListItem::new(Line::from(Span::styled(
-                    label,
-                    if Some(i) == s.editing_step_idx {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default().fg(Color::Green)
-                    },
-                )))
+                let style = if editing {
+                    Style::default().fg(Color::Yellow)
+                } else if row.branch.is_some() {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(marker, style),
+                    // rails are dimmed so the eye follows the text, not the lines
+                    Span::styled(row.guide.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(text, style),
+                ]))
             })
             .collect()
     };
 
     let list_title = if s.focused == 5 {
-        format!(" Steps ({})  [Enter] edit  [i] insert after  [d] delete ", s.steps.len())
+        format!(" Steps ({})  [Enter] edit  [i] insert  [b] branch  [r] new path  [d] del  [D] del+below ", s.steps.len())
     } else {
         format!(" Steps ({}) ", s.steps.len())
     };
@@ -2047,4 +2065,158 @@ pub(super) fn render_import(f: &mut Frame, app: &mut AppState, clicks: &mut Clic
         )
     };
     f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), v[3]);
+}
+
+// ~~~ Tests ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Store;
+    use crate::models::{SessionLimits, StepDraft};
+    use crate::ui::state::{AddCardState, ReviewState, Screen};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn draft(key: u32, parent: Option<u32>, name: &str, answer: &str) -> StepDraft {
+        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None }
+    }
+
+    fn dump(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let w = buf.area.width as usize;
+        buf.content()
+            .chunks(w)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn fork_store() -> (Store, String) {
+        let store = Store::open(":memory:").unwrap();
+        let drafts = vec![
+            draft(0, None, "", "Pick a storage device"),
+            draft(1, Some(0), "SSD", "Fast random reads"),
+            draft(2, Some(1), "", "Costs more per GB"),
+            draft(3, Some(0), "HDD", "Cheap capacity"),
+        ];
+        let id = store
+            .add_multi_card("Hardware", "Justify a storage choice", &drafts, true, &ReviewMode::SpacedRepetition)
+            .unwrap();
+        (store, id)
+    }
+
+    #[test]
+    fn editor_draws_branches_as_an_outline_and_shows_where_the_next_step_goes() {
+        let (store, id) = fork_store();
+        let mut app = AppState::new(&store);
+        let card = store.load_card(&id).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let mut s = AddCardState::for_edit(&card, &items, vec![], vec![]);
+        s.focused = 5; // the steps list
+        s.step_list_state.select(Some(1)); // SSD
+        s.begin_branch(); // -> Step Name, "new branch under 2. [SSD]"
+        app.add_card = Some(s);
+        app.screen = Screen::AddCard;
+
+        let mut term = Terminal::new(TestBackend::new(110, 50)).unwrap();
+        let mut clicks = Vec::new();
+        term.draw(|f| render_add_card(f, &mut app, &mut clicks)).unwrap();
+        let out = dump(&term);
+        println!("{out}");
+
+        assert!(out.contains("├─ 2. [SSD]  Fast random reads"), "SSD drawn as a branch");
+        assert!(out.contains("└─ 2. [HDD]  Cheap capacity"), "HDD drawn as the last branch");
+        assert!(out.contains("3. Costs more per GB"), "chain continuation keeps its step number");
+        assert!(out.contains("→  new branch under 2. SSD"), "attach hint on the Step Name box");
+    }
+
+    #[test]
+    fn editor_draws_two_root_paths_and_a_nested_fork_with_connected_rails() {
+        // the card from a real bug report: two top-level paths, and the first
+        // one forks again under its step 2
+        let store = Store::open(":memory:").unwrap();
+        let drafts = vec![
+            draft(0, None, "step one", "hi hi"),
+            draft(1, Some(0), "step two", "answer to step 2"),
+            draft(2, Some(1), "branch one", "hi branch of step 2"),
+            draft(3, Some(1), "branch two", "second branch going from step 2"),
+            draft(4, None, "alternative path", "alternate pathway from step 1"),
+            draft(5, Some(4), "continues", "extra step from the alternative"),
+        ];
+        let id = store
+            .add_multi_card("D", "Q", &drafts, true, &ReviewMode::SpacedRepetition)
+            .unwrap();
+        let mut app = AppState::new(&store);
+        let card = store.load_card(&id).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let mut s = AddCardState::for_edit(&card, &items, vec![], vec![]);
+        s.focused = 5;
+        app.add_card = Some(s);
+        app.screen = Screen::AddCard;
+
+        let mut term = Terminal::new(TestBackend::new(110, 60)).unwrap();
+        let mut clicks = Vec::new();
+        term.draw(|f| render_add_card(f, &mut app, &mut clicks)).unwrap();
+        let out = dump(&term);
+        let list: Vec<&str> = out.lines().filter(|l| l.contains("│") ).collect();
+        println!("{out}");
+
+        // every row that sits under path A carries the rail, the second path closes it
+        assert!(out.contains("┌─ 1. [step one]"), "first alternative opens the bracket");
+        assert!(out.contains("│  2. [step two]"), "rail continues down the chain");
+        assert!(out.contains("│  ├─ 3. [branch one]"), "nested branch hangs off the rail");
+        assert!(out.contains("│  └─ 3. [branch two]"), "last nested branch closes");
+        assert!(out.contains("└─ 1. [alternative path]"), "second alternative closes the bracket");
+        assert!(out.contains("   2. [continues]"), "no rail after the last path's head");
+        let _ = list;
+    }
+
+    #[test]
+    fn editor_still_draws_a_plain_chain_like_before() {
+        let store = Store::open(":memory:").unwrap();
+        let drafts: Vec<StepDraft> = (0..3)
+            .map(|i| draft(i, if i == 0 { None } else { Some(i - 1) }, "", &format!("answer {i}")))
+            .collect();
+        let id = store
+            .add_multi_card("D", "Q", &drafts, true, &ReviewMode::SpacedRepetition)
+            .unwrap();
+        let mut app = AppState::new(&store);
+        let card = store.load_card(&id).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let mut s = AddCardState::for_edit(&card, &items, vec![], vec![]);
+        s.focused = 5;
+        app.add_card = Some(s);
+        app.screen = Screen::AddCard;
+        let mut term = Terminal::new(TestBackend::new(110, 50)).unwrap();
+        let mut clicks = Vec::new();
+        term.draw(|f| render_add_card(f, &mut app, &mut clicks)).unwrap();
+        let out = dump(&term);
+        assert!(out.contains("1. answer 0") && out.contains("2. answer 1") && out.contains("3. answer 2"));
+        assert!(!out.contains("├─") && !out.contains("└─"));
+    }
+
+    #[test]
+    fn review_screen_renders_a_branch_path_with_its_context() {
+        let (store, id) = fork_store();
+        // make the trunk known so the session targets the two branches
+        for a in ["Pick a storage device"] {
+            let it = store.load_items(&id).unwrap().into_iter().find(|i| i.answer == a).unwrap();
+            store.record_review(&it.id, 3, std::time::Duration::from_secs(1), false).unwrap();
+        }
+        let session = store.due_session(None, &SessionLimits::default()).unwrap();
+        assert_eq!(session.len(), 2);
+        let mut app = AppState::new(&store);
+        let mut rs = ReviewState::new(session);
+        rs.item_idx = 1; // on the branch step, trunk shown as context
+        app.review = Some(rs);
+        app.screen = Screen::Review;
+
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut clicks = Vec::new();
+        term.draw(|f| render_review(f, &app, &mut clicks)).unwrap();
+        let out = dump(&term);
+        println!("{out}");
+        assert!(out.contains("Justify a storage choice"));
+        assert!(out.contains("SSD"), "the branch name tells the learner which path they are on");
+    }
 }

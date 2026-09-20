@@ -416,6 +416,7 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                 let i = s.step_list_state.selected().map_or(0, |i| (i + 1).min(n - 1));
                 s.step_list_state.select(Some(i));
             }
+            s.pending_parent = None;
         }
         KeyCode::Up if is_steps_list => {
             let s = app.add_card.as_mut().unwrap();
@@ -424,20 +425,23 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                 let i = s.step_list_state.selected().map_or(n.saturating_sub(1), |i| i.saturating_sub(1));
                 s.step_list_state.select(Some(i));
             }
+            s.pending_parent = None;
         }
+        // [d] removes just the selected step (its children move up),
+        // [D] removes the step and everything below it
         KeyCode::Char('d') | KeyCode::Delete if is_steps_list => {
-            let s = app.add_card.as_mut().unwrap();
-            if let Some(i) = s.step_list_state.selected() {
-                if i < s.steps.len() {
-                    s.steps.remove(i);
-                    let n = s.steps.len();
-                    if n == 0 {
-                        s.step_list_state.select(None);
-                    } else if i >= n {
-                        s.step_list_state.select(Some(n - 1));
-                    }
-                }
-            }
+            app.add_card.as_mut().unwrap().delete_selected_step(false);
+        }
+        KeyCode::Char('D') if is_steps_list => {
+            app.add_card.as_mut().unwrap().delete_selected_step(true);
+        }
+        // [b] next step becomes a child of the selected one (a new branch if it
+        // already has children) [r] step starts a new top-level path from the root question
+        KeyCode::Char('b') if is_steps_list => {
+            app.add_card.as_mut().unwrap().begin_branch();
+        }
+        KeyCode::Char('r') if is_steps_list => {
+            app.add_card.as_mut().unwrap().begin_root_path();
         }
         KeyCode::Tab => {
             let s = app.add_card.as_mut().unwrap();
@@ -474,10 +478,11 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
             let s = app.add_card.as_mut().unwrap();
             if let Some(idx) = s.step_list_state.selected() {
                 if idx < s.steps.len() {
-                    let (name, answer, img) = s.steps[idx].clone();
-                    s.step_name_buf    = name;
-                    s.step_buf         = answer;
-                    s.step_image_path  = img;
+                    let d = s.steps[idx].clone();
+                    s.step_name_buf    = d.name;
+                    s.step_buf         = d.answer;
+                    s.step_image_path  = d.image;
+                    s.pending_parent   = None;
                     s.editing_step_idx = Some(idx);
                     s.focused          = 2; // jump to Step Name field
                 }
@@ -536,15 +541,11 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                             // return to the review session and patch the live card
                             app.screen = Screen::Review;
                             if let (Some(rs), Some(id)) = (app.review.as_mut(), edited_card_id) {
-                                // reload the card from DB and update whichever slot in
-                                // the session matches, so review_mode are current
-                                if let Ok(fresh_card) = app.store.load_card(&id) {
-                                    for rc in rs.session.iter_mut() {
-                                        if rc.card.id == id {
-                                            rc.card = fresh_card.clone();
-                                        }
-                                    }
-                                }
+                                // reload the card AND its steps from the DB and rebuild
+                                // every unfinished path of it in the session, the edit may
+                                // have added, deleted or moved steps, and a queued path
+                                // naming a deleted step would fail when rated (hence reloading)
+                                let _ = rs.refresh_card(app.store, &id);
                             }
                         } else {
                             app.go_back();
