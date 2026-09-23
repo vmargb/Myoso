@@ -249,7 +249,8 @@ impl Store {
         let now = Utc::now();
         let ts = now.to_rfc3339();
 
-        let tx = self.conn.unchecked_transaction().context("begin add multi card")?;
+        // joins the callers transaction if one is open (bulk import) or else makes its own
+        let tx = self.begin_if_needed().context("begin add multi card")?;
         self.conn
             .execute_batch("PRAGMA defer_foreign_keys = ON;")
             .context("defer foreign keys")?;
@@ -261,13 +262,24 @@ impl Store {
             )
             .context("insert multi card")?;
         self.write_step_drafts(&card_id, &drafts, &HashSet::new(), now)?;
-        tx.commit().context("commit add multi card")?;
+        if let Some(tx) = tx {
+            tx.commit().context("commit add multi card")?;
+        }
         Ok(card_id)
     }
 
-    /// insert / update the step rows of one card from prepared drafts
-    /// returns the ids of every step row that now belongs to the card
-    /// must run inside a transaction with `defer_foreign_keys = ON`
+    /// Start a transaction unless one is already open, so a function that wants
+    /// to be atomic can also be called from inside a bigger atomic operation
+    fn begin_if_needed(&self) -> Result<Option<rusqlite::Transaction<'_>>> {
+        if self.conn.is_autocommit() {
+            Ok(Some(self.conn.unchecked_transaction()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Insert / update the step rows of one card from prepared drafts
+    /// Returns the ids of every step row that now belongs to the card
     fn write_step_drafts(
         &self,
         card_id: &str,
@@ -512,6 +524,53 @@ impl Store {
         Ok(session)
     }
 
+    /// build a cram session: every card in `deck` scope, completely ignoring
+    /// `due_at` / review mode / session caps. record review is completely skipped
+    pub fn cram_session(&self, deck: Option<&str>) -> Result<Vec<ReviewCard>> {
+        let filter = deck.unwrap_or("");
+        let cards  = self.load_cards_for_session(filter)?;
+        self.build_cram_session(cards)
+    }
+
+    /// Same as `cram_session`, but scoped to an explicit set of card ids
+    /// rather than a deck, such as whatever the All Cards screens search box
+    /// and tag filter currently have on screen.
+    pub fn cram_session_for_ids(&self, card_ids: &[String]) -> Result<Vec<ReviewCard>> {
+        let mut cards = Vec::with_capacity(card_ids.len());
+        for id in card_ids {
+            if let Ok(card) = self.load_card(id) {
+                cards.push(card);
+            }
+        }
+        self.build_cram_session(cards)
+    }
+
+    fn build_cram_session(&self, cards: Vec<Card>) -> Result<Vec<ReviewCard>> {
+        let mut session = Vec::new();
+        for card in cards {
+            let items = self.load_items(&card.id)?;
+            if items.is_empty() { continue; }
+
+            let paths: Vec<Vec<Item>> = match card.kind {
+                CardKind::Multi => {
+                    let tree = StepTree::new(card.is_tree, &items);
+                    tree.leaf_paths()
+                        .into_iter()
+                        .map(|p| p.into_iter().map(|i| tree.item(i).clone()).collect())
+                        .collect()
+                }
+                CardKind::Simple => vec![items],
+            };
+
+            for path in paths {
+                session.push(ReviewCard { card: card.clone(), items: path });
+            }
+        }
+
+        session.shuffle(&mut rng());
+        Ok(session)
+    }
+
     /// Load all cards in `filter` scope, ordered by creation time.
     fn load_cards_for_session(&self, filter: &str) -> Result<Vec<Card>> {
         let mut stmt = self
@@ -547,8 +606,16 @@ impl Store {
             })
             .context("query cards for session")?;
 
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("collect cards for session")
+        let mut cards = rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect cards for session")?;
+
+        // the query above doesn't join card_tags, so every row comes back
+        // with tags: vec![] fill them in per card
+        for card in &mut cards {
+            card.tags = self.get_card_tags(&card.id)?;
+        }
+
+        Ok(cards)
     }
 
     // re-check a single card after a rating, returns a ReviewCard for every path
@@ -590,7 +657,7 @@ impl Store {
     }
 
     pub fn load_card(&self, card_id: &str) -> Result<Card> {
-        self.conn
+        let mut card = self.conn
             .query_row(
                 "SELECT id,deck,kind,question,reversible,show_chain,created_at,updated_at,review_mode,is_tree
                 FROM cards WHERE id=?1",
@@ -618,7 +685,11 @@ impl Store {
                     })
                 },
             )
-            .context("load card")
+            .context("load card")?;
+        // same as load_cards_for_session, this query doesn't join
+        // card_tags, so fill tags in separately
+        card.tags = self.get_card_tags(card_id)?;
+        Ok(card)
     }
 
     // ~~ Review recording ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1060,8 +1131,7 @@ impl Store {
         let now = Utc::now();
 
         for s in &summaries {
-            let mut card = self.load_card(&s.card_id)?;
-            card.tags = self.get_card_tags(&s.card_id)?;
+            let card = self.load_card(&s.card_id)?;
             let mut items = self.load_items(&s.card_id)?;
             if reset_metadata {
                 for item in &mut items {
