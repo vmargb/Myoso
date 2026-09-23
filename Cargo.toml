@@ -33,3 +33,5 @@ syntect = "5"
 # open image previews
 open = "5"
 rand = "0.10"
+# cross-platform absolute directory handling
+directories = "5"
