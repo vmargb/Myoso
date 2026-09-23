@@ -4,6 +4,7 @@ mod scheduler;
 mod ui;
 mod markdown;
 mod tree;
+mod outline;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -11,6 +12,18 @@ use std::process::Command;
 use std::path::PathBuf;
 
 use db::Store;
+use directories::ProjectDirs;
+
+fn default_db_path() -> PathBuf {
+    if let Some(proj) = ProjectDirs::from("dev", "vmargb", "myoso") {
+        let dir = proj.data_dir();
+        let _ = std::fs::create_dir_all(dir); // ensure it exists
+        dir.join("flashcards.db")
+    } else {
+        // fallback if the OS gives us nothing (rare), stay relative
+        PathBuf::from("flashcards.db")
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -19,8 +32,8 @@ use db::Store;
     version
 )]
 struct Cli {
-    #[arg(long, default_value = "flashcards.db", global = true)]
-    db: PathBuf, // path to sqlite
+    #[arg(long, global = true)]
+    db: Option<PathBuf>, // path to sqlite
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -40,8 +53,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let db_path = cli.db.to_string_lossy().to_string();
-    let store = Store::open(&db_path)?;
+    let db_path = cli.db.unwrap_or_else(default_db_path);
+    let store = Store::open(&db_path.to_string_lossy())?;
     ui::run_tui(&store)?;
     Ok(())
 }
