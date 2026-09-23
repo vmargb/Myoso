@@ -124,6 +124,11 @@ pub struct ReviewState {
     pub scratchpad:        String, // feynman technique
     pub scratchpad_open:   bool,
     pub focus:             ReviewFocus,
+    // cram ignores the schedule entirely: `rate()` never calls `Store::record_review`
+    pub cram:              bool, // cram mode
+    // cram-only: how many items were skipped rather than answered, for the
+    // end-of-session summary. Always 0 outside cram mode.
+    pub skipped_items:     usize,
 }
 
 impl ReviewState {
@@ -146,7 +151,17 @@ impl ReviewState {
             scratchpad: String::new(),
             scratchpad_open: false,
             focus: ReviewFocus::Card,
+            cram: false,
+            skipped_items: 0,
         }
+    }
+
+    /// Build a cram session (`Store::cram_session`). Everything else
+    /// about `ReviewState` behaves the same.
+    pub fn new_cram(session: Vec<ReviewCard>) -> Self {
+        let mut rs = Self::new(session);
+        rs.cram = true;
+        rs
     }
 
     pub fn is_done(&self) -> bool {
@@ -287,6 +302,13 @@ impl ReviewState {
     pub fn rate(&mut self, store: &Store, confidence: u8) -> anyhow::Result<()> {
         // ignore rating input while a blocking leech intervention, or the
         if self.is_done() || self.leech_prompt.is_some() || self.weak_span_prompt.is_some() {
+            return Ok(());
+        }
+
+        // press [1]-[4] here and the card comes back without stage change
+        if self.cram {
+            self.done_items += 1;
+            self.advance();
             return Ok(());
         }
 
@@ -440,6 +462,27 @@ impl ReviewState {
         Ok(())
     }
 
+    /// Cram-only: skip the whole card (every remaining step of the current
+    /// path, if it's a multi-step one) and move on, without rating anything.
+    pub fn skip(&mut self) {
+        if !self.cram || self.is_done() {
+            return;
+        }
+        let remaining = self.session[self.card_idx].items.len() - self.item_idx;
+        self.skipped_items += remaining;
+
+        self.card_idx += 1;
+        self.item_idx = 0;
+        self.phase = ReviewPhase::Thinking;
+        self.item_started_at = Instant::now();
+        self.answer_scroll = 0;
+        self.clear_scratchpad();
+
+        if self.is_done() && self.finished_duration.is_none() {
+            self.finished_duration = Some(self.started_at.elapsed());
+        }
+    }
+
     pub fn advance(&mut self) {
         let prev_card_idx = self.card_idx;
         self.item_idx += 1;
@@ -465,7 +508,9 @@ impl ReviewState {
         if self.total_items == 0 {
             1.0
         } else {
-            self.done_items as f64 / self.total_items as f64
+            // a skip still moves the cursor forward
+            let numerator = self.done_items + self.skipped_items;
+            numerator as f64 / self.total_items as f64
         }
     }
 
