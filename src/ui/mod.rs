@@ -293,6 +293,10 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 r.rate(store, c as u8 - b'0')?;
             }
         }
+        // Cram-only: move on without rating at all, from either phase
+        KeyCode::Char('s') if !is_done && app.review.as_ref().map_or(false, |r| r.cram) => {
+            if let Some(rs) = app.review.as_mut() { rs.skip(); }
+        }
         KeyCode::Char('j') | KeyCode::Down => {
             if let Some(rs) = app.review.as_mut() {
                 rs.answer_scroll = rs.answer_scroll.saturating_add(1);
@@ -866,6 +870,19 @@ fn on_list_cards(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
             }
         }
 
+        // Cram exactly whats currently on screen: whatever the search
+        // query and tag filter have narrowed the list down to.
+        KeyCode::Char('c') => {
+            let ids: Vec<String> = app.list_cards.as_ref()
+                .map(|lc| lc.filtered_cards().iter().map(|c| c.card_id.clone()).collect())
+                .unwrap_or_default();
+            if !ids.is_empty() {
+                let session = app.store.cram_session_for_ids(&ids)?;
+                app.review = Some(ReviewState::new_cram(session));
+                app.go_to(Screen::Review);
+            }
+        }
+
         KeyCode::Char('m') => {
             let result = app.list_cards.as_ref().and_then(|lc| {
                 let filtered = lc.filtered_cards();
@@ -1011,6 +1028,16 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 app.go_to(Screen::ListCards);
             }
         }
+        KeyCode::Char('c') => {
+            // Deck-scoped cram: every card under this deck (and its sub-decks)
+            let deck = app.list_decks.as_ref()
+                .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
+            if let Some(deck) = deck {
+                let session = app.store.cram_session(Some(&deck))?;
+                app.review = Some(ReviewState::new_cram(session));
+                app.go_to(Screen::Review);
+            }
+        }
         KeyCode::Char('M') => {
             let deck = app.list_decks.as_ref()
                 .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
@@ -1137,8 +1164,13 @@ fn on_import(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
     // [b] browse open native open-file dialog regardless of focus
     if code == KeyCode::Char('b') {
         let _ = disable_raw_mode();
+        // let picked = FileDialog::new()
+        //     .add_filter("Deck files", &["json", "jsonl", "txt"])
+        //     .pick_file();
         let picked = FileDialog::new()
             .add_filter("JSON", &["json"])
+            .add_filter("JSON Lines", &["jsonl"])
+            .add_filter("Text", &["txt"])
             .pick_file();
         let _ = enable_raw_mode();
         if let Some(p) = picked {
