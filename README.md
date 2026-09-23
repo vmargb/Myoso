@@ -27,15 +27,19 @@
 
 ## What is it?
 
-Ordinary flashcard apps are great for 1:1 facts and definitions but struggle with *long chain of thought* or
-**Step-by-step knowledge**:
-- "What are all the verb endings in past tense?"
-- "how do you reverse a linked list?"
-- "walk me through this derivation".
+Ordinary flashcard apps are great for one-to-one facts and definitions, but they struggle with long chains of thought: "What are all the verb endings in the past tense?", "How do you reverse a linked list?", "Walk me through this derivation". You *can* squeeze these into normal cards with one retrieval step, but this requires too much to hold in your head at once, and a deck with hundreds of these heavy cards quickly becomes unsustainable and impossible to maintain long-term.
 
-Standard flashcard *can* be used in this way, but wind up becoming **heavy**, carrying too much mental load. A deck with hundreds(or thousands) of these *heavy* cards quickly become unsustainable to maintain long-term.
+Myoso fixes this by modelling your answer as an ordered sequence of retrieval steps. During review you reveal and rate each step individually, where later steps unlock once the earlier ones are recalled well. If you forget an early step, the ones after it is blocked again until you rebuild the chain. This reinforces the whole procedural flow, rather than memorising isolated / separated fragments the way a normal flashcard do.
 
-Myoso fixes this problem by modellling your answer as an ordered sequence of steps. During review, you **reveal and rate each step** individually, unlocking later steps only after earlier ones are recalled well. Likewise, forgetting an *earlier* step naturally blocks access to the subsequent steps until you **rebuild the chain again**. This reinforces the full procedural flow, rather than merely memorising isolated bits as normal flashcards would do.
+### Branching paths
+
+An answer(or chain of thought) can have multiple routes.
+
+Instead of writing the question twice, you can give it several banching paths. Each path is its own sequence of steps, and every one of them comes back for review on its own schedule.
+
+Paths can also **fork** in the *middle* of a chain. Any step can split apart into different branches midway, so a card grows into a small *tree of thought*, with a shared trunk of reasoning that forks wherever the problem can genuinely go more than one way. Branches stay independent of each other, forgetting a step in one branch only blocks what sits beneath it, so struggling with path A never resets path B.
+
+In the card editor, press `b` on a **step** to start a new branch beneath it and `r` to start a whole new path from the question itself. Press `d` to remove the selected step (anything below it moves up) or `D` to remove it together with everything beneath it. When a step has several branches, each one needs a name so you can tell which direction you are going during review.
 
 ---
 
@@ -61,6 +65,9 @@ After installation, run:
 myoso
 ```
 
+> [!WARNING]
+> Myoso used to open(and create) `flashcards.db` in whatever directory you ran `myoso` from, not in a fixed location. Which would operate on different, unsynced databases. You now run an old path with `myoso --db /path/to/flashcards.db`, to continue using your old decks.
+
 ## Updating
 
 To update to the latest version:
@@ -84,21 +91,23 @@ cargo run
 
 ---
 
-## Features
-
-Myoso keeps simple things simple. A plain card can be made reversible so that question -> answer also works as answer -> question, and a step-by-step card lets you rate every step individually. When you want to see how you are doing, the analytics screen shows statistics for your decks and cards and what is currently due.
-
-Cards are organised with decks, and decks can be split into sub-decks such as vocabulary and grammar, while tags let you filter and search across them. Answers and steps support full markdown, including bold, italics and lists, and code blocks are syntax-highlighted for any programming language. If your working is on paper, you can attach the path of a local image, such as a handwritten derivation or a screenshot, to any answer or step and see it during review.
-
-Writing long answers in a tiny text box is painful, so any text box can be opened in your default editor, whether that is Neovim, VS Code or Notepad. Close the editor and you land back in the app with your updated text. Decks can be exported to JSON, either one at a time or all together and imported by anyone else. For the times you want to test yourself before peeking, an optional Feynman step asks you to explain the answer in your own words before revealing it, so you can compare the two.
-
-### Daily cards
+## Daily cards and Cram mode
 
 Spaced-repetition isn't everything, some cards require more attention than others,
-like the most essential cards in your upcoming exam.
+like the most essential cards for an upcoming exam.
 You can mark new cards as daily or move existing SRS cards into your dailies to have them
 shown in every review session once per day, bypassing any scheduling applied to them.
 Once the demand is gone(e.g. after the exam), you can move those cards back into SRS.
+
+You can also use the **cram** feature on a deck or a filtered search to get through as many cards
+as possible in a day, just in case you don't have enough time to benefit from Spaced-repetition.
+
+
+## Generating decks with AI
+
+You can ask an AI to write a whole deck for you. Myoso imports a compact "outline" format that holds only the content of your cards: a question with an answer, a list of steps, and named branches wherever the reasoning forks. There are no ids or scheduling data for the AI to get wrong, and Myoso builds the chains and branches itself when you import. Simply ask the AI for a map of the subject first and then for one deck at a time. A ready-made prompt for both stages lives in [`docs/ai-deck-prompt.md`](docs/ai-deck-prompt.md), next to a sample deck in [`docs/example-c-deck.jsonl`](docs/example-c-deck.jsonl).
+
+Import the file from the menu like any other. Myoso will recognize the format on its own, skips cards you already have, imports everything that is valid, and shows what was rejected. The full list of rejected cards is saved next to your file, so you can hand it straight back to the AI to fix.
 
 ---
 
