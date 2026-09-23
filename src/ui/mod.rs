@@ -19,8 +19,9 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use rfd::FileDialog;
 
-use crate::db::Store;
+use crate::db::{ImportOutcome, Store};
 use crate::models::{ReviewMode, SessionLimits};
+use crate::outline::OutlineSummary;
 
 use state::{
     AddCardState, AddKind, AddPhase, AppState, ClickTarget, ExportFocus, ImportFocus,
@@ -1175,17 +1176,30 @@ fn on_import(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 Err(e) => {
                     app.import.as_mut().unwrap().status = Some(format!("✗  {e}"));
                 }
-                Ok(bytes) => match app.store.import_json(&bytes) {
+                // a myoso export and an AI-written outline are told apart automatically
+                Ok(bytes) => match app.store.import_auto(&bytes) {
                     Err(e) => {
-                        app.import.as_mut().unwrap().status = Some(format!("✗  {e}"));
+                        app.import.as_mut().unwrap().status = Some(format!("✗  {e:#}"));
                     }
-                    Ok(summary) => {
+                    Ok(ImportOutcome::Export(summary)) => {
                         app.import.as_mut().unwrap().status = Some(format!(
                             "✓  {} card(s) added, {} replaced, {} item(s) total",
                             summary.cards_imported,
                             summary.cards_replaced,
                             summary.items_imported,
                         ));
+                    }
+                    Ok(ImportOutcome::Outline(summary)) => {
+                        // keep the full list of problems next to the file so it can be
+                        // pasted back to the AI  so it can "fix these cards"
+                        let report_path = if summary.errors.is_empty() {
+                            None
+                        } else {
+                            let rp = format!("{path}.errors.txt");
+                            std::fs::write(&rp, summary.error_report()).ok().map(|_| rp)
+                        };
+                        app.import.as_mut().unwrap().status =
+                            Some(outline_status(&summary, report_path.as_deref()));
                     }
                 },
             }
@@ -1194,6 +1208,29 @@ fn on_import(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// How many skipped cards are listed on the import screen (the rest go in the report)
+const IMPORT_ERRORS_SHOWN: usize = 6;
+
+/// Text for the import screen after an outline import. The first line is the
+/// headline the rest are the cards that were skipped
+fn outline_status(summary: &OutlineSummary, report_path: Option<&str>) -> String {
+    let mut lines = vec![summary.headline()];
+    let n = summary.errors.len();
+    if n > 0 {
+        lines.push(format!("⚠  {n} card(s) skipped:"));
+        for e in summary.errors.iter().take(IMPORT_ERRORS_SHOWN) {
+            lines.push(format!("   {e}"));
+        }
+        if n > IMPORT_ERRORS_SHOWN {
+            lines.push(format!("   …and {} more", n - IMPORT_ERRORS_SHOWN));
+        }
+        if let Some(rp) = report_path {
+            lines.push(format!("   full list saved to {rp}"));
+        }
+    }
+    lines.join("\n")
 }
 
 // ~~~ Mouse handlers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

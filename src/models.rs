@@ -297,7 +297,7 @@ pub struct Stats {
 /// `key` is an editor-local identity used only to express `parent` inside
 /// the slice. `db_id` is the existing `items.id` when editing (so SRS state
 /// follows the step, not its position) and `None` for steps that are new
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StepDraft {
     pub key:    u32,
     pub db_id:  Option<String>,
