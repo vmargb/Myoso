@@ -10,9 +10,16 @@ use uuid::Uuid;
 
 use crate::models::*;
 use crate::scheduler;
+use crate::outline::{self, Body, OutlineSummary};
 use crate::tree::{self, StepTree};
 
 // ~~~ Store ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// Result of `Store::import_auto`
+pub enum ImportOutcome {
+    Export(ImportSummary),
+    Outline(OutlineSummary),
+}
 
 pub struct Store {
     conn: Connection,
@@ -1223,6 +1230,82 @@ impl Store {
         Ok(summary)
     }
 
+    // ~~ Outline import (see outline.rs)
+
+    /// Import cards written in the compact outline format (typically AI-generated)
+    ///
+    /// Cards that can't be read are skipped and reported in `errors`, the rest
+    /// are imported 
+    pub fn import_outline(&self, text: &str) -> Result<OutlineSummary> {
+        let parsed = outline::parse(text);
+        let mut summary = OutlineSummary { errors: parsed.errors, ..Default::default() };
+
+        let mut seen: HashSet<(String, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT deck, question FROM cards")
+                .context("prepare existing cards")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .context("query existing cards")?;
+            let mut set = HashSet::new();
+            for row in rows {
+                let (deck, question) = row.context("read existing card")?;
+                set.insert(outline::dup_key(&deck, &question));
+            }
+            set
+        };
+
+        let mut decks: std::collections::BTreeSet<String> = Default::default();
+        let tx = self.conn.unchecked_transaction().context("begin outline import")?;
+
+        for card in parsed.cards {
+            if !seen.insert(outline::dup_key(&card.deck, &card.question)) {
+                summary.duplicates_skipped += 1;
+                continue;
+            }
+            let mode = ReviewMode::SpacedRepetition;
+            let id = match &card.body {
+                Body::Simple { answer, reversible } => {
+                    summary.simple_cards += 1;
+                    summary.steps_imported += 1;
+                    self.add_simple_card(&card.deck, &card.question, answer, *reversible, None, &mode)
+                }
+                Body::Chain { steps } => {
+                    if tree::is_linear(steps) {
+                        summary.chain_cards += 1;
+                    } else {
+                        summary.branching_cards += 1;
+                    }
+                    summary.steps_imported += steps.len();
+                    self.add_multi_card(&card.deck, &card.question, steps, true, &mode)
+                }
+            }
+            .with_context(|| format!("import card \"{}\"", card.question))?;
+
+            if !card.tags.is_empty() {
+                self.set_card_tags(&id, &card.tags)?;
+            }
+            decks.insert(card.deck.clone());
+            summary.cards_imported += 1;
+        }
+
+        tx.commit().context("commit outline import")?;
+        summary.decks = decks.len();
+        Ok(summary)
+    }
+
+    /// Import a file in either format: a Myoso export (`{"cards": [...]}`) or an
+    /// outline (one card per JSON object)
+    pub fn import_auto(&self, data: &[u8]) -> Result<ImportOutcome> {
+        let text = std::str::from_utf8(data).context("the file is not valid UTF-8 text")?;
+        if outline::looks_like_export(text) {
+            Ok(ImportOutcome::Export(self.import_json(data)?))
+        } else {
+            Ok(ImportOutcome::Outline(self.import_outline(text)?))
+        }
+    }
+
     // ~~ Editing ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     /// Update an existing simple card's content in-place.
@@ -2020,7 +2103,177 @@ mod tests {
         assert_eq!(answers(&next[0].items), ["s1", "s2"]);
     }
 
-    // ~~ upgrading a database created before this feature
+    // ~~ outline import (AI-generated decks) ~~
+
+    const OUTLINE: &str = r#"
+{"deck":"C::Pointers","question":"What does *p++ do?","answer":"Reads *p, then advances p.","tags":["Pointers","syntax"],"reversible":true}
+{"deck":"C::Memory","question":"Heap lifecycle?","steps":["malloc + NULL check",{"answer":"use it","branches":[{"name":"Grow","steps":["realloc, keep the returned pointer"]},{"name":"Done","steps":["free once","p = NULL"]}]}],"tags":["heap"]}
+{"deck":"C::Memory","question":"Order of a stack frame teardown?","steps":["restore callee-saved regs","pop the frame","return"]}
+{"deck":"Systems","question":"SSD or HDD for video editing?","paths":[{"name":"SSD","steps":["random-read speed suits scrubbing"]},{"name":"HDD","steps":["cheap capacity suits archives"]}]}
+"#;
+
+    fn tags_of(store: &Store, id: &str) -> Vec<String> {
+        store.get_card_tags(id).unwrap()
+    }
+
+    fn card_by_question(store: &Store, q: &str) -> CardSummary {
+        store.list_cards(None).unwrap().into_iter().find(|c| c.question == q)
+            .unwrap_or_else(|| panic!("no card {q}"))
+    }
+
+    #[test]
+    fn outline_import_creates_simple_chain_and_branching_cards() {
+        let store = mem();
+        let s = store.import_outline(OUTLINE).unwrap();
+        assert!(s.errors.is_empty(), "{:?}", s.errors);
+        assert_eq!(s.cards_imported, 4);
+        assert_eq!((s.simple_cards, s.chain_cards, s.branching_cards), (1, 1, 2));
+        assert_eq!(s.steps_imported, 1 + 5 + 3 + 2);
+        assert_eq!(s.decks, 3);
+        assert!(s.headline().starts_with("✓  4 card(s) added to 3 deck(s)"));
+
+        // simple, reversible: forward + reverse items, tags lowercased
+        let simple = card_by_question(&store, "What does *p++ do?");
+        assert_eq!(store.load_items(&simple.card_id).unwrap().len(), 2);
+        assert_eq!(tags_of(&store, &simple.card_id), ["pointers", "syntax"]);
+
+        // the fork is a real tree: "use it" has two children
+        let heap = card_by_question(&store, "Heap lifecycle?");
+        let card = store.load_card(&heap.card_id).unwrap();
+        assert!(card.is_tree);
+        assert_eq!(card.deck, "C::Memory");
+        assert_eq!(tags_of(&store, &heap.card_id), ["heap"]);
+        let items = store.load_items(&heap.card_id).unwrap();
+        let use_it = items.iter().find(|i| i.answer == "use it").unwrap();
+        let kids: Vec<&str> = items.iter().filter(|i| i.parent_id.as_deref() == Some(use_it.id.as_str()))
+            .map(|i| i.prompt.as_str()).collect();
+        assert_eq!(kids, ["Grow", "Done"]);
+        assert_eq!(fk_violations(&store), 0);
+        assert!(store.conn.is_autocommit(), "the import transaction was closed");
+    }
+
+    #[test]
+    fn imported_root_paths_are_reviewable_like_hand_made_ones() {
+        let store = mem();
+        store.import_outline(OUTLINE).unwrap();
+        let ssd = card_by_question(&store, "SSD or HDD for video editing?");
+        let session = store.due_session(None, &SessionLimits { max_reviews: 200, new_cards: 200 }).unwrap();
+        let paths: Vec<Vec<&str>> = session.iter()
+            .filter(|rc| rc.card.id == ssd.card_id)
+            .map(|rc| answers(&rc.items)).collect();
+        assert_eq!(paths.len(), 2, "one review path per alternative: {paths:?}");
+    }
+
+    #[test]
+    fn reimporting_skips_duplicates_and_never_touches_existing_progress() {
+        let store = mem();
+        store.import_outline(OUTLINE).unwrap();
+        let heap = card_by_question(&store, "Heap lifecycle?").card_id;
+        rate(&store, &heap, "malloc + NULL check", 3);
+        let before = by_answer(&store, &heap, "malloc + NULL check");
+
+        let again = store.import_outline(OUTLINE).unwrap();
+        assert_eq!(again.cards_imported, 0);
+        assert_eq!(again.duplicates_skipped, 4);
+        assert!(again.headline().starts_with("✓  nothing new"));
+        assert_eq!(store.list_cards(None).unwrap().len(), 4);
+        let after = by_answer(&store, &heap, "malloc + NULL check");
+        assert_eq!((before.id.as_str(), before.stability, before.review_count),
+                   (after.id.as_str(), after.stability, after.review_count));
+    }
+
+    #[test]
+    fn duplicates_ignore_case_spacing_and_cover_hand_made_cards_and_the_same_file() {
+        let store = mem();
+        store.add_simple_card("C::Pointers", "What does *p++ do?", "mine", false, None, &ReviewMode::SpacedRepetition).unwrap();
+        let text = r#"
+{"deck":"c::pointers","question":"what   does *P++ do?","answer":"theirs"}
+{"deck":"D","question":"Same twice","answer":"a"}
+{"deck":"D","question":"same TWICE","answer":"b"}
+"#;
+        let s = store.import_outline(text).unwrap();
+        assert_eq!((s.cards_imported, s.duplicates_skipped), (1, 2));
+        let mine = store.list_cards(None).unwrap().into_iter().find(|c| c.question == "What does *p++ do?").unwrap();
+        assert_eq!(by_answer(&store, &mine.card_id, "mine").answer, "mine", "hand-made card untouched");
+        // the same question in a DIFFERENT deck is a different card
+        let other = store.import_outline(r#"{"deck":"Rust","question":"Same twice","answer":"c"}"#).unwrap();
+        assert_eq!(other.cards_imported, 1);
+    }
+
+    #[test]
+    fn bad_cards_are_reported_and_the_good_ones_still_import() {
+        let store = mem();
+        let text = r#"
+{"deck":"D","question":"good one","answer":"a"}
+{"deck":"D","question":"typo","steps":[{"answer":"x","branch":[]}]}
+{"deck":"D","question":"unnamed forks","paths":[{"name":"A","steps":["a"]},{"steps":["b"]}]}
+{"deck":"D","question":"good two","steps":["a","b"]}
+"#;
+        let s = store.import_outline(text).unwrap();
+        assert_eq!(s.cards_imported, 2);
+        assert_eq!(s.errors.len(), 2);
+        assert_eq!(s.errors.iter().map(|e| e.line).collect::<Vec<_>>(), [3, 4]);
+        let report = s.error_report();
+        assert!(report.contains("line 3 (\"typo\"): steps[0]: unknown field \"branch\""), "{report}");
+        assert!(report.contains("needs a \"name\""), "{report}");
+        assert_eq!(store.list_cards(None).unwrap().len(), 2, "nothing from the bad cards was stored");
+    }
+
+    #[test]
+    fn a_file_of_only_errors_imports_nothing() {
+        let store = mem();
+        let s = store.import_outline("this is not a deck").unwrap();
+        assert_eq!(s.cards_imported, 0);
+        assert_eq!(s.errors.len(), 1);
+        assert!(s.headline().starts_with('✗'));
+    }
+
+    #[test]
+    fn import_auto_recognises_both_formats() {
+        let src = mem();
+        add(&src, &fork_drafts());
+        let export = src.export_json(None, false).unwrap();
+
+        let dst = mem();
+        match dst.import_auto(&export).unwrap() {
+            ImportOutcome::Export(s) => assert_eq!(s.cards_imported, 1),
+            ImportOutcome::Outline(_) => panic!("an export was treated as an outline"),
+        }
+        match dst.import_auto(OUTLINE.as_bytes()).unwrap() {
+            ImportOutcome::Outline(s) => assert_eq!(s.cards_imported, 4),
+            ImportOutcome::Export(_) => panic!("an outline was treated as an export"),
+        }
+        assert!(dst.import_auto(&[0xff, 0xfe, 0x00]).is_err(), "binary junk is a clear error");
+    }
+
+    #[test]
+    fn a_large_generated_deck_imports_quickly_and_sessions_stay_capped() {
+        let store = mem();
+        let mut text = String::new();
+        for i in 0..2000 {
+            if i % 4 == 0 {
+                text.push_str(&format!(
+                    "{{\"deck\":\"Big::Part{}\",\"question\":\"chain {i}\",\"steps\":[\"a\",{{\"answer\":\"b\",\"branches\":[{{\"name\":\"L\",\"steps\":[\"l\"]}},{{\"name\":\"R\",\"steps\":[\"r\"]}}]}}],\"tags\":[\"t{}\"]}}\n",
+                    i % 10, i % 7));
+            } else {
+                text.push_str(&format!("{{\"deck\":\"Big::Part{}\",\"question\":\"q {i}\",\"answer\":\"a {i}\"}}\n", i % 10));
+            }
+        }
+        let t = std::time::Instant::now();
+        let s = store.import_outline(&text).unwrap();
+        let took = t.elapsed();
+        println!("imported {} cards in {took:?}", s.cards_imported);
+        assert_eq!(s.cards_imported, 2000);
+        assert!(s.errors.is_empty());
+        assert!(took.as_secs() < 20, "took {took:?}");
+
+        // your existing new-card cap still protects you from a flood
+        let session = store.due_session(None, &SessionLimits::default()).unwrap();
+        let cards: HashSet<&str> = session.iter().map(|rc| rc.card.id.as_str()).collect();
+        assert_eq!(cards.len(), 20);
+    }
+
+    // ~~ upgrading a database created before this feature ~~
 
     #[test]
     fn opening_a_pre_branching_database_migrates_in_place() {
