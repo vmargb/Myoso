@@ -409,7 +409,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
 
     if rs.is_done() {
         if rs.total_items == 0 {
-            render_nothing_due(f, app, size);
+            render_nothing_due(f, app, size, rs.cram);
         } else {
             render_review_done(f, rs, size);
         }
@@ -429,37 +429,49 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         ])
         .split(size);
 
-    let bar_title = format!(
-        " {}/{} items  •  card {}/{} ",
-        rs.done_items + 1, rs.total_items,
-        rs.card_idx + 1,   rs.session.len(),
-    );
+    let bar_title = if rs.cram {
+        format!(
+            " CRAM  •  {} seen  •  card {}/{} ",
+            rs.done_items + rs.skipped_items + 1,
+            rs.card_idx + 1, rs.session.len(),
+        )
+    } else {
+        format!(
+            " {}/{} items  •  card {}/{} ",
+            rs.done_items + 1, rs.total_items,
+            rs.card_idx + 1,   rs.session.len(),
+        )
+    };
     f.render_widget(
         Gauge::default()
             .block(Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .title(bar_title))
-            .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+            .gauge_style(Style::default().fg(if rs.cram { Color::Magenta } else { Color::Cyan }).bg(Color::DarkGray))
             .ratio(rs.progress()),
         v[0],
     );
 
     let daily_prefix = if rc.card.review_mode.is_daily() { "★ DAILY  " } else { "" };
-    let prompt_label = if rc.card.kind == CardKind::Multi {
-        format!(
-            " {}{} | multi | step {} of {} ",
-            daily_prefix,
-            rc.card.deck,
-            rs.item_idx + 1,
-            rc.items.len(),
-        )
+    let kind_part = if rc.card.kind == CardKind::Multi {
+        format!("multi | step {} of {}", rs.item_idx + 1, rc.items.len())
     } else {
         match item.kind {
-            ItemKind::Reverse => format!(" {}{} | {} | A->Q ", daily_prefix, rc.card.deck, rc.card.kind),
-            _                 => format!(" {}{} | {} ", daily_prefix, rc.card.deck, rc.card.kind),
+            ItemKind::Reverse => format!("{} | A->Q", rc.card.kind),
+            _                 => rc.card.kind.to_string(),
         }
     };
+    let mut prompt_title_spans: Vec<Span<'static>> = vec![
+        Span::raw(format!(" {}{} | {}", daily_prefix, rc.card.deck, kind_part)),
+    ];
+    if !rc.card.tags.is_empty() {
+        let tags_text = rc.card.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
+        prompt_title_spans.push(Span::raw("  "));
+        prompt_title_spans.push(Span::styled(tags_text, Style::default().fg(Color::LightMagenta)));
+    }
+    prompt_title_spans.push(Span::raw(" "));
+    let prompt_label = Line::from(prompt_title_spans);
 
     let prompt_title_style = if rc.card.review_mode.is_daily() {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -834,6 +846,13 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         Line::from(spans)
     };
     let mut footer = footer;
+    if rs.cram {
+        footer.spans.push(Span::raw("   "));
+        footer.spans.push(Span::styled(
+            " [s] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+        footer.spans.push(Span::raw("Skip card"));
+    }
     footer.spans.extend(feynman_footer_hint(rs.scratchpad_open));
     f.render_widget(
         Paragraph::new(footer)
@@ -968,7 +987,36 @@ fn render_weak_span_prompt(f: &mut Frame, prompt: &WeakSpanPrompt, size: Rect) {
     );
 }
 
-fn render_nothing_due(f: &mut Frame, app: &AppState, size: Rect) {
+fn render_nothing_due(f: &mut Frame, app: &AppState, size: Rect, cram: bool) {
+    if cram {
+        let area = centered_rect(64, 7, size);
+        let lines = vec![
+            Line::from(Span::styled(
+                " Nothing to cram!",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::raw(" That selection has no cards in it.")),
+            Line::from(""),
+            Line::from(Span::styled(
+                " [q] / [Esc] to return",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" Cram "),
+                )
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+
     let next  = app.store.next_due().ok().flatten();
     let h     = if next.is_some() { 11 } else { 7 };
     let area  = centered_rect(64, h, size);
@@ -1026,36 +1074,53 @@ fn render_nothing_due(f: &mut Frame, app: &AppState, size: Rect) {
 }
 
 fn render_review_done(f: &mut Frame, rs: &super::state::ReviewState, size: Rect) {
-    let area    = centered_rect(50, 9, size);
+    let area    = centered_rect(50, if rs.cram { 11 } else { 9 }, size);
     let elapsed = rs.finished_duration.unwrap_or_else(|| rs.started_at.elapsed());
     let (m, s)  = (elapsed.as_secs() / 60, elapsed.as_secs() % 60);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            if rs.cram { " Cram complete!" } else { " Session complete!" },
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(if rs.cram { "  Answered      : " } else { "  Items reviewed : " }),
+            Span::styled(rs.done_items.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ]),
+    ];
+    if rs.cram {
+        lines.push(Line::from(vec![
+            Span::raw("  Skipped        : "),
+            Span::styled(rs.skipped_items.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::raw("  Time taken     : "),
+        Span::styled(format!("{m:02}:{s:02}"),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+    ]));
+    if rs.cram {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Schedule untouched, nothing here changed when cards are next due.",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  [q] / [Esc] to return",
+        Style::default().fg(Color::DarkGray),
+    )));
+
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                " Session complete!",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("  Items reviewed : "),
-                Span::styled(rs.done_items.to_string(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::raw("  Time taken     : "),
-                Span::styled(format!("{m:02}:{s:02}"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  [q] / [Esc] to return",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ])
+        Paragraph::new(lines)
         .block(Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" Done ")),
+            .title(if rs.cram { " Cram Done " } else { " Done " })),
         area,
     );
 }
@@ -1751,7 +1816,7 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState, clicks: &mut 
         vec![
             Line::from(Span::styled(
                 format!(
-                    " [/] edit search  │  [Esc] clear filter  │  {tag_hint}  │  [e] edit  │  [m] toggle SR/daily  │  [d] delete"
+                    " [/] edit search  │  [Esc] clear filter  │  {tag_hint}  │  [c] cram this  │  [e] edit  │  [m] toggle SR/daily  │  [d] delete"
                 ),
                 Style::default().fg(Color::DarkGray),
             )),
@@ -1761,7 +1826,7 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState, clicks: &mut 
         vec![
             Line::from(Span::styled(
                 format!(
-                    " [j/k] navigate  │  [/] search  │  {tag_hint}  │  [e] edit  │  [m] toggle SR/daily  │  [d] delete  │  [Esc] back"
+                    " [j/k] navigate  │  [/] search  │  {tag_hint}  │  [c] cram this  │  [e] edit  │  [m] toggle SR/daily  │  [d] delete  │  [Esc] back"
                 ),
                 Style::default().fg(Color::DarkGray),
             )),
@@ -1899,7 +1964,7 @@ pub(super) fn render_list_decks(f: &mut Frame, app: &mut AppState, clicks: &mut 
     } else {
         vec![
             Line::from(Span::styled(
-                " [j/k] navigate  │  [/] search  │  [Enter/r] review  │  [l] list cards  │  [M] toggle daily/SR  │  [d] delete  │  [Esc] back",
+                " [j/k] navigate  │  [/] search  │  [Enter/r] review  │  [c] cram deck  │  [l] list cards  │  [M] toggle daily/SR  │  [d] delete  │  [Esc] back",
                 Style::default().fg(Color::DarkGray),
             )),
         ]
@@ -2023,7 +2088,7 @@ pub(super) fn render_import(f: &mut Frame, app: &mut AppState, clicks: &mut Clic
             Constraint::Percentage(30), // top padding
             Constraint::Length(3),      // path field
             Constraint::Length(3),      // import button
-            Constraint::Length(2),      // hint / status
+            Constraint::Length(12),     // hint / status (an outline import lists skipped cards)
             Constraint::Min(0),
         ])
         .split(size);
@@ -2032,7 +2097,7 @@ pub(super) fn render_import(f: &mut Frame, app: &mut AppState, clicks: &mut Clic
     let fp = im.focus == ImportFocus::PathField;
     f.render_widget(
         Paragraph::new(with_cursor(&im.path, fp))
-            .block(field_block(" Path to JSON file  ([b] browse) ", fp))
+            .block(field_block(" Path to deck file (.json or .jsonl)  ([b] browse) ", fp))
             .style(text_style(fp)),
         v[1],
     );
@@ -2055,16 +2120,35 @@ pub(super) fn render_import(f: &mut Frame, app: &mut AppState, clicks: &mut Clic
     clicks.push((v[2], ClickTarget::ImportConfirmBtn));
 
     // ~~ Hint / status ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    let hint = if let Some(ref msg) = im.status {
-        let col = if msg.starts_with('✓') { Color::Green } else { Color::Red };
-        Span::styled(msg.as_str(), Style::default().fg(col))
+    // the first status line is the result (green / red) any further lines
+    // are cards an outline import skipped, in yellow, left-aligned so they read
+    let multi_line = im.status.as_ref().map_or(false, |m| m.lines().count() > 1);
+    let hint: Vec<Line> = if let Some(ref msg) = im.status {
+        msg.lines()
+            .enumerate()
+            .map(|(i, l)| {
+                let col = if i > 0 {
+                    Color::Yellow
+                } else if l.starts_with('✓') {
+                    Color::Green
+                } else {
+                    Color::Red
+                };
+                Line::from(Span::styled(l.to_string(), Style::default().fg(col)))
+            })
+            .collect()
     } else {
-        Span::styled(
+        vec![Line::from(Span::styled(
             "  [b] browse  │  [Tab] focus  │  [Enter] import  │  [Esc] back",
             Style::default().fg(Color::DarkGray),
-        )
+        ))]
     };
-    f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), v[3]);
+    f.render_widget(
+        Paragraph::new(hint)
+            .alignment(if multi_line { Alignment::Left } else { Alignment::Center })
+            .wrap(Wrap { trim: false }),
+        v[3],
+    );
 }
 
 // ~~~ Tests ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
