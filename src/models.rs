@@ -250,10 +250,21 @@ pub struct Item {
     pub scaffold_pass_date: Option<chrono::NaiveDate>,
     /// Cloze-deletion span pool, substrings of `answer` the user has
     /// identified as their own blind spot, with a weight that increases
-    /// each time the same phrase is marked again. Rendered highest-weight
-    /// first when the item is scaffolded.
+    /// each time the same phrase is marked again.
     #[serde(default)]
     pub weak_spans: Vec<WeakSpan>,
+    /// a placeholder step, doesn't know the answer yet
+    #[serde(default)]
+    pub is_pass: bool,
+}
+
+/// A Simple card attached to a Multi card as a "margin" context clue
+/// shown alongside the problem during review without being graded
+#[derive(Debug, Clone)]
+pub struct CardRef {
+    pub id:       String,
+    pub question: String,
+    pub answer:   String,
 }
 
 /// A card together with the subset of items that are due (or needed for context).
@@ -261,6 +272,8 @@ pub struct Item {
 pub struct ReviewCard {
     pub card: Card,
     pub items: Vec<Item>,
+    /// Simple cards attached to this card as margin context clues
+    pub references: Vec<CardRef>,
 }
 
 /// Lightweight row returned by `list_cards`.
@@ -306,8 +319,11 @@ pub struct StepDraft {
     pub name:   String,
     pub answer: String,
     pub image:  Option<String>,
-    /// true only when this step was created through an explicit "start a branch"
-    pub branched: bool, // not added to db
+    /// true only when this step was created through an explicit "start a
+    /// branch" action
+    pub branched: bool,
+    /// a placeholder step with a prompt but no answer yet, see `Item::is_pass`
+    pub is_pass: bool,
 }
 
 impl StepDraft {
@@ -326,6 +342,7 @@ impl StepDraft {
                 answer: answer.clone(),
                 image: image.clone(),
                 branched: false,
+                is_pass: false,
             })
             .collect()
     }
