@@ -306,6 +306,8 @@ pub struct StepDraft {
     pub name:   String,
     pub answer: String,
     pub image:  Option<String>,
+    /// true only when this step was created through an explicit "start a branch"
+    pub branched: bool, // not added to db
 }
 
 impl StepDraft {
@@ -323,6 +325,7 @@ impl StepDraft {
                 name: name.clone(),
                 answer: answer.clone(),
                 image: image.clone(),
+                branched: false,
             })
             .collect()
     }

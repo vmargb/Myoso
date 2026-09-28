@@ -286,6 +286,7 @@ pub fn drafts_from_items(is_tree: bool, items: &[Item]) -> Vec<StepDraft> {
                 name: if it.prompt == auto { String::new() } else { it.prompt.clone() },
                 answer: it.answer.clone(),
                 image: it.image_path.clone(),
+                branched: false,
             }
         })
         .collect()
@@ -523,7 +524,11 @@ pub fn outline(drafts: &[StepDraft]) -> Vec<OutlineRow> {
             .unwrap_or_default();
 
         let group = &sibs[&d.parent];
-        let (guide, branch) = if group.len() > 1 {
+        // a parent with 2+ children is always a fork. A parent with exactly
+        // one child only reads as a fork when that child was explicitly
+        // started as a branch
+        let is_fork = group.len() > 1 || d.branched;
+        let (guide, branch) = if is_fork {
             let first = group.first() == Some(&d.key);
             let last  = group.last()  == Some(&d.key);
             // several top-level paths have no parent row above them to hang from,
@@ -791,7 +796,7 @@ mod tests {
     // ~~ drafts ~~
 
     fn draft(name: &str, answer: &str) -> StepDraft {
-        StepDraft { key: 0, db_id: None, parent: None, name: name.into(), answer: answer.into(), image: None }
+        StepDraft { key: 0, db_id: None, parent: None, name: name.into(), answer: answer.into(), image: None, branched: false }
     }
 
     fn names(d: &[StepDraft]) -> Vec<String> {
@@ -966,6 +971,21 @@ mod tests {
         let bk = d[2].key;
         add_child(&mut d, Some(bk), draft("", "b2"));
         assert_eq!(guides(&d), ["", "├─ ", "└─ ", "   "]);
+    }
+
+    #[test]
+    fn outline_marks_a_lone_explicit_branch_even_with_one_child() {
+        // even though root has only one child, the outline should
+        // show it as a branch
+        let mut d = Vec::new();
+        add_child(&mut d, None, draft("", "root"));
+        let rk = d[0].key;
+        let mut a = draft("", "a");
+        a.branched = true;
+        add_child(&mut d, Some(rk), a);
+        assert_eq!(guides(&d), ["", "└─ "]);
+        let o = outline(&d);
+        assert_eq!(o[1].branch, Some(true));
     }
 
     #[test]

@@ -1750,7 +1750,7 @@ mod tests {
     }
 
     fn draft(key: u32, parent: Option<u32>, name: &str, answer: &str) -> StepDraft {
-        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None }
+        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false }
     }
 
     /// t1 - t2 -+- a1 - a2      (branch names A / B)

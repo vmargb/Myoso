@@ -105,7 +105,7 @@ as possible in a day, just in case you don't have enough time to benefit from Sp
 
 ## Generating decks with AI
 
-You can ask an AI to write a whole deck for you. Myoso imports a compact "outline" format that holds only the content of your cards: a question with an answer, a list of steps, and named branches wherever the reasoning forks. There are no ids or scheduling data for the AI to get wrong, and Myoso builds the chains and branches itself when you import. Simply ask the AI for a map of the subject first and then for one deck at a time. A ready-made prompt for both stages lives in [`docs/ai-deck-prompt.md`](docs/ai-deck-prompt.md), next to a sample deck in [`docs/example-c-deck.jsonl`](docs/example-c-deck.jsonl).
+You can ask an AI to write the deck for you. Myoso imports a compact *"outline"* format that holds only the content of your cards: a question with an answer, a list of steps, and named branches wherever the reasoning forks. Myoso builds the chains and branches itself when you import. Simply ask the AI for a map of the subject first and then for one deck at a time, or pass a source text and ask is to generate the deck using this guide: [`docs/ai_card_generation_guide.md`](docs/ai_card_generation_guide.md).
 
 Import the file from the menu like any other. Myoso will recognize the format on its own, skips cards you already have, imports everything that is valid, and shows what was rejected. The full list of rejected cards is saved next to your file, so you can hand it straight back to the AI to fix.
 

@@ -744,16 +744,21 @@ impl AddCardState {
         self.step_list_state.selected().filter(|&i| i < self.steps.len())
     }
 
-    /// where a new step goes when the user hasn't asked for a branch, after the
-    /// selected step if it is a leaf (extending its chain), otherwise at the end
-    /// of the outline. The last step in DFS order is always a leaf, so for a
-    /// plain chain this is simply "append"
+    /// where a new step goes when the user hasn't asked for a branch, after
+    /// the selected step if it is a leaf (extending its chain), otherwise
+    /// after the last step of the SELECTED step's own subtree (continuing
+    /// whatever path it's already part of). Only when nothing is selected at
+    /// all does it fall back to the end of the whole outline
     fn default_parent(&self) -> Option<u32> {
         match self.selected_step() {
             Some(i) if tree::child_count(&self.steps, Some(self.steps[i].key)) == 0 => {
                 Some(self.steps[i].key)
             }
-            _ => self.steps.last().map(|d| d.key),
+            Some(i) => {
+                let end = tree::subtree_end(&self.steps, i);
+                Some(self.steps[end - 1].key)
+            }
+            None => self.steps.last().map(|d| d.key),
         }
     }
 
@@ -850,14 +855,14 @@ impl AddCardState {
                 self.editing_step_idx = None;
                 self.focused = 5; // jump back to the list after editing
             } else {
-                let parent = match self.pending_parent.take() {
-                    Some(p) => p,
-                    None    => self.default_parent(),
+                let (parent, branched) = match self.pending_parent.take() {
+                    Some(p) => (p, true),
+                    None    => (self.default_parent(), false),
                 };
                 let at = tree::add_child(
                     &mut self.steps,
                     parent,
-                    StepDraft { name, answer, image: img, ..StepDraft::default() },
+                    StepDraft { name, answer, image: img, branched, ..StepDraft::default() },
                 );
                 self.step_list_state.select(Some(at));
                 self.focused = 3; // keep the cursor in the step editor for the next entry
@@ -1399,7 +1404,7 @@ mod tests {
     }
 
     fn draft(key: u32, parent: Option<u32>, name: &str, answer: &str) -> StepDraft {
-        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None }
+        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false }
     }
 
     /// t1 - t2 -+- a1 - a2   (branches "A" / "B")

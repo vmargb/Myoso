@@ -2162,7 +2162,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     fn draft(key: u32, parent: Option<u32>, name: &str, answer: &str) -> StepDraft {
-        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None }
+        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false }
     }
 
     fn dump(term: &Terminal<TestBackend>) -> String {
