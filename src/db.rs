@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rand::seq::SliceRandom;
 use rand::{rng, RngExt};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -122,6 +122,20 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_card_tags_card ON card_tags(card_id);
             CREATE INDEX IF NOT EXISTS idx_card_tags_tag  ON card_tags(tag_id);
+
+            -- Simple cards attached to a Multi card as margin context clues,
+            -- shown alongside the problem during review without being part of
+            -- the graded chain. `card_id` is always a Multi card `ref_id` is
+            -- always a Simple card
+            CREATE TABLE IF NOT EXISTS card_refs (
+                card_id  TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+                ref_id   TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (card_id, ref_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_card_refs_card ON card_refs(card_id);
+            CREATE INDEX IF NOT EXISTS idx_card_refs_ref  ON card_refs(ref_id);
             ",
             )
             .context("schema migration")?;
@@ -185,6 +199,12 @@ impl Store {
         );
         let _ = self.conn.execute(
             "ALTER TABLE items ADD COLUMN parent_id TEXT REFERENCES items(id)",
+            [],
+        );
+        // placeholder ("pass") steps which are prompts with no answer yet
+        // therefore never shown in review, and never gates its children
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN is_pass INTEGER NOT NULL DEFAULT 0",
             [],
         );
         // after the ALTERs, so old databases have the column when this runs
@@ -317,14 +337,14 @@ impl Store {
                 self.conn
                     .execute(
                         "UPDATE items
-                         SET prompt=?1, answer=?2, image_path=?3, position=?4, parent_id=?5
-                         WHERE id=?6 AND card_id=?7",
-                        params![label, d.answer, d.image, pos, parent, id, card_id],
+                         SET prompt=?1, answer=?2, image_path=?3, position=?4, parent_id=?5, is_pass=?6
+                         WHERE id=?7 AND card_id=?8",
+                        params![label, d.answer, d.image, pos, parent, d.is_pass as i32, id, card_id],
                     )
                     .context("update step item")?;
             } else {
                 self.insert_item_full(
-                    id, card_id, pos, parent, "step", &label, &d.answer, now, d.image.as_deref(),
+                    id, card_id, pos, parent, "step", &label, &d.answer, now, d.image.as_deref(), d.is_pass,
                 )?;
             }
         }
@@ -341,7 +361,7 @@ impl Store {
         now: DateTime<Utc>,
         image_path: Option<&str>,
     ) -> Result<()> {
-        self.insert_item_full(&new_id(), card_id, pos, None, kind, prompt, answer, now, image_path)
+        self.insert_item_full(&new_id(), card_id, pos, None, kind, prompt, answer, now, image_path, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -356,6 +376,7 @@ impl Store {
         answer: &str,
         now: DateTime<Utc>,
         image_path: Option<&str>,
+        is_pass: bool,
     ) -> Result<()> {
         // due_at is set just before now so every new item is immediately reviewable
         // interval_days, ease (stability), and difficulty all start at 0.0, so the
@@ -367,10 +388,10 @@ impl Store {
                 "INSERT INTO items(id,card_id,position,kind,prompt,answer,due_at,
                                    interval_days,ease,lapses,review_count,confidence_avg,image_path,difficulty,
                                    consecutive_fails,consecutive_hards,
-                                   scaffold_state,scaffold_passes,weak_spans,scaffold_pass_date,parent_id)
+                                   scaffold_state,scaffold_passes,weak_spans,scaffold_pass_date,parent_id,is_pass)
                  VALUES(?1,?2,?3,?4,?5,?6,?7, 0.0,0.0,0,0,0.0,?8,0.0, 0,0,
-                        'normal',0,'[]',NULL,?9)",
-                params![id, card_id, pos, kind, prompt, answer, due, image_path, parent_id],
+                        'normal',0,'[]',NULL,?9,?10)",
+                params![id, card_id, pos, kind, prompt, answer, due, image_path, parent_id, is_pass as i32],
             )
             .context("insert item")?;
         Ok(())
@@ -451,8 +472,9 @@ impl Store {
         // include ALL items, skip card only if every item was reviewed today
         for card in daily_cards {
             let items = self.load_items(&card.id)?;
+            let refs  = self.references_for(&card)?;
             for path in daily_paths(&card, &items, &today) {
-                session.push(ReviewCard { card: card.clone(), items: path });
+                session.push(ReviewCard { card: card.clone(), items: path, references: refs.clone() });
             }
         }
 
@@ -475,10 +497,11 @@ impl Store {
             let items = self.load_items(&card.id)?;
             let paths = due_paths_for_card(&card, &items, now);
             if paths.is_empty() { continue; }
+            let refs = self.references_for(&card)?;
 
             let group: Vec<ReviewCard> = paths
                 .into_iter()
-                .map(|path| ReviewCard { card: card.clone(), items: path })
+                .map(|path| ReviewCard { card: card.clone(), items: path, references: refs.clone() })
                 .collect();
 
             if items.iter().all(|it| it.review_count == 0) {
@@ -550,6 +573,7 @@ impl Store {
         for card in cards {
             let items = self.load_items(&card.id)?;
             if items.is_empty() { continue; }
+            let refs = self.references_for(&card)?;
 
             let paths: Vec<Vec<Item>> = match card.kind {
                 CardKind::Multi => {
@@ -563,7 +587,7 @@ impl Store {
             };
 
             for path in paths {
-                session.push(ReviewCard { card: card.clone(), items: path });
+                session.push(ReviewCard { card: card.clone(), items: path, references: refs.clone() });
             }
         }
 
@@ -626,6 +650,7 @@ impl Store {
         let now   = Utc::now();
         let card  = self.load_card(card_id)?;
         let items = self.load_items(card_id)?;
+        let refs  = self.references_for(&card)?;
 
         let paths = if card.review_mode.is_daily() {
             let today = now.format("%Y-%m-%d").to_string();
@@ -636,8 +661,104 @@ impl Store {
 
         Ok(paths
             .into_iter()
-            .map(|path| ReviewCard { card: card.clone(), items: path })
+            .map(|path| ReviewCard { card: card.clone(), items: path, references: refs.clone() })
             .collect())
+    }
+
+    /// margin references for `card`, empty for anything
+    /// that isn't a Multi card, since only Multi cards can hold references
+    fn references_for(&self, card: &Card) -> Result<Vec<CardRef>> {
+        if card.kind == CardKind::Multi {
+            self.list_card_references(&card.id)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Simple cards available to attach as a margin reference (id, question)
+    pub fn list_simple_card_choices(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, question FROM cards WHERE kind='simple' ORDER BY question COLLATE NOCASE")
+            .context("prepare list_simple_card_choices")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .context("query list_simple_card_choices")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect list_simple_card_choices")
+    }
+
+    /// ids of the Simple cards attached to `card_id` as margin references,
+    /// in attach order - used to pre-populate the editor
+    pub fn list_reference_ids(&self, card_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ref_id FROM card_refs WHERE card_id=?1 ORDER BY position ASC")
+            .context("prepare list_reference_ids")?;
+        let rows = stmt
+            .query_map(params![card_id], |row| row.get(0))
+            .context("query list_reference_ids")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect list_reference_ids")
+    }
+
+    /// resolved (question + answer) of the Simple cards attached to
+    /// `card_id`, in attach order - used to render the review margin
+    pub fn list_card_references(&self, card_id: &str) -> Result<Vec<CardRef>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT c.id, c.question, i.answer
+                 FROM card_refs r
+                 JOIN cards c ON c.id = r.ref_id
+                 JOIN items i ON i.card_id = c.id AND i.kind = 'forward'
+                 WHERE r.card_id = ?1
+                 ORDER BY r.position ASC",
+            )
+            .context("prepare list_card_references")?;
+        let rows = stmt
+            .query_map(params![card_id], |row| {
+                Ok(CardRef { id: row.get(0)?, question: row.get(1)?, answer: row.get(2)? })
+            })
+            .context("query list_card_references")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect list_card_references")
+    }
+
+    /// replace the full set of margin references attached to `card_id` with
+    /// `ref_ids`, in the given order. Anything that isn't an existing
+    /// Simple card is silently skipped rather than erroring, since the
+    /// editor only ever offers valid Simple cards to attach
+    pub fn set_card_references(&self, card_id: &str, ref_ids: &[String]) -> Result<()> {
+        let tx = self.begin_if_needed().context("begin set_card_references")?;
+        self.conn
+            .execute("DELETE FROM card_refs WHERE card_id=?1", params![card_id])
+            .context("clear card references")?;
+        for (i, ref_id) in ref_ids.iter().enumerate() {
+            let is_simple: bool = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM cards WHERE id=?1 AND kind='simple'",
+                    params![ref_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .context("check reference card")?
+                .unwrap_or(false);
+            if !is_simple {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO card_refs(card_id, ref_id, position) VALUES(?1,?2,?3)",
+                    params![card_id, ref_id, i as i32],
+                )
+                .context("insert card reference")?;
+        }
+        if let Some(tx) = tx {
+            tx.commit().context("commit set_card_references")?;
+        }
+        Ok(())
     }
 
     pub fn load_items(&self, card_id: &str) -> Result<Vec<Item>> {
@@ -1673,13 +1794,13 @@ fn target_retrievability(rc: &ReviewCard, now: DateTime<Utc>) -> f64 {
 ///  12 confidence_avg | 13 image_path | 14 difficulty |
 ///  15 consecutive_fails | 16 consecutive_hards |
 ///  17 scaffold_state | 18 scaffold_passes | 19 weak_spans |
-///  20 scaffold_pass_date | 21 parent_id
+///  20 scaffold_pass_date | 21 parent_id | 22 is_pass
 const ITEM_COLS: &str = "id, card_id, position, kind, prompt, answer, due_at,
                         interval_days, ease, last_reviewed_at, lapses, review_count,
                         confidence_avg, image_path, difficulty,
                         consecutive_fails, consecutive_hards,
                         scaffold_state, scaffold_passes, weak_spans, scaffold_pass_date,
-                        parent_id";
+                        parent_id, is_pass";
 
 fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     let kind: String                       = row.get(3)?;
@@ -1689,6 +1810,7 @@ fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     let scaffold_state: String             = row.get(17)?;
     let weak_spans: String                 = row.get(19)?;
     let scaffold_pass_date: Option<String> = row.get(20)?;
+    let is_pass: i32                       = row.get(22)?;
     Ok(Item {
         id:               row.get(0)?,
         card_id:          row.get(1)?,
@@ -1713,6 +1835,7 @@ fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         weak_spans:       parse_weak_spans(&weak_spans),
         scaffold_pass_date: scaffold_pass_date
             .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
+        is_pass: is_pass != 0,
     })
 }
 
@@ -2473,4 +2596,60 @@ mod tests {
             CREATE INDEX IF NOT EXISTS idx_card_tags_tag  ON card_tags(tag_id);
 
     "#;
+    // ~~ pass steps + margin references ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    #[test]
+    fn pass_steps_persist_and_never_reach_a_review_session() {
+        let store = mem();
+        let mut real = draft(0, None, "", "real answer");
+        real.is_pass = false;
+        let mut pass = draft(1, Some(0), "todo", "");
+        pass.is_pass = true;
+        let id = store
+            .add_multi_card("D", "Q?", &[real, pass], true, &ReviewMode::SpacedRepetition)
+            .unwrap();
+
+        let items = store.load_items(&id).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|i| i.is_pass && i.prompt == "todo"));
+
+        // only the real step is ever a review target
+        let rc = store.review_card_if_due(&id).unwrap();
+        assert_eq!(rc.len(), 1);
+        assert_eq!(rc[0].items.last().unwrap().answer, "real answer");
+    }
+
+    #[test]
+    fn references_attach_reload_and_only_accept_simple_cards() {
+        let store = mem();
+        let mode = ReviewMode::SpacedRepetition;
+        let mse = store.add_simple_card("ML", "What is MSE?", "mean squared error", false, None, &mode).unwrap();
+        let gd  = store.add_simple_card("ML", "What is GD?", "descend the gradient", false, None, &mode).unwrap();
+        let multi = store
+            .add_multi_card("ML", "Fit a model", &[draft(0, None, "", "step one")], true, &mode)
+            .unwrap();
+
+        // a Multi card id is skipped, unknown ids are skipped, order is kept
+        store
+            .set_card_references(&multi, &[gd.clone(), multi.clone(), "nope".into(), mse.clone()])
+            .unwrap();
+        assert_eq!(store.list_reference_ids(&multi).unwrap(), vec![gd.clone(), mse.clone()]);
+
+        let refs = store.list_card_references(&multi).unwrap();
+        assert_eq!(refs[0].question, "What is GD?");
+        assert_eq!(refs[0].answer, "descend the gradient");
+
+        // they ride along on the review card
+        let rc = store.review_card_if_due(&multi).unwrap();
+        assert_eq!(rc[0].references.len(), 2);
+
+        // only Simple cards are offered as choices
+        let choices = store.list_simple_card_choices().unwrap();
+        assert_eq!(choices.len(), 2);
+
+        // deleting a referenced card cleans up the link
+        store.delete_card(&gd).unwrap();
+        assert_eq!(store.list_reference_ids(&multi).unwrap(), vec![mse]);
+    }
+
 }
