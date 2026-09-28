@@ -429,7 +429,7 @@ impl Builder {
             return Err(format!("more than {MAX_STEPS_PER_CARD} steps in one card: split it into several cards"));
         }
         let key = self.drafts.len() as u32;
-        self.drafts.push(StepDraft { key, db_id: None, parent, name, answer, image: None, branched: false });
+        self.drafts.push(StepDraft { key, db_id: None, parent, name, answer, image: None, branched: false, is_pass: false });
         Ok(key)
     }
 
