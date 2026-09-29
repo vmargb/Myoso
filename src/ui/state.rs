@@ -620,10 +620,20 @@ pub struct AddCardState {
     // set when launched from inside a review session so save returns to Review
     pub editing_from_review: bool,
     pub tags_buf:            String,
+    // multi-only: simple cards attached as "margin" context clues
+    // `db::Store::{set,list}_card_references` (id, question)
+    // of every simple card available to search over
+    pub simple_cards:        Vec<(String, String)>,
+    // ids of the Simple cards currently attached, in attach order
+    pub reference_ids:       Vec<String>,
+    // search text typed into the References field
+    pub reference_buf:       String,
+    // which of `reference_matches()` is highlighted (Up/Down), attached on Enter
+    pub reference_idx:       usize,
 }
 
 impl AddCardState {
-    pub fn new(decks: Vec<String>) -> Self {
+    pub fn new(decks: Vec<String>, simple_cards: Vec<(String, String)>) -> Self {
         Self {
             phase:               AddPhase::PickType,
             kind:                AddKind::Simple,
@@ -649,6 +659,10 @@ impl AddCardState {
             review_mode:         ReviewMode::SpacedRepetition,
             editing_from_review: false,
             tags_buf:            String::new(),
+            simple_cards,
+            reference_ids:       Vec::new(),
+            reference_buf:       String::new(),
+            reference_idx:       0,
         }
     }
 
@@ -679,11 +693,11 @@ impl AddCardState {
     /// Field layout
     ///   Simple: deck(0)  question(1)  answer(2)  reversible(3)  daily(4)  tags(5)  [Save](6)
     ///   Multi:  deck(0)  question(1)  step_name(2)  step_answer(3)  [Add step](4)
-    ///           steps_list(5)  show_chain(6)  daily(7)  tags(8)  [Save](9)
+    ///           steps_list(5)  show_chain(6)  daily(7)  tags(8)  references(9)  [Save](10)
     pub fn field_count(&self) -> usize {
         match self.kind {
             AddKind::Simple => 7,
-            AddKind::Multi  => 10,
+            AddKind::Multi  => 11,
         }
     }
 
@@ -708,6 +722,9 @@ impl AddCardState {
     pub fn is_add_step_button(&self) -> bool { self.kind == AddKind::Multi && self.focused == 4 }
     pub fn is_steps_list(&self)      -> bool { self.kind == AddKind::Multi && self.focused == 5 }
     pub fn is_show_chain(&self)      -> bool { self.kind == AddKind::Multi && self.focused == 6 }
+    /// "margin" reference search field: attach Simple cards as context
+    /// clues shown alongside this card during review
+    pub fn is_references(&self)      -> bool { self.kind == AddKind::Multi && self.focused == 9 }
 
     pub fn active_buf_mut(&mut self) -> Option<&mut String> {
         match self.kind {
@@ -724,17 +741,71 @@ impl AddCardState {
                 2 => Some(&mut self.step_name_buf),
                 3 => Some(&mut self.step_buf),
                 8 => Some(&mut self.tags_buf),
-                _ => None, // 4 is add button, 5 is steps list, 6 is save
+                9 => Some(&mut self.reference_buf),
+                _ => None, // 4 is add button, 5 is steps list, 10 is save
             },
         }
     }
 
     pub fn push_char(&mut self, c: char) {
+        if self.is_references() { self.reference_idx = 0; }
         if let Some(b) = self.active_buf_mut() { b.push(c); }
     }
 
     pub fn pop_char(&mut self) {
+        // backspacing an empty References search box detaches the most
+        // recently attached reference instead of doing nothing
+        if self.is_references() && self.reference_buf.is_empty() {
+            self.reference_ids.pop();
+            return;
+        }
+        if self.is_references() { self.reference_idx = 0; }
         if let Some(b) = self.active_buf_mut() { b.pop(); }
+    }
+
+    /// move the highlighted reference match up/down, clamped to the list
+    pub fn move_reference_idx(&mut self, down: bool) {
+        let n = self.reference_matches().len();
+        if n == 0 { self.reference_idx = 0; return; }
+        self.reference_idx = if down {
+            (self.reference_idx + 1).min(n - 1)
+        } else {
+            self.reference_idx.saturating_sub(1)
+        };
+    }
+
+    /// simple cards that are related to the problem
+    /// most relevant first (substring match, case-insensitive)
+    pub fn reference_matches(&self) -> Vec<&(String, String)> {
+        let q = self.reference_buf.trim().to_lowercase();
+        self.simple_cards
+            .iter()
+            .filter(|(id, question)| {
+                !self.reference_ids.contains(id)
+                    && (q.is_empty() || question.to_lowercase().contains(&q))
+            })
+            .take(6)
+            .collect()
+    }
+
+    /// attach the best match for the current search text (the first result
+    /// of `reference_matches`)
+    pub fn attach_reference_match(&mut self) {
+        let idx = self.reference_idx;
+        let found = self.reference_matches().get(idx).map(|pair| pair.0.clone());
+        if let Some(id) = found {
+            self.reference_ids.push(id);
+        }
+        self.reference_buf.clear();
+        self.reference_idx = 0;
+    }
+
+    /// the attached references, resolved to (id, question) for display
+    pub fn attached_references(&self) -> Vec<&(String, String)> {
+        self.reference_ids
+            .iter()
+            .filter_map(|id| self.simple_cards.iter().find(|(cid, _)| cid == id))
+            .collect()
     }
 
     // ~~ step tree editing
@@ -744,11 +815,14 @@ impl AddCardState {
         self.step_list_state.selected().filter(|&i| i < self.steps.len())
     }
 
-    /// where a new step goes when the user hasn't asked for a branch, after
+    /// where a new step goes when the user hasn't asked for a branch: after
     /// the selected step if it is a leaf (extending its chain), otherwise
     /// after the last step of the SELECTED step's own subtree (continuing
     /// whatever path it's already part of). Only when nothing is selected at
-    /// all does it fall back to the end of the whole outline
+    /// all do we fall back to the end of the whole outline.
+    ///
+    /// This intentionally never jumps to some unrelated branch elsewhere in
+    /// the tree just because the selected step already has a child
     fn default_parent(&self) -> Option<u32> {
         match self.selected_step() {
             Some(i) if tree::child_count(&self.steps, Some(self.steps[i].key)) == 0 => {
@@ -848,13 +922,18 @@ impl AddCardState {
             if let Some(idx) = self.editing_step_idx {
                 if idx < self.steps.len() {
                     // edit in place, identity and position in the tree are kept
-                    self.steps[idx].name   = name;
-                    self.steps[idx].answer = answer;
-                    self.steps[idx].image  = img;
+                    self.steps[idx].name    = name;
+                    self.steps[idx].answer  = answer;
+                    self.steps[idx].image   = img;
+                    // a real answer was just written, this is no longer a pass
+                    self.steps[idx].is_pass = false;
                 }
                 self.editing_step_idx = None;
                 self.focused = 5; // jump back to the list after editing
             } else {
+                // `pending_parent` means the user pressed [b] or [r]
+                // to ask for a branch, mark the new step so that the
+                // outline shows it right away even before a sibling joins it
                 let (parent, branched) = match self.pending_parent.take() {
                     Some(p) => (p, true),
                     None    => (self.default_parent(), false),
@@ -871,18 +950,66 @@ impl AddCardState {
             self.step_name_buf.clear();
             self.step_buf.clear();
         } else if let Some(idx) = self.editing_step_idx {
-            // cancel edit if user submits blank answer
-            if idx < self.steps.len() && self.steps[idx].answer.is_empty() {
+            // cancel edit if user submits blank answer UNLESS the step is
+            // (or was) a pass step, re-saving a pass step with no answer
+            // just keeps it, rather than silently deleting it
+            if idx < self.steps.len() && self.steps[idx].answer.is_empty() && !self.steps[idx].is_pass {
                 // a step that was spliced in and never filled, take it back out
                 tree::remove_splice(&mut self.steps, idx);
                 let n = self.steps.len();
                 let sel = if n == 0 { None } else { Some(idx.min(n - 1)) };
                 self.step_list_state.select(sel);
+            } else if idx < self.steps.len() {
+                self.steps[idx].name = name; // keep the pass step, name may have changed
             }
             self.editing_step_idx = None;
             self.step_name_buf.clear();
             self.step_buf.clear();
             self.focused = 5;
+        }
+    }
+
+    /// commit the step currently being drafted (or edited) as a pass step
+    pub fn commit_pass_step(&mut self) {
+        let name = self.step_name_buf.trim().to_string();
+        if name.is_empty() {
+            return; // nothing to place in the chain without at least a prompt
+        }
+        let img = self.step_image_path.take();
+        if let Some(idx) = self.editing_step_idx {
+            if idx < self.steps.len() {
+                self.steps[idx].name    = name;
+                self.steps[idx].answer  = String::new();
+                self.steps[idx].image   = img;
+                self.steps[idx].is_pass = true;
+            }
+            self.editing_step_idx = None;
+            self.focused = 5;
+        } else {
+            let (parent, branched) = match self.pending_parent.take() {
+                Some(p) => (p, true),
+                None    => (self.default_parent(), false),
+            };
+            let at = tree::add_child(
+                &mut self.steps,
+                parent,
+                StepDraft { name, answer: String::new(), image: img, branched, is_pass: true, ..StepDraft::default() },
+            );
+            self.step_list_state.select(Some(at));
+            self.focused = 3;
+        }
+        self.step_name_buf.clear();
+        self.step_buf.clear();
+    }
+
+    /// toggle the selected step's pass state directly from the steps list,
+    pub fn toggle_pass_selected_step(&mut self) {
+        if let Some(idx) = self.selected_step() {
+            let d = &mut self.steps[idx];
+            d.is_pass = !d.is_pass;
+            if d.is_pass {
+                d.answer.clear();
+            }
         }
     }
 
@@ -898,7 +1025,8 @@ impl AddCardState {
                 Err("Answer cannot be empty."),
             AddKind::Multi if self.steps.is_empty() =>
                 Err("Add at least one step (type in the step field, then press the Add step button)."),
-            AddKind::Multi if self.steps.iter().all(|d| d.answer.trim().is_empty()) =>
+            // a pass step deliberately has no answer, so it doesn't count
+            AddKind::Multi if self.steps.iter().all(|d| d.answer.trim().is_empty() && !d.is_pass) =>
                 Err("Add at least one step with content."),
             // sibling branches must be nameable in review
             AddKind::Multi => tree::check_branch_names(&tree::prune_blank(&self.steps)),
@@ -908,14 +1036,22 @@ impl AddCardState {
 
     /// Rebuild an AddCardState pre-populated from an existing card for editing.
     /// Jumps straight to FillForm and skips the PickType screen.
-    pub fn for_edit(card: &Card, items: &[Item], decks: Vec<String>, tags: Vec<String>) -> Self {
-        let mut s = Self::new(decks);
+    pub fn for_edit(
+        card: &Card,
+        items: &[Item],
+        decks: Vec<String>,
+        tags: Vec<String>,
+        simple_cards: Vec<(String, String)>,
+        reference_ids: Vec<String>,
+    ) -> Self {
+        let mut s = Self::new(decks, simple_cards);
         s.editing_card_id = Some(card.id.clone());
         s.phase    = AddPhase::FillForm;
         s.deck     = card.deck.clone();
         s.reversible = card.reversible;
         s.review_mode = card.review_mode.clone();
         s.tags_buf = tags.join(" ");
+        s.reference_ids = reference_ids;
         match card.kind {
             CardKind::Simple => { // handle question & answer for simple kind
                 s.kind = AddKind::Simple;
@@ -1361,7 +1497,8 @@ impl<'a> AppState<'a> {
             }
             Some(1) => {
                 let decks = self.store.list_decks().unwrap_or_default();
-                self.add_card = Some(AddCardState::new(decks));
+                let simple_cards = self.store.list_simple_card_choices().unwrap_or_default();
+                self.add_card = Some(AddCardState::new(decks, simple_cards));
                 self.go_to(Screen::AddCard);
             }
             Some(2) => {
@@ -1635,7 +1772,7 @@ mod tests {
     fn editor_for(store: &Store, id: &str) -> AddCardState {
         let card = store.load_card(id).unwrap();
         let items = store.load_items(id).unwrap();
-        AddCardState::for_edit(&card, &items, vec![], vec![])
+        AddCardState::for_edit(&card, &items, vec![], vec![], vec![], vec![])
     }
 
     fn step_answers(s: &AddCardState) -> Vec<&str> {
@@ -1764,4 +1901,104 @@ mod tests {
         assert_eq!(s.steps[2].name, "A");
         assert!(s.steps[0].name.is_empty(), "auto label is not shown as a name");
     }
+    // ~~ pass steps + margin references in the editor
+
+    fn blank_multi_editor() -> AddCardState {
+        let mut s = AddCardState::new(vec![], vec![
+            ("c1".into(), "What is MSE?".into()),
+            ("c2".into(), "What is gradient descent?".into()),
+            ("c3".into(), "What is a learning rate?".into()),
+        ]);
+        s.kind = AddKind::Multi;
+        s
+    }
+
+    #[test]
+    fn a_pass_step_needs_only_a_prompt_and_is_kept() {
+        let mut s = blank_multi_editor();
+        s.step_name_buf = "compute the gradient".into();
+        s.commit_pass_step();
+        assert_eq!(s.steps.len(), 1);
+        assert!(s.steps[0].is_pass);
+        assert!(s.steps[0].answer.is_empty());
+        // a card made only of pass steps is still valid content
+        s.deck = "ML".into();
+        s.multi_question = "Fit a model".into();
+        assert!(s.validate().is_ok());
+        // ...and survives saving
+        assert_eq!(tree::prune_blank(&s.steps).len(), 1);
+    }
+
+    #[test]
+    fn a_pass_step_needs_a_prompt() {
+        let mut s = blank_multi_editor();
+        s.commit_pass_step();
+        assert!(s.steps.is_empty());
+    }
+
+    #[test]
+    fn writing_a_real_answer_clears_pass_and_re_saving_blank_keeps_it() {
+        let mut s = blank_multi_editor();
+        s.step_name_buf = "todo".into();
+        s.commit_pass_step();
+        s.step_list_state.select(Some(0));
+
+        // re-save a pass step with no answer, so it must not be deleted
+        s.editing_step_idx = Some(0);
+        s.step_name_buf = "todo".into();
+        s.commit_step();
+        assert_eq!(s.steps.len(), 1);
+        assert!(s.steps[0].is_pass);
+
+        // now give it an answer, no longer a pass
+        s.editing_step_idx = Some(0);
+        s.step_name_buf = "todo".into();
+        s.step_buf = "the real answer".into();
+        s.commit_step();
+        assert!(!s.steps[0].is_pass);
+    }
+
+    #[test]
+    fn toggling_pass_on_clears_the_answer() {
+        let mut s = blank_multi_editor();
+        s.step_buf = "an answer".into();
+        s.commit_step();
+        s.step_list_state.select(Some(0));
+        s.toggle_pass_selected_step();
+        assert!(s.steps[0].is_pass && s.steps[0].answer.is_empty());
+        s.toggle_pass_selected_step();
+        assert!(!s.steps[0].is_pass);
+    }
+
+    #[test]
+    fn references_search_pick_attach_and_detach() {
+        let mut s = blank_multi_editor();
+        s.focused = 9;
+        for c in "what is".chars() { s.push_char(c); }
+        assert_eq!(s.reference_matches().len(), 3);
+
+        // down picks the second match, Enter attaches it
+        s.move_reference_idx(true);
+        s.attach_reference_match();
+        assert_eq!(s.reference_ids, vec!["c2".to_string()]);
+        assert!(s.reference_buf.is_empty());
+        // already-attached cards drop out of the results
+        assert!(s.reference_matches().iter().all(|(id, _)| id != "c2"));
+
+        // backspace on an empty search box detaches the last reference
+        s.pop_char();
+        assert!(s.reference_ids.is_empty());
+    }
+
+    #[test]
+    fn references_are_multi_only_and_last_before_save() {
+        let s = blank_multi_editor();
+        assert_eq!(s.field_count(), 11);
+        let mut s2 = s;
+        s2.focused = 10;
+        assert!(s2.is_save());
+        s2.focused = 9;
+        assert!(s2.is_references() && !s2.is_save());
+    }
+
 }

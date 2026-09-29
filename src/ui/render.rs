@@ -517,22 +517,30 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         // ~~ Preceding steps rebuild context ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if rc.card.show_chain {
             for (i, prev) in rc.items[..rs.item_idx].iter().enumerate() {
-                let step_label = format!("  {} ✓", prev.prompt);
+                let mark = if prev.is_pass { "…" } else { "✓" };
+                let step_label = format!("  {} {mark}", prev.prompt);
                 // if the prompt is just the auto "Step N" we already have the number, otherwise show it
                 let display_label = if prev.prompt == format!("Step {}", i + 1) {
                     step_label
                 } else {
-                    format!("  {}. {} ✓", i + 1, prev.prompt)
+                    format!("  {}. {} {mark}", i + 1, prev.prompt)
                 };
                 context_lines.push(Line::from(Span::styled(
                     display_label,
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
                 )));
-                for l in prev.answer.lines() {
+                if prev.is_pass {
                     context_lines.push(Line::from(Span::styled(
-                        format!("    {l}"),
-                        Style::default().fg(Color::DarkGray),
+                        "    (pass — no answer recorded yet)",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                     )));
+                } else {
+                    for l in prev.answer.lines() {
+                        context_lines.push(Line::from(Span::styled(
+                            format!("    {l}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
                 }
                 context_lines.push(Line::from(""));
             }
@@ -578,20 +586,77 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // ONE stable card for BOTH phases, same position/size always, so revealing
     // never repositions or resizes anything, it only grows the content inside
-    // when the Feynman scratchpad is open, the review area is split side-by-side
-    let (card, pad_area) = if rs.scratchpad_open {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-            .split(v[1]);
-        let card = centered_rect(92, cols[0].height.saturating_sub(2).max(10), cols[0]);
-        (card, Some(cols[1]))
-    } else {
-        let card = centered_rect(80, v[1].height.saturating_sub(2).max(10), v[1]);
-        (card, None)
+    // when the Feynman scratchpad is open, the review area is split side-by-side.
+    // A card with attached margin references gets a column on the LEFT
+    // [ context | card | scratchpad ]
+    let has_margin = !rc.references.is_empty();
+    let (margin_area, card, pad_area) = match (has_margin, rs.scratchpad_open) {
+        (true, true) => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(45),
+                    Constraint::Percentage(35),
+                ])
+                .split(v[1]);
+            (Some(cols[0]), cols[1], Some(cols[2]))
+        }
+        (false, true) => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(58), 
+                    Constraint::Percentage(42)
+                ])
+                .split(v[1]);
+            (None, cols[0], Some(cols[1]))
+        }
+        (true, false) => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(25), 
+                    Constraint::Percentage(75)
+                ])
+                .split(v[1]);
+            (Some(cols[0]), cols[1], None)
+        }
+        (false, false) => {
+            // single center card view (shrunk horizontally for comfortable reading width)
+            let card = centered_rect(80, v[1].height, v[1]);
+            (None, card, None)
+        }
     };
     if rs.phase == ReviewPhase::Thinking {
         clicks.push((card, ClickTarget::ReviewCard));
+    }
+
+    // margin panel: simple cards attached as context clues that are always visible
+    if let Some(margin) = margin_area {
+        let mut mlines: Vec<Line> = vec![Line::from(Span::styled(
+            " Context ",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )), Line::from("")];
+        for r in &rc.references {
+            mlines.push(Line::from(Span::styled(
+                format!(" • {}", r.question),
+                Style::default().fg(Color::Cyan),
+            )));
+            for l in r.answer.lines() {
+                mlines.push(Line::from(Span::styled(
+                    format!("   {l}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            mlines.push(Line::from(""));
+        }
+        f.render_widget(
+            Paragraph::new(mlines)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
+            margin,
+        );
     }
 
     let mut lines: Vec<Line> = vec![Line::from(""), Line::from("")];
@@ -1357,8 +1422,8 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
     // room for branching outlines
     let steps_h = 8;
     //  heading + deck + sugg + question + step_name + step_ans + add_btn + steps_list
-    //  + show_chain + daily + tags + save + hint
-    let total_h: u16 = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + steps_h + 3 + 3 + 3 + 3 + 1;
+    //  + show_chain + daily + tags + references + save + hint
+    let total_h: u16 = 1 + 3 + sugg_h + 5 + 3 + 5 + 3 + steps_h + 3 + 3 + 3 + 4 + 3 + 1;
 
     let area = centered_rect(72, total_h, size);
     let v = Layout::default()
@@ -1375,7 +1440,8 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
             Constraint::Length(3),        // show_chain  (focused == 6)
             Constraint::Length(3),        // daily       (focused == 7)
             Constraint::Length(3),        // tags        (focused == 8)
-            Constraint::Length(3),        // save        (focused == 9)
+            Constraint::Length(4),        // references  (focused == 9)
+            Constraint::Length(3),        // save        (focused == 10)
             Constraint::Min(1),           // error / help
         ])
         .split(area);
@@ -1487,13 +1553,20 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
                 let editing = Some(i) == s.editing_step_idx;
                 let marker = if editing { " ✎ " } else { "  " };
                 let first_line = d.answer.lines().next().unwrap_or("");
-                let text = if d.name.trim().is_empty() {
-                    format!("{}. {}", row.step_no, first_line)
+                let body = if d.is_pass {
+                    "[pass: no answer yet]".to_string()
                 } else {
-                    format!("{}. [{}]  {}", row.step_no, d.name, first_line)
+                    first_line.to_string()
+                };
+                let text = if d.name.trim().is_empty() {
+                    format!("{}. {}", row.step_no, body)
+                } else {
+                    format!("{}. [{}]  {}", row.step_no, d.name, body)
                 };
                 let style = if editing {
                     Style::default().fg(Color::Yellow)
+                } else if d.is_pass {
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
                 } else if row.branch.is_some() {
                     Style::default().fg(Color::Cyan)
                 } else {
@@ -1510,7 +1583,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
     };
 
     let list_title = if s.focused == 5 {
-        format!(" Steps ({})  [Enter] edit  [i] insert  [b] branch  [r] new path  [d] del  [D] del+below ", s.steps.len())
+        format!(" Steps ({})  [Enter] edit  [i] insert  [b] branch  [r] new path  [p] pass  [d] del  [D] del+below ", s.steps.len())
     } else {
         format!(" Steps ({}) ", s.steps.len())
     };
@@ -1554,9 +1627,46 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
     );
     clicks.push((v[10], ClickTarget::AddCardField(8)));
 
-    render_save_btn(f, s.focused == 9, v[11]);
-    clicks.push((v[11], ClickTarget::AddCardButton(9)));
-    render_form_hint(f, s.error.as_deref(), v[12]);
+    // references field (focused == 9) attach Simple cards as "margin"
+    // context clues shown alongside this card during review
+    let attached = s.attached_references();
+    let chips = if attached.is_empty() {
+        "(none attached)".to_string()
+    } else {
+        attached.iter().map(|pair| pair.1.as_str()).collect::<Vec<_>>().join("  •  ")
+    };
+    let ref_title = if s.focused == 9 {
+        " References  (margin context clues)  [↑ /↓ ] pick  [Enter] attach  [Backspace] remove last "
+    } else {
+        " References  (margin context clues) "
+    };
+    let ref_body = if s.focused == 9 {
+        let matches = s.reference_matches();
+        let sel = s.reference_idx.min(matches.len().saturating_sub(1));
+        let shown = if matches.is_empty() {
+            "(no match)".to_string()
+        } else {
+            matches.iter().enumerate()
+                .map(|(i, pair)| if i == sel { format!("▸{}", pair.1) } else { pair.1.clone() })
+                .collect::<Vec<_>>()
+                .join("  |  ")
+        };
+        format!("{}\nsearch: {}  →  {}", chips, with_cursor(&s.reference_buf, true), shown)
+    } else {
+        chips
+    };
+    f.render_widget(
+        Paragraph::new(ref_body)
+            .block(field_block(ref_title, s.focused == 9))
+            .wrap(Wrap { trim: false })
+            .style(text_style(s.focused == 9)),
+        v[11],
+    );
+    clicks.push((v[11], ClickTarget::AddCardField(9)));
+
+    render_save_btn(f, s.focused == 10, v[12]);
+    clicks.push((v[12], ClickTarget::AddCardButton(10)));
+    render_form_hint(f, s.error.as_deref(), v[13]);
 }
 
 fn render_daily_toggle(f: &mut Frame, mode: &ReviewMode, focused: bool, area: Rect) {
@@ -1580,7 +1690,11 @@ fn render_daily_toggle(f: &mut Frame, mode: &ReviewMode, focused: bool, area: Re
 }
 
 fn render_add_step_btn(f: &mut Frame, focused: bool, editing: bool, area: Rect) {
-    let label = if editing { "  ►  Update step" } else { "  ►  Add step" };
+    let label = if editing {
+        "  ►  Update step   ([p] keep as pass)"
+    } else {
+        "  ►  Add step   ([p] pass step, no answer yet)"
+    };
     f.render_widget(
         Paragraph::new(Span::styled(
             label,
@@ -2195,7 +2309,7 @@ mod tests {
         let mut app = AppState::new(&store);
         let card = store.load_card(&id).unwrap();
         let items = store.load_items(&id).unwrap();
-        let mut s = AddCardState::for_edit(&card, &items, vec![], vec![]);
+        let mut s = AddCardState::for_edit(&card, &items, vec![], vec![], vec![], vec![]);
         s.focused = 5; // the steps list
         s.step_list_state.select(Some(1)); // SSD
         s.begin_branch(); // -> Step Name, "new branch under 2. [SSD]"
@@ -2233,7 +2347,7 @@ mod tests {
         let mut app = AppState::new(&store);
         let card = store.load_card(&id).unwrap();
         let items = store.load_items(&id).unwrap();
-        let mut s = AddCardState::for_edit(&card, &items, vec![], vec![]);
+        let mut s = AddCardState::for_edit(&card, &items, vec![], vec![], vec![], vec![]);
         s.focused = 5;
         app.add_card = Some(s);
         app.screen = Screen::AddCard;
@@ -2267,7 +2381,7 @@ mod tests {
         let mut app = AppState::new(&store);
         let card = store.load_card(&id).unwrap();
         let items = store.load_items(&id).unwrap();
-        let mut s = AddCardState::for_edit(&card, &items, vec![], vec![]);
+        let mut s = AddCardState::for_edit(&card, &items, vec![], vec![], vec![], vec![]);
         s.focused = 5;
         app.add_card = Some(s);
         app.screen = Screen::AddCard;

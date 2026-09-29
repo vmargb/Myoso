@@ -326,7 +326,9 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 let items = app.store.load_items(&id)?;
                 let tags  = app.store.get_card_tags(&id)?;
                 let decks = app.store.list_decks().unwrap_or_default();
-                let mut edit_state = AddCardState::for_edit(&card, &items, decks, tags);
+                let simple_cards = app.store.list_simple_card_choices().unwrap_or_default();
+                let refs  = app.store.list_reference_ids(&id).unwrap_or_default();
+                let mut edit_state = AddCardState::for_edit(&card, &items, decks, tags, simple_cards, refs);
                 edit_state.editing_from_review = true;
                 app.add_card = Some(edit_state);
                 app.go_to(Screen::AddCard);
@@ -352,6 +354,7 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
     let is_editing    = app.add_card.as_ref().unwrap().editing_card_id.is_some();
     let is_show_chain = app.add_card.as_ref().unwrap().is_show_chain();
     let is_daily      = app.add_card.as_ref().unwrap().is_daily_toggle();
+    let is_references = app.add_card.as_ref().unwrap().is_references();
 
     // ~~ Pick-type phase ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if phase == AddPhase::PickType {
@@ -414,6 +417,12 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
         KeyCode::Char('i') if is_steps_list => {
             app.add_card.as_mut().unwrap().insert_step_after_selected();
         }
+        KeyCode::Down if is_references => {
+            app.add_card.as_mut().unwrap().move_reference_idx(true);
+        }
+        KeyCode::Up if is_references => {
+            app.add_card.as_mut().unwrap().move_reference_idx(false);
+        }
         KeyCode::Down if is_steps_list => {
             let s = app.add_card.as_mut().unwrap();
             let n = s.steps.len();
@@ -447,6 +456,10 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
         }
         KeyCode::Char('r') if is_steps_list => {
             app.add_card.as_mut().unwrap().begin_root_path();
+        }
+        // [p] toggle the selected step between normal and "pass"
+        KeyCode::Char('p') if is_steps_list => {
+            app.add_card.as_mut().unwrap().toggle_pass_selected_step();
         }
         KeyCode::Tab => {
             let s = app.add_card.as_mut().unwrap();
@@ -514,8 +527,18 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                 s.focused = 3;
             }
         }
+        // [p] on the add-step button commits the step as a *pass*
+        // instead of an answer the way [Enter] does
+        KeyCode::Char('p') if is_add_step => {
+            app.add_card.as_mut().unwrap().commit_pass_step();
+        }
 
-        // === normal Enter = newline only in multi-line fields ===
+        // === References field: search simple cards to attach as margin
+        KeyCode::Enter if is_references => {
+            app.add_card.as_mut().unwrap().attach_reference_match();
+        }
+
+        // === normal enter: newline only in multi-line fields
         KeyCode::Enter if app.add_card.as_ref().unwrap().is_multiline_field() => {
             let s = app.add_card.as_mut().unwrap();
             s.error = None;
@@ -575,7 +598,8 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                     } else {
                         let saved_kind = app.add_card.as_ref().unwrap().kind;
                         let decks = app.store.list_decks().unwrap_or_default();
-                        let mut fresh = AddCardState::new(decks);
+                        let simple_cards = app.store.list_simple_card_choices().unwrap_or_default();
+                        let mut fresh = AddCardState::new(decks, simple_cards);
                         fresh.kind = saved_kind;
                         app.add_card = Some(fresh);
                     }
@@ -865,7 +889,9 @@ fn on_list_cards(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                 let items = app.store.load_items(&id)?;
                 let tags  = app.store.get_card_tags(&id)?;
                 let decks = app.store.list_decks().unwrap_or_default();
-                app.add_card = Some(AddCardState::for_edit(&card, &items, decks, tags));
+                let simple_cards = app.store.list_simple_card_choices().unwrap_or_default();
+                let refs  = app.store.list_reference_ids(&id).unwrap_or_default();
+                app.add_card = Some(AddCardState::for_edit(&card, &items, decks, tags, simple_cards, refs));
                 app.go_to(Screen::AddCard);
             }
         }
@@ -1479,14 +1505,17 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.answer_image_path.as_deref(),
                 &s.review_mode,
             )?,
-            AddKind::Multi => store.update_multi_card(
-                card_id,
-                s.deck.trim(),
-                s.multi_question.trim(),
-                &s.steps,
-                s.show_chain,
-                &s.review_mode,
-            )?,
+            AddKind::Multi => {
+                store.update_multi_card(
+                    card_id,
+                    s.deck.trim(),
+                    s.multi_question.trim(),
+                    &s.steps,
+                    s.show_chain,
+                    &s.review_mode,
+                )?;
+                store.set_card_references(card_id, &s.reference_ids)?;
+            }
         }
         store.set_card_tags(card_id, &tags)?;
     } else {
@@ -1500,13 +1529,17 @@ fn save_new_card(app: &mut AppState) -> anyhow::Result<()> {
                 s.answer_image_path.as_deref(),
                 &s.review_mode,
             )?,
-            AddKind::Multi => store.add_multi_card(
-                s.deck.trim(),
-                s.multi_question.trim(),
-                &s.steps,
-                s.show_chain,
-                &s.review_mode,
-            )?,
+            AddKind::Multi => {
+                let id = store.add_multi_card(
+                    s.deck.trim(),
+                    s.multi_question.trim(),
+                    &s.steps,
+                    s.show_chain,
+                    &s.review_mode,
+                )?;
+                store.set_card_references(&id, &s.reference_ids)?;
+                id
+            }
         };
         store.set_card_tags(&card_id, &tags)?;
     }

@@ -162,23 +162,29 @@ impl<'a> StepTree<'a> {
         out
     }
 
-    /// one root -> leaf path per leaf, in display order
+    /// one root -> leaf path per leaf, in display order. A leaf that is a
+    /// pass step is never a review target
     pub fn leaf_paths(&self) -> Vec<Vec<usize>> {
         self.dfs_order()
             .into_iter()
-            .filter(|&i| self.is_leaf(i))
+            .filter(|&i| self.is_leaf(i) && !self.items[i].is_pass)
             .map(|i| self.path_to(i))
             .collect()
     }
 
     /// the steps a session must target right now, due nodes with no due
-    /// ancestor in display order. For a linear chain this is exactly one node
+    /// ancestor in display order. For a linear chain this is exactly one node.
+    ///
+    /// A pass step is treated asalready cleared, it is never itself a target,
+    /// and it never gates whatever comes after it
     pub fn frontier(&self, now: DateTime<Utc>) -> Vec<usize> {
         let mut out = Vec::new();
         let mut stack: Vec<usize> = self.roots.iter().rev().copied().collect();
         while let Some(n) = stack.pop() {
-            if self.items[n].due_at <= now {
-                out.push(n); // don't descend: everything below is gated by this
+            if self.items[n].is_pass {
+                stack.extend(self.children[n].iter().rev().copied());
+            } else if self.items[n].due_at <= now {
+                out.push(n); // don't descend, everything below is gated by this
             } else {
                 stack.extend(self.children[n].iter().rev().copied());
             }
@@ -286,7 +292,9 @@ pub fn drafts_from_items(is_tree: bool, items: &[Item]) -> Vec<StepDraft> {
                 name: if it.prompt == auto { String::new() } else { it.prompt.clone() },
                 answer: it.answer.clone(),
                 image: it.image_path.clone(),
+                // steps loaded back from the DB are shown by real sibling count alone
                 branched: false,
+                is_pass: it.is_pass,
             }
         })
         .collect()
@@ -410,13 +418,12 @@ pub fn normalize_order(drafts: &mut Vec<StepDraft>) {
     // a cycle among drafts would leave order shorter, so leave as is
 }
 
-/// blank-answer drafts are dropped when saving (as they always were) but
-/// their children are kept, they move up to the dropped steps parent
+/// blank-answer drafts are dropped when saving `is_pass` is the one exception
 pub fn prune_blank(drafts: &[StepDraft]) -> Vec<StepDraft> {
     let mut out: Vec<StepDraft> = drafts.to_vec();
     let mut i = 0;
     while i < out.len() {
-        if out[i].answer.trim().is_empty() {
+        if out[i].answer.trim().is_empty() && !out[i].is_pass {
             let key = out[i].key;
             let parent = out[i].parent;
             for x in out.iter_mut() {
@@ -562,6 +569,15 @@ mod tests {
     use chrono::Duration;
 
     fn item(id: &str, pos: i32, parent: Option<&str>, due_in_min: i64) -> Item {
+        item_ex(id, pos, parent, due_in_min, false)
+    }
+
+    fn pass_item(id: &str, pos: i32, parent: Option<&str>) -> Item {
+        // a pass step's due_at doesn't matter
+        item_ex(id, pos, parent, 60 * 24 * 365, true)
+    }
+
+    fn item_ex(id: &str, pos: i32, parent: Option<&str>, due_in_min: i64, is_pass: bool) -> Item {
         Item {
             id: id.into(),
             card_id: "c".into(),
@@ -569,7 +585,7 @@ mod tests {
             parent_id: parent.map(str::to_string),
             kind: ItemKind::Step,
             prompt: format!("Step {pos}"),
-            answer: format!("answer {id}"),
+            answer: if is_pass { String::new() } else { format!("answer {id}") },
             due_at: Utc::now() + Duration::minutes(due_in_min),
             interval_days: 0.0,
             stability: 0.0,
@@ -585,6 +601,7 @@ mod tests {
             scaffold_passes: 0,
             scaffold_pass_date: None,
             weak_spans: Vec::new(),
+            is_pass,
         }
     }
 
@@ -750,6 +767,73 @@ mod tests {
         assert_eq!(ids(&t, &t.frontier(Utc::now())), ["t2"]);
     }
 
+    // ~~ pass steps: a placeholder with a prompt but no answer
+
+    #[test]
+    fn a_pass_leaf_never_shows_up_in_review() {
+        // t1 -> t2 -> p (pass, no answer written yet)
+        let items = vec![
+            item("t1", 1, None, -1),
+            item("t2", 2, Some("t1"), -1),
+            pass_item("p", 3, Some("t2")),
+        ];
+        let t = StepTree::new(true, &items);
+        // t1 is the only real target; nothing ever surfaces the pass leaf
+        assert_eq!(ids(&t, &t.frontier(Utc::now())), ["t1"]);
+        assert!(t.leaf_paths().is_empty(), "a pass-only leaf contributes no reviewable path");
+    }
+
+    #[test]
+    fn a_pass_step_never_gates_its_children_and_is_never_the_target() {
+        // t1 (due) -> p (pass, "due" or not doesn't matter) -> t3 (due)
+        let items = vec![
+            item("t1", 1, None, -1),
+            pass_item("p", 2, Some("t1")),
+            item("t3", 3, Some("p"), -1),
+        ];
+        let t = StepTree::new(true, &items);
+        // t1 still gates t3 normally; the pass step in between is transparent
+        assert_eq!(ids(&t, &t.frontier(Utc::now())), ["t1"]);
+
+        // once t1 is done, the walk falls straight through the pass step to t3
+        let mut items2 = items.clone();
+        items2[0].due_at = Utc::now() + Duration::days(30); // t1 no longer due
+        let t2 = StepTree::new(true, &items2);
+        assert_eq!(ids(&t2, &t2.frontier(Utc::now())), ["t3"]);
+    }
+
+    #[test]
+    fn a_pass_step_still_appears_as_context_for_a_real_descendant() {
+        let items = vec![
+            item("t1", 1, None, -1),
+            pass_item("p", 2, Some("t1")),
+            item("t3", 3, Some("p"), -1),
+        ];
+        let t = StepTree::new(true, &items);
+        let paths = t.due_paths(Utc::now());
+        // t1 is the target this round, "p" and "t3" aren't reached yet
+        let got: Vec<&str> = paths[0].iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(got, ["t1"]);
+    }
+
+    #[test]
+    fn prune_blank_keeps_a_pass_step_but_drops_a_truly_blank_one() {
+        let mut d = Vec::new();
+        add_child(&mut d, None, draft("", "root"));
+        let rk = d[0].key;
+        let mut p = draft("todo", "");
+        p.is_pass = true;
+        add_child(&mut d, Some(rk), p);
+        let pass_key = d[1].key;
+        let blank_idx = add_child(&mut d, Some(pass_key), draft("", ""));
+        let _ = blank_idx;
+
+        let pruned = prune_blank(&d);
+        // root + the pass step survive, the truly-blank one is gone
+        assert_eq!(pruned.len(), 2);
+        assert!(pruned.iter().any(|s| s.is_pass && s.name == "todo"));
+    }
+
     #[test]
     fn dangling_parent_becomes_root_and_self_parent_is_ignored() {
         let items = vec![
@@ -796,7 +880,7 @@ mod tests {
     // ~~ drafts ~~
 
     fn draft(name: &str, answer: &str) -> StepDraft {
-        StepDraft { key: 0, db_id: None, parent: None, name: name.into(), answer: answer.into(), image: None, branched: false }
+        StepDraft { key: 0, db_id: None, parent: None, name: name.into(), answer: answer.into(), image: None, branched: false, is_pass: false }
     }
 
     fn names(d: &[StepDraft]) -> Vec<String> {
@@ -975,8 +1059,7 @@ mod tests {
 
     #[test]
     fn outline_marks_a_lone_explicit_branch_even_with_one_child() {
-        // even though root has only one child, the outline should
-        // show it as a branch
+        // root -> a, where `a` was created with `b`
         let mut d = Vec::new();
         add_child(&mut d, None, draft("", "root"));
         let rk = d[0].key;
