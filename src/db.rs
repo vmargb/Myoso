@@ -455,6 +455,53 @@ impl Store {
     //    up to `limits.new_cards`   SR cards being introduced for the FIRST time
     // the caps don't apply to daily mode cards
     // pass `SessionLimits::unlimited()' to get unlimited
+
+    /// Within a session, pull a Multi card's attached Simple-card references
+    /// to just before it, when both happen to be due in the same session.
+    /// retrievability order is left exactly as it was.
+    fn prioritize_references(session: Vec<ReviewCard>) -> Vec<ReviewCard> {
+        let n = session.len();
+        if n <= 1 {
+            return session;
+        }
+        let mut pos_by_id: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, rc) in session.iter().enumerate() {
+            pos_by_id.entry(rc.card.id.clone()).or_default().push(i);
+        }
+
+        let mut items: Vec<Option<ReviewCard>> = session.into_iter().map(Some).collect();
+        let mut placed = vec![false; n];
+        let mut out = Vec::with_capacity(n);
+
+        for i in 0..n {
+            if placed[i] {
+                continue;
+            }
+            // collect first, so this immutable borrow ends before the moves below
+            let ref_ids: Vec<String> = match items[i].as_ref() {
+                Some(rc) if rc.card.kind == CardKind::Multi && !rc.references.is_empty() => {
+                    rc.references.iter().map(|r| r.id.clone()).collect()
+                }
+                _ => Vec::new(),
+            };
+            for ref_id in ref_ids {
+                if let Some(positions) = pos_by_id.get(&ref_id) {
+                    if let Some(&j) = positions.iter().find(|&&j| j > i && !placed[j]) {
+                        if let Some(rc) = items[j].take() {
+                            out.push(rc);
+                            placed[j] = true;
+                        }
+                    }
+                }
+            }
+            if let Some(rc) = items[i].take() {
+                out.push(rc);
+                placed[i] = true;
+            }
+        }
+        out
+    }
+
     pub fn due_session(&self, deck: Option<&str>, limits: &SessionLimits) -> Result<Vec<ReviewCard>> {
         let filter = deck.unwrap_or("");
         let now    = Utc::now();
@@ -544,7 +591,7 @@ impl Store {
         session.extend(sr_reviews.into_iter().flatten());
         session.extend(sr_new.into_iter().flatten());
 
-        Ok(session)
+        Ok(Self::prioritize_references(session))
     }
 
     /// build a cram session: every card in `deck` scope, completely ignoring
@@ -592,7 +639,7 @@ impl Store {
         }
 
         session.shuffle(&mut rng());
-        Ok(session)
+        Ok(Self::prioritize_references(session))
     }
 
     /// Load all cards in `filter` scope, ordered by creation time.
@@ -1873,7 +1920,7 @@ mod tests {
     }
 
     fn draft(key: u32, parent: Option<u32>, name: &str, answer: &str) -> StepDraft {
-        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false }
+        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false, is_pass: false }
     }
 
     /// t1 - t2 -+- a1 - a2      (branch names A / B)
@@ -2650,6 +2697,44 @@ mod tests {
         // deleting a referenced card cleans up the link
         store.delete_card(&gd).unwrap();
         assert_eq!(store.list_reference_ids(&multi).unwrap(), vec![mse]);
+    }
+
+    #[test]
+    fn a_due_reference_is_pulled_before_the_multi_card_that_uses_it() {
+        let store = mem();
+        let mode = ReviewMode::SpacedRepetition;
+        let mse = store.add_simple_card("ML", "What is MSE?", "mean squared error", false, None, &mode).unwrap();
+        let multi = store
+            .add_multi_card("ML", "Fit a model", &[draft(0, None, "", "step one")], true, &mode)
+            .unwrap();
+        store.set_card_references(&multi, &[mse.clone()]).unwrap();
+
+        // both are due (new cards are due immediately); MSE must come first
+        let session = store.due_session(None, &SessionLimits::default()).unwrap();
+        let mse_pos   = session.iter().position(|rc| rc.card.id == mse).unwrap();
+        let multi_pos = session.iter().position(|rc| rc.card.id == multi).unwrap();
+        assert!(mse_pos < multi_pos, "referenced Simple card should be pulled before its Multi card");
+    }
+
+    #[test]
+    fn a_not_due_reference_is_not_pulled_in_and_nothing_else_moves() {
+        let store = mem();
+        let mode = ReviewMode::SpacedRepetition;
+        let mse = store.add_simple_card("ML", "What is MSE?", "mean squared error", false, None, &mode).unwrap();
+        let multi = store
+            .add_multi_card("ML", "Fit a model", &[draft(0, None, "", "step one")], true, &mode)
+            .unwrap();
+        store.set_card_references(&multi, &[mse.clone()]).unwrap();
+
+        // push MSE's due date far into the future: it's referenced, but not due
+        store.conn.execute(
+            "UPDATE items SET due_at=?1 WHERE card_id=?2",
+            params![(Utc::now() + chrono::Duration::days(30)).to_rfc3339(), mse],
+        ).unwrap();
+
+        let session = store.due_session(None, &SessionLimits::default()).unwrap();
+        assert!(session.iter().all(|rc| rc.card.id != mse), "an undue reference must not be pulled into the session");
+        assert!(session.iter().any(|rc| rc.card.id == multi), "the multi card is still due on its own");
     }
 
 }
