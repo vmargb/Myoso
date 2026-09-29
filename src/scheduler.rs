@@ -241,6 +241,7 @@ mod tests {
             scaffold_passes: 0,
             scaffold_pass_date: None,
             weak_spans: Vec::new(),
+            is_pass: false,
         }
     }
 
