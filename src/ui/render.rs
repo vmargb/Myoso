@@ -297,9 +297,20 @@ pub(super) fn render_stats(f: &mut Frame, app: &AppState) {
                     },
                 ),
             ]),
+            Line::from(vec![
+                Span::raw("  Pass steps  : "),
+                Span::styled(
+                    format!("{} in {} card{}", st.pass_steps, st.pass_cards, if st.pass_cards == 1 { "" } else { "s" }),
+                    if st.pass_steps > 0 {
+                        Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+            ]),
             Line::from(""),
             Line::from(Span::styled(
-                "  [Enter] / [Esc] to return",
+                if st.pass_steps > 0 { "  [p] pass steps  │  [Enter] / [Esc] return" } else { "  [Enter] / [Esc] to return" },
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -1795,6 +1806,8 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState, clicks: &mut 
         vec![ListItem::new(Span::styled(
             if total_count == 0 {
                 "  No cards yet,  use Add Card to create one."
+            } else if lc.passes_only {
+                "  No pass steps pending."
             } else {
                 "  No cards match the current filter."
             },
@@ -1855,6 +1868,12 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState, clicks: &mut 
                     n_tag,
                     time_tag,
                 ];
+                if c.pass_count > 0 {
+                    spans.push(Span::styled(
+                        format!(" …{} pass", c.pass_count),
+                        Style::default().fg(Color::LightRed),
+                    ));
+                }
                 for tag in &c.tags {
                     spans.push(Span::styled(
                         format!(" #{tag}"),
@@ -1889,7 +1908,8 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState, clicks: &mut 
         } else {
             String::new()
         };
-        format!("{base}{count}{filter_tags}{search_indicator}")
+        let pass_ind = if lc.passes_only { " [passes only]" } else { "" };
+        format!("{base}{count}{filter_tags}{search_indicator}{pass_ind}")
     };
 
     f.render_stateful_widget(
@@ -1930,7 +1950,7 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState, clicks: &mut 
         vec![
             Line::from(Span::styled(
                 format!(
-                    " [/] edit search  │  [Esc] clear filter  │  {tag_hint}  │  [c] cram this  │  [e] edit  │  [m] toggle SR/daily  │  [d] delete"
+                    " [/] edit search  │  [Esc] clear filter  │  {tag_hint}  │  [c] cram this  │  [e] edit  │  [M] make multi  │  [p] passes  │  [m] toggle SR/daily  │  [d] delete"
                 ),
                 Style::default().fg(Color::DarkGray),
             )),
@@ -1940,7 +1960,7 @@ pub(super) fn render_list_cards(f: &mut Frame, app: &mut AppState, clicks: &mut 
         vec![
             Line::from(Span::styled(
                 format!(
-                    " [j/k] navigate  │  [/] search  │  {tag_hint}  │  [c] cram this  │  [e] edit  │  [m] toggle SR/daily  │  [d] delete  │  [Esc] back"
+                    " [j/k] navigate  │  [/] search  │  {tag_hint}  │  [c] cram this  │  [e] edit  │  [M] make multi  │  [p] passes  │  [m] toggle SR/daily  │  [d] delete  │  [Esc] back"
                 ),
                 Style::default().fg(Color::DarkGray),
             )),

@@ -1102,6 +1102,25 @@ impl AddCardState {
         self.focused = 2; // jump to Step Name field first
     }
 
+    /// jump to the Step Name field so the next thing typed becomes a new step
+    /// (used right after converting a simple card to a multi-step one)
+    pub fn focus_new_step(&mut self) {
+        if self.kind == AddKind::Multi {
+            self.focused = 2;
+        }
+    }
+
+    /// select the first pass (placeholder) step in the steps list, ready to fill in
+    pub fn focus_first_pass(&mut self) {
+        if self.kind != AddKind::Multi {
+            return;
+        }
+        if let Some(i) = self.steps.iter().position(|d| d.is_pass) {
+            self.step_list_state.select(Some(i));
+            self.focused = 5; // the steps list
+        }
+    }
+
     pub fn is_multiline_field(&self) -> bool {
         match self.kind {
             AddKind::Simple => matches!(self.focused, 1 | 2), // both question or answer
@@ -1155,6 +1174,8 @@ pub struct ListCardsState {
     pub tag_picker_active: bool,
     pub tag_picker_tags:   Vec<String>,
     pub tag_picker_state:  ListState,
+    // show only cards that still have pass (placeholder) steps waiting for an answer
+    pub passes_only:       bool,
 }
 
 impl ListCardsState {
@@ -1173,6 +1194,7 @@ impl ListCardsState {
             tag_picker_active: false,
             tag_picker_tags:   Vec::new(),
             tag_picker_state:  ListState::default(),
+            passes_only:       false,
         }
     }
 
@@ -1195,7 +1217,8 @@ impl ListCardsState {
             };
             let tag_ok = self.tag_filter.is_empty()
                 || self.tag_filter.iter().all(|ft| c.tags.iter().any(|ct| ct == ft));
-            text_ok && tag_ok
+            let pass_ok = !self.passes_only || c.pass_count > 0;
+            text_ok && tag_ok && pass_ok
         }).collect()
     }
 
@@ -2001,4 +2024,17 @@ mod tests {
         assert!(s2.is_references() && !s2.is_save());
     }
 
+    #[test]
+    fn a_converted_simple_card_opens_as_a_one_step_multi_editor() {
+        let store = mem();
+        let id = store
+            .add_simple_card("D", "Q?", "A", false, None, &ReviewMode::SpacedRepetition)
+            .unwrap();
+        store.convert_simple_to_multi(&id).unwrap();
+        let mut s = editor_for(&store, &id);
+        assert_eq!(s.kind, AddKind::Multi);
+        assert_eq!(step_answers(&s), vec!["A"]);
+        s.focus_new_step();
+        assert!(s.is_step_name());
+    }
 }

@@ -291,6 +291,7 @@ pub struct CardSummary {
     pub tags: Vec<String>,
     // space-joined item answers used for answer-scope searching
     pub answers_text: String,
+    pub pass_count: i32,
 }
 
 /// Aggregate counts for the `stats` command.
@@ -302,6 +303,8 @@ pub struct Stats {
     pub review_logs: i64,
     pub daily_cards: i64,
     pub daily_due: i64,
+    pub pass_steps: i64,
+    pub pass_cards: i64,
 }
 
 /// drafts are passed to `Store::add_multi_card` / `update_multi_card` as a

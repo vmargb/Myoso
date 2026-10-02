@@ -20,7 +20,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use rfd::FileDialog;
 
 use crate::db::{ImportOutcome, Store};
-use crate::models::{ReviewMode, SessionLimits};
+use crate::models::{CardKind, ReviewMode, SessionLimits};
 use crate::outline::OutlineSummary;
 
 use state::{
@@ -139,7 +139,7 @@ fn event_loop(
                 }
                 match app.screen {
                     Screen::MainMenu  => on_menu(app, key.code)?,
-                    Screen::Stats     => on_stats(app, key.code),
+                    Screen::Stats     => on_stats(app, key.code)?,
                     Screen::Review    => on_review(app, key.code)?,
                     Screen::AddCard   => on_add_card(app, key)?,
                     Screen::ListDecks => on_list_decks(app, key.code)?,
@@ -168,10 +168,22 @@ fn on_menu(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn on_stats(app: &mut AppState, code: KeyCode) {
-    if matches!(code, KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter) {
-        app.go_back();
+fn on_stats(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => app.go_back(),
+        // [p] open the card list narrowed to cards with pass steps still to fill in
+        KeyCode::Char('p') => {
+            let cards = app.store.list_cards(None)?;
+            let mut lc = ListCardsState::new(cards, None);
+            lc.passes_only = true;
+            let n = lc.filtered_cards().len();
+            lc.list_state.select(if n > 0 { Some(0) } else { None });
+            app.list_cards = Some(lc);
+            app.go_to(Screen::ListCards);
+        }
+        _ => {}
     }
+    Ok(())
 }
 
 fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
@@ -581,15 +593,20 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                                 let deck = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
                                 let sel  = app.list_cards.as_ref()
                                     .and_then(|lc| lc.list_state.selected());
+                                let prev_passes = app.list_cards.as_ref().map_or(false, |lc| lc.passes_only);
                                 let tag_filter = app.list_cards.as_ref()
                                     .map(|lc| lc.tag_filter.clone()).unwrap_or_default();
                                 if let Ok(cards) = app.store.list_cards(deck.as_deref()) {
                                     let mut new_lc = ListCardsState::new(cards, deck);
                                     new_lc.tag_filter = tag_filter;
+                                    new_lc.passes_only = prev_passes;
                                     if let Some(i) = sel {
-                                        new_lc.list_state.select(Some(
-                                            i.min(new_lc.cards.len().saturating_sub(1))
-                                        ));
+                                        let n = new_lc.filtered_cards().len();
+                                        new_lc.list_state.select(if n > 0 {
+                                            Some(i.min(n - 1))
+                                        } else {
+                                            None
+                                        });
                                     }
                                     app.list_cards = Some(new_lc);
                                 }
@@ -634,6 +651,29 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
 
         _ => {}
     }
+    Ok(())
+}
+
+/// id and kind of the card currently highlighted in the card list
+fn selected_card(app: &AppState) -> Option<(String, CardKind)> {
+    app.list_cards.as_ref().and_then(|lc| {
+        let f = lc.filtered_cards();
+        lc.list_state
+            .selected()
+            .and_then(|i| f.get(i).map(|c| (c.card_id.clone(), c.kind.clone())))
+    })
+}
+
+/// open the card editor on an existing card
+fn open_card_editor(app: &mut AppState, id: &str) -> anyhow::Result<()> {
+    let card  = app.store.load_card(id)?;
+    let items = app.store.load_items(id)?;
+    let tags  = app.store.get_card_tags(id)?;
+    let decks = app.store.list_decks().unwrap_or_default();
+    let simple_cards = app.store.list_simple_card_choices().unwrap_or_default();
+    let refs  = app.store.list_reference_ids(id).unwrap_or_default();
+    app.add_card = Some(AddCardState::for_edit(&card, &items, decks, tags, simple_cards, refs));
+    app.go_to(Screen::AddCard);
     Ok(())
 }
 
@@ -808,11 +848,13 @@ fn on_list_cards(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
             if let Some(id) = card_id {
                 app.store.delete_card(&id)?;
                 let deck       = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
+                let prev_passes = app.list_cards.as_ref().map_or(false, |lc| lc.passes_only);
                 let tag_filter = app.list_cards.as_ref()
                     .map(|lc| lc.tag_filter.clone()).unwrap_or_default();
                 let cards = app.store.list_cards(deck.as_deref())?;
                 let mut new_lc = ListCardsState::new(cards, deck);
                 new_lc.tag_filter = tag_filter;
+                new_lc.passes_only = prev_passes;
                 app.list_cards = Some(new_lc);
             }
         } else {
@@ -879,20 +921,40 @@ fn on_list_cards(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
         }
 
         KeyCode::Char('e') => {
-            let card_id = app.list_cards.as_ref().and_then(|lc| {
-                let filtered = lc.filtered_cards();
-                lc.list_state.selected()
-                    .and_then(|i| filtered.get(i).map(|c| c.card_id.clone()))
-            });
-            if let Some(id) = card_id {
-                let card  = app.store.load_card(&id)?;
-                let items = app.store.load_items(&id)?;
-                let tags  = app.store.get_card_tags(&id)?;
-                let decks = app.store.list_decks().unwrap_or_default();
-                let simple_cards = app.store.list_simple_card_choices().unwrap_or_default();
-                let refs  = app.store.list_reference_ids(&id).unwrap_or_default();
-                app.add_card = Some(AddCardState::for_edit(&card, &items, decks, tags, simple_cards, refs));
-                app.go_to(Screen::AddCard);
+            if let Some((id, _)) = selected_card(app) {
+                open_card_editor(app, &id)?;
+                // in the passes-only view, land straight on the first pass step
+                let passes = app.list_cards.as_ref().map_or(false, |lc| lc.passes_only);
+                if passes {
+                    if let Some(s) = app.add_card.as_mut() { s.focus_first_pass(); }
+                }
+            }
+        }
+
+        // [p] toggle "only cards with pass steps still to fill in"
+        KeyCode::Char('p') => {
+            if let Some(lc) = app.list_cards.as_mut() {
+                lc.passes_only = !lc.passes_only;
+                let n = lc.filtered_cards().len();
+                lc.list_state.select(if n > 0 { Some(0) } else { None });
+            }
+        }
+
+        // [M] make the selected simple card multi-step and jump into the editor
+        KeyCode::Char('M') => {
+            if let Some((id, kind)) = selected_card(app) {
+                if kind == CardKind::Simple {
+                    match app.store.convert_simple_to_multi(&id) {
+                        Ok(()) => {
+                            open_card_editor(app, &id)?;
+                            if let Some(s) = app.add_card.as_mut() { s.focus_new_step(); }
+                            app.flash = Some("✓ Converted to multi-step, add your next step".into());
+                        }
+                        Err(e) => app.flash = Some(format!("✗ {e}")),
+                    }
+                } else {
+                    app.flash = Some("Already a multi-step card".into());
+                }
             }
         }
 
@@ -926,11 +988,13 @@ fn on_list_cards(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
                 let deck       = app.list_cards.as_ref().and_then(|lc| lc.deck.clone());
                 let sel        = app.list_cards.as_ref()
                     .and_then(|lc| lc.list_state.selected());
+                let prev_passes = app.list_cards.as_ref().map_or(false, |lc| lc.passes_only);
                 let tag_filter = app.list_cards.as_ref()
                     .map(|lc| lc.tag_filter.clone()).unwrap_or_default();
                 let cards = app.store.list_cards(deck.as_deref())?;
                 let mut new_lc = ListCardsState::new(cards, deck);
                 new_lc.tag_filter = tag_filter;
+                new_lc.passes_only = prev_passes;
                 if let Some(i) = sel {
                     let fc_len = new_lc.filtered_cards().len();
                     new_lc.list_state.select(Some(i.min(fc_len.saturating_sub(1))));

@@ -405,10 +405,12 @@ impl Store {
             .conn
             .prepare(
                 "SELECT c.id, c.kind, c.deck, c.question, c.reversible,
-                        MIN(i.due_at) AS due_at, COUNT(DISTINCT i.id) AS item_count,
+                        COALESCE(MIN(CASE WHEN i.is_pass = 0 THEN i.due_at END), MIN(i.due_at)) AS due_at,
+                        COUNT(DISTINCT i.id) AS item_count,
                         c.review_mode,
                         GROUP_CONCAT(DISTINCT t.name) AS tag_names,
-                        GROUP_CONCAT(i.answer, ' ')   AS answers_text
+                        GROUP_CONCAT(i.answer, ' ')   AS answers_text,
+                        COUNT(DISTINCT CASE WHEN i.is_pass = 1 THEN i.id END) AS pass_count
                 FROM cards c
                 JOIN items i ON i.card_id = c.id
                 LEFT JOIN card_tags ct ON ct.card_id = c.id
@@ -441,6 +443,7 @@ impl Store {
                     review_mode:  rm.parse().unwrap_or_default(),
                     tags,
                     answers_text: answers.unwrap_or_default(),
+                    pass_count:   row.get(10)?,
                 })
             })
             .context("query list_cards")?;
@@ -1205,6 +1208,14 @@ impl Store {
     pub fn stats(&self) -> Result<Stats> {
         let now   = Utc::now().to_rfc3339();
         let today = Utc::now().format("%Y-%m-%d").to_string();
+        let (pass_steps, pass_cards): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT card_id) FROM items WHERE is_pass = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .context("count pass steps")?;
         Ok(Stats {
             cards: self
                 .conn
@@ -1219,7 +1230,7 @@ impl Store {
                 .query_row(
                     "SELECT COUNT(*) FROM items i
                      JOIN cards c ON c.id = i.card_id
-                     WHERE c.review_mode != 'daily' AND i.due_at <= ?1",
+                     WHERE c.review_mode != 'daily' AND i.is_pass = 0 AND i.due_at <= ?1",
                     params![now],
                     |r| r.get(0),
                 )
@@ -1242,12 +1253,15 @@ impl Store {
                     "SELECT COUNT(DISTINCT c.id) FROM cards c
                      JOIN items i ON i.card_id = c.id
                      WHERE c.review_mode = 'daily'
+                       AND i.is_pass = 0
                        AND (i.last_reviewed_at IS NULL
                             OR date(i.last_reviewed_at) < ?1)",
                     params![today],
                     |r| r.get(0),
                 )
                 .context("count daily due")?,
+            pass_steps,
+            pass_cards,
         })
     }
 
@@ -1259,7 +1273,7 @@ impl Store {
                 "SELECT i.due_at, c.question, c.deck
                 FROM items i
                 JOIN cards c ON c.id = i.card_id
-                WHERE c.review_mode != 'daily'
+                WHERE c.review_mode != 'daily' AND i.is_pass = 0
                 ORDER BY i.due_at ASC
                 LIMIT 1",
             )
@@ -1610,6 +1624,50 @@ impl Store {
                     .context("delete reverse item")?;
             }
             (false, false) => {}
+        }
+        Ok(())
+    }
+
+    /// Turn a Simple card into a one-step Multi card. Forward item becomes
+    /// step 1 and keeps its whole schedule, the reverse item is dropped
+    /// and the reference would silently disappear as well
+    pub fn convert_simple_to_multi(&self, card_id: &str) -> Result<()> {
+        let card = self.load_card(card_id)?;
+        if card.kind != CardKind::Simple {
+            anyhow::bail!("only simple cards can be converted");
+        }
+        let used_as_ref: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM card_refs WHERE ref_id=?1",
+                params![card_id],
+                |r| r.get(0),
+            )
+            .context("check card is used as reference")?;
+        if used_as_ref > 0 {
+            anyhow::bail!("this card is attached as a reference to another card; detach it first");
+        }
+
+        let tx = self.begin_if_needed().context("begin convert simple card")?;
+        self.conn
+            .execute("DELETE FROM items WHERE card_id=?1 AND kind='reverse'", params![card_id])
+            .context("drop reverse item")?;
+        self.conn
+            .execute(
+                "UPDATE items SET kind='step', prompt='Step 1', parent_id=NULL, position=1
+                 WHERE card_id=?1 AND kind='forward'",
+                params![card_id],
+            )
+            .context("promote forward item to step")?;
+        self.conn
+            .execute(
+                "UPDATE cards SET kind='multi', reversible=0, show_chain=1, is_tree=1, updated_at=?2
+                 WHERE id=?1",
+                params![card_id, Utc::now().to_rfc3339()],
+            )
+            .context("flip card kind")?;
+        if let Some(tx) = tx {
+            tx.commit().context("commit convert simple card")?;
         }
         Ok(())
     }
@@ -2737,4 +2795,54 @@ mod tests {
         assert!(session.iter().any(|rc| rc.card.id == multi), "the multi card is still due on its own");
     }
 
+    #[test]
+    fn converting_refuses_multi_cards_and_cards_used_as_references() {
+        let store = mem();
+        let simple = store
+            .add_simple_card("D", "S?", "a", false, None, &ReviewMode::SpacedRepetition)
+            .unwrap();
+        let multi = add(&store, &chain_drafts(&["x", "y"]));
+        assert!(store.convert_simple_to_multi(&multi).is_err());
+
+        store.set_card_references(&multi, &[simple.clone()]).unwrap();
+        assert!(store.convert_simple_to_multi(&simple).is_err());
+        assert_eq!(store.load_card(&simple).unwrap().kind, CardKind::Simple);
+
+        store.set_card_references(&multi, &[]).unwrap();
+        assert!(store.convert_simple_to_multi(&simple).is_ok());
+    }
+
+    #[test]
+    fn pass_steps_are_counted_once_and_never_inflate_due_numbers() {
+        let store = mem();
+        let real = draft(0, None, "", "real");
+        let mut pass = draft(1, Some(0), "todo", "");
+        pass.is_pass = true;
+        let id = store
+            .add_multi_card("D", "Q?", &[real, pass], true, &ReviewMode::SpacedRepetition)
+            .unwrap();
+        store.set_card_tags(&id, &["a".to_string(), "b".to_string()]).unwrap();
+
+        let st = store.stats().unwrap();
+        assert_eq!((st.pass_steps, st.pass_cards), (1, 1));
+        assert_eq!(st.due_items, 1, "only the real step is due");
+        assert_eq!(store.list_cards(None).unwrap()[0].pass_count, 1);
+    }
+
+    #[test]
+    fn a_card_with_only_a_pending_pass_step_left_is_not_reported_due() {
+        let store = mem();
+        let real = draft(0, None, "", "real");
+        let mut pass = draft(1, Some(0), "todo", "");
+        pass.is_pass = true;
+        let id = store
+            .add_multi_card("D", "Q?", &[real, pass], true, &ReviewMode::SpacedRepetition)
+            .unwrap();
+        rate(&store, &id, "real", 3);
+        let st = store.stats().unwrap();
+        assert_eq!(st.due_items, 0);
+        let row = &store.list_cards(None).unwrap()[0];
+        assert!(row.due_at > Utc::now(), "list must not show DUE because of a pass step");
+        assert_eq!(row.pass_count, 1);
+    }
 }
