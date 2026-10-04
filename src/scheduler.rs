@@ -21,13 +21,18 @@ const DESIRED_RETENTION: f64 = 0.9;
 
 // ~~~ weak-step handling ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
-/// shared threshold for leech detection, and scaffold graduation
-pub const LEECH_STREAK_THRESHOLD: u32 = 4;
+/// consecutive `Again` ratings after which a step is flagged as a leech
+/// (Anki's default is 8 as well). A leech is only a warning, the review screen
+/// suggests splitting the step into two easier ones
+pub const LEECH_STREAK_THRESHOLD: u32 = 8;
 
 /// Number of most-recent rating events (from `review_log`) inspected for the
 /// oscillating Again/Hard/Again/Hard leech pattern that never produces a
 /// clean consecutive streak of either type alone
-pub const LEECH_LOOKBACK_EVENTS: usize = 6;
+pub const LEECH_LOOKBACK_EVENTS: usize = 10;
+
+/// how many Again/Hard ratings inside that window flag an oscillating leech
+pub const LEECH_OSCILLATION_WEAK: u32 = 8;
 
 // FSRS-5 default weights
 // source: https://github.com/open-spaced-repetition/py-fsrs
@@ -237,10 +242,6 @@ mod tests {
             image_path:       None,
             consecutive_fails: 0,
             consecutive_hards: 0,
-            scaffold_state: crate::models::ScaffoldState::Normal,
-            scaffold_passes: 0,
-            scaffold_pass_date: None,
-            weak_spans: Vec::new(),
             is_pass: false,
         }
     }

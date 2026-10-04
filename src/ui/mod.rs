@@ -191,51 +191,28 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
     let is_done = app.review.as_ref().map_or(true, |r| r.is_done());
     let phase   = app.review.as_ref().map(|r| r.phase);
 
-    // weak-step handling, blocking leech-intervention prompt takes
-    // over the review screens keys entirely until resolved
+    // the blocking leech warning takes over the review screen's keys until
+    // it is dealt with: [s] split the step in the editor, [c] keep going
     let leech_active = app.review.as_ref()
         .map(|r| r.leech_prompt.is_some())
         .unwrap_or(false);
     if leech_active {
         match code {
-            KeyCode::Char('1') => {
-                if let Some(rs) = app.review.as_mut() {
-                    rs.resolve_leech_prompt(store, true)?;
+            KeyCode::Char('s') => {
+                let target = match app.review.as_mut() {
+                    Some(rs) if rs.leech_prompt.as_ref().map_or(false, |p| p.is_step) => {
+                        rs.resolve_leech_prompt(store, true)?
+                    }
+                    _ => None,
+                };
+                if let Some((card_id, item_id)) = target {
+                    open_review_editor(app, &card_id, Some(&item_id))?;
                 }
             }
             KeyCode::Char('c') | KeyCode::Esc | KeyCode::Enter => {
                 if let Some(rs) = app.review.as_mut() {
                     rs.resolve_leech_prompt(store, false)?;
                 }
-            }
-            _ => {}
-        }
-        return Ok(());
-    }
-
-    // weak-step handling
-    if app.review.as_ref().and_then(|r| r.weak_span_prompt.as_ref()).is_some() {
-        match code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(rs) = app.review.as_mut() { rs.weak_span_move_cursor(1); }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(rs) = app.review.as_mut() { rs.weak_span_move_cursor(-1); }
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                if let Some(rs) = app.review.as_mut() { rs.weak_span_move_cursor(-1); }
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                if let Some(rs) = app.review.as_mut() { rs.weak_span_move_cursor(1); }
-            }
-            KeyCode::Char(' ') => {
-                if let Some(rs) = app.review.as_mut() { rs.weak_span_toggle_cursor(); }
-            }
-            KeyCode::Enter => {
-                if let Some(rs) = app.review.as_mut() { rs.weak_span_commit(store)?; }
-            }
-            KeyCode::Esc => {
-                if let Some(rs) = app.review.as_mut() { rs.resolve_weak_span_prompt(store)?; }
             }
             _ => {}
         }
@@ -265,26 +242,6 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
             _ => {}
         }
         return Ok(());
-    }
-
-    // scaffolded item has no reveal gate
-    // cloze-blanked answer is already on screen) and only accepts pass/fail
-    // ([1]/[3]) : [2]/[4] are visibly disabled in the footer and ignored here
-    let is_scaffolded = app.review.as_ref()
-        .filter(|r| !r.is_done())
-        .map(|r| r.session[r.card_idx].items[r.item_idx].scaffold_state.is_scaffolded())
-        .unwrap_or(false);
-    if is_scaffolded && phase == Some(ReviewPhase::Revealed) {
-        match code {
-            KeyCode::Char(c @ ('1' | '3')) => {
-                if let Some(r) = app.review.as_mut() {
-                    r.rate(store, c as u8 - b'0')?;
-                }
-                return Ok(());
-            }
-            KeyCode::Char('2') | KeyCode::Char('4') => return Ok(()), // disabled while scaffolded
-            _ => {}
-        }
     }
 
     match code {
@@ -334,16 +291,7 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 .and_then(|rs| rs.session.get(rs.card_idx))
                 .map(|rc| rc.card.id.clone());
             if let Some(id) = card_id {
-                let card  = app.store.load_card(&id)?;
-                let items = app.store.load_items(&id)?;
-                let tags  = app.store.get_card_tags(&id)?;
-                let decks = app.store.list_decks().unwrap_or_default();
-                let simple_cards = app.store.list_simple_card_choices().unwrap_or_default();
-                let refs  = app.store.list_reference_ids(&id).unwrap_or_default();
-                let mut edit_state = AddCardState::for_edit(&card, &items, decks, tags, simple_cards, refs);
-                edit_state.editing_from_review = true;
-                app.add_card = Some(edit_state);
-                app.go_to(Screen::AddCard);
+                open_review_editor(app, &id, None)?;
             }
         }
         _ => {}
@@ -468,6 +416,11 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
         }
         KeyCode::Char('r') if is_steps_list => {
             app.add_card.as_mut().unwrap().begin_root_path();
+        }
+        // [s] split the selected step in two (the text is copied into both
+        // halves so you can decide where to cut)
+        KeyCode::Char('s') if is_steps_list => {
+            app.add_card.as_mut().unwrap().begin_split_selected_step();
         }
         // [p] toggle the selected step between normal and "pass"
         KeyCode::Char('p') if is_steps_list => {
@@ -662,6 +615,25 @@ fn selected_card(app: &AppState) -> Option<(String, CardKind)> {
             .selected()
             .and_then(|i| f.get(i).map(|c| (c.card_id.clone(), c.kind.clone())))
     })
+}
+
+/// open the editor from inside a review session (saving returns to the
+/// session). With `split_item` the editor starts the split flow on that step
+fn open_review_editor(app: &mut AppState, card_id: &str, split_item: Option<&str>) -> anyhow::Result<()> {
+    let card  = app.store.load_card(card_id)?;
+    let items = app.store.load_items(card_id)?;
+    let tags  = app.store.get_card_tags(card_id)?;
+    let decks = app.store.list_decks().unwrap_or_default();
+    let simple_cards = app.store.list_simple_card_choices().unwrap_or_default();
+    let refs  = app.store.list_reference_ids(card_id).unwrap_or_default();
+    let mut st = AddCardState::for_edit(&card, &items, decks, tags, simple_cards, refs);
+    st.editing_from_review = true;
+    if let Some(item_id) = split_item {
+        st.begin_split_for_item(item_id);
+    }
+    app.add_card = Some(st);
+    app.go_to(Screen::AddCard);
+    Ok(())
 }
 
 /// open the card editor on an existing card
@@ -1469,8 +1441,8 @@ fn on_click(app: &mut AppState, col: u16, row: u16) -> anyhow::Result<()> {
         ClickTarget::ReviewRate(n) => {
             on_review(app, KeyCode::Char((b'0' + n) as char))?;
         }
-        ClickTarget::LeechMarkBlindSpot => {
-            on_review(app, KeyCode::Char('1'))?;
+        ClickTarget::LeechSplit => {
+            on_review(app, KeyCode::Char('s'))?;
         }
         ClickTarget::LeechIgnore => {
             on_review(app, KeyCode::Char('c'))?;
@@ -1540,11 +1512,6 @@ fn on_click(app: &mut AppState, col: u16, row: u16) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
-// ~~~ weak-step handling: leech intervention ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-/// step editor No new editor logic both reuse `AddCardState` exactly
-/// as the normal "edit step" flow does.
 
 // ~~~ Save helper ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

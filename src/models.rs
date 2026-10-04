@@ -82,53 +82,6 @@ pub enum LeechStatus {
     Leech,
 }
 
-// ~~~ weak-step handling: scaffolding ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ScaffoldState {
-    #[default]
-    Normal,
-    Scaffolded,
-}
-
-impl ScaffoldState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ScaffoldState::Normal     => "normal",
-            ScaffoldState::Scaffolded => "scaffolded",
-        }
-    }
-    pub fn is_scaffolded(&self) -> bool { *self == ScaffoldState::Scaffolded }
-}
-
-impl fmt::Display for ScaffoldState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl FromStr for ScaffoldState {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "scaffolded" => Ok(ScaffoldState::Scaffolded),
-            _            => Ok(ScaffoldState::Normal), // graceful fallback
-        }
-    }
-}
-
-/// single (phrase, weight) entry in an item's cloze-deletion span pool
-/// the literal marked substring is stored, not character offsets
-/// if user edits the step's answer later, offsets would silently rot
-/// substring needle just needs a `.contains()` at render time, and if it no
-/// longer matches, it's dropped from the render set rather than an error
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WeakSpan {
-    pub phrase: String,
-    pub weight: u32,
-}
-
 // ~~~ Review mode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -240,19 +193,6 @@ pub struct Item {
     /// Reset to 0 on any confidence >= 3 rating
     #[serde(default)]
     pub consecutive_hards: i32,
-    #[serde(default)]
-    pub scaffold_state: ScaffoldState,
-    /// daily-capped count of scaffolded passes toward graduation back to normal
-    #[serde(default)]
-    pub scaffold_passes: i32,
-    /// Date (RFC3339 date-only, e.g. "2026-08-13") of the last scaffolded
-    #[serde(default)]
-    pub scaffold_pass_date: Option<chrono::NaiveDate>,
-    /// Cloze-deletion span pool, substrings of `answer` the user has
-    /// identified as their own blind spot, with a weight that increases
-    /// each time the same phrase is marked again.
-    #[serde(default)]
-    pub weak_spans: Vec<WeakSpan>,
     /// a placeholder step, doesn't know the answer yet
     #[serde(default)]
     pub is_pass: bool,
@@ -416,4 +356,144 @@ pub fn deck_leaf(deck: &str) -> &str {
 /// "Math"                      -> None
 pub fn deck_parent(deck: &str) -> Option<&str> {
     deck.rfind("::").map(|i| &deck[..i])
+}
+
+// ~~~ Cloze markup ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// A cloze is not a separate kind of card or step: it is ordinary text that
+// contains deletion markers. A step whose answer has markers is a cloze step,
+// and a simple card whose question has markers is a cloze card. Nothing is
+// stored besides the text, so export, import and editing all just work.
+//
+//   {{ln(x)}}          blank, revealed as "ln(x)"
+//   {{c1::ln(x)}}      same (Anki style, the number is ignored)
+//   {{ln(x)::a log}}   same, with a hint shown inside the blank
+//   \{{               a literal "{{" (so code containing braces is safe)
+//
+// Every blank in a step is tested together, so one step is still one
+// retrievable unit with one rating.
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClozePart {
+    Text(String),
+    Blank { answer: String, hint: Option<String> },
+}
+
+/// split `{{c1::answer::hint}}` / `{{answer}}` contents into (answer, hint)
+fn parse_cloze_inner(inner: &str) -> (String, Option<String>) {
+    let mut body = inner.trim();
+    // optional Anki-style "c<digits>::" prefix
+    if let Some(rest) = body.strip_prefix('c') {
+        let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 && rest[digits..].starts_with("::") {
+            body = rest[digits + 2..].trim();
+        }
+    }
+    match body.split_once("::") {
+        Some((a, h)) if !h.trim().is_empty() => (a.trim().to_string(), Some(h.trim().to_string())),
+        Some((a, _)) => (a.trim().to_string(), None),
+        None => (body.to_string(), None),
+    }
+}
+
+pub fn cloze_parts(s: &str) -> Vec<ClozePart> {
+    let mut parts: Vec<ClozePart> = Vec::new();
+    let mut text = String::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        let Some(open) = rest.find("{{") else {
+            text.push_str(rest);
+            break;
+        };
+        // "\{{" is an escaped literal
+        if rest[..open].ends_with('\\') {
+            text.push_str(&rest[..open - 1]);
+            text.push_str("{{");
+            rest = &rest[open + 2..];
+            continue;
+        }
+        let after = &rest[open + 2..];
+        match after.find("}}") {
+            Some(close) if !after[..close].trim().is_empty() && !after[..close].contains("{{") => {
+                text.push_str(&rest[..open]);
+                if !text.is_empty() {
+                    parts.push(ClozePart::Text(std::mem::take(&mut text)));
+                }
+                let (answer, hint) = parse_cloze_inner(&after[..close]);
+                parts.push(ClozePart::Blank { answer, hint });
+                rest = &after[close + 2..];
+            }
+            _ => {
+                // not a valid blank, keep the braces as plain text
+                text.push_str(&rest[..open + 2]);
+                rest = after;
+            }
+        }
+    }
+    if !text.is_empty() {
+        parts.push(ClozePart::Text(text));
+    }
+    parts
+}
+
+/// does this text contain at least one blank?
+pub fn has_cloze(s: &str) -> bool {
+    s.contains("{{") && cloze_parts(s).iter().any(|p| matches!(p, ClozePart::Blank { .. }))
+}
+
+/// the text with every marker removed and the hidden words filled in
+pub fn cloze_plain(s: &str) -> String {
+    if !s.contains("{{") {
+        return s.to_string();
+    }
+    cloze_parts(s)
+        .into_iter()
+        .map(|p| match p {
+            ClozePart::Text(t) => t,
+            ClozePart::Blank { answer, .. } => answer,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cloze_tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_has_no_cloze() {
+        assert!(!has_cloze("no blanks here"));
+        assert_eq!(cloze_plain("no blanks here"), "no blanks here");
+    }
+
+    #[test]
+    fn basic_anki_and_hint_forms_are_understood() {
+        assert_eq!(
+            cloze_parts("d/dx {{ln(x)}} = 1/x"),
+            vec![
+                ClozePart::Text("d/dx ".into()),
+                ClozePart::Blank { answer: "ln(x)".into(), hint: None },
+                ClozePart::Text(" = 1/x".into()),
+            ]
+        );
+        assert_eq!(
+            cloze_parts("{{c2::Paris::capital}}"),
+            vec![ClozePart::Blank { answer: "Paris".into(), hint: Some("capital".into()) }]
+        );
+        assert_eq!(cloze_plain("a {{b}} c {{c1::d}}"), "a b c d");
+    }
+
+    #[test]
+    fn unterminated_empty_and_escaped_braces_stay_literal() {
+        assert!(!has_cloze("open {{ never closed"));
+        assert!(!has_cloze("empty {{}} braces"));
+        assert!(!has_cloze("{{   }}"));
+        assert!(!has_cloze("literal \\{{x}} braces"));
+        assert_eq!(cloze_plain("literal \\{{x}} braces"), "literal {{x}} braces");
+    }
+
+    #[test]
+    fn blanks_may_span_lines_and_non_ascii_is_safe() {
+        assert!(has_cloze("héllo {{wörld\nline}} ✓"));
+        assert_eq!(cloze_plain("héllo {{wörld\nline}} ✓"), "héllo wörld\nline ✓");
+    }
 }

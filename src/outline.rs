@@ -545,7 +545,9 @@ fn convert(v: &Value) -> Result<OutlineCard, String> {
 
     let has = |k: &str| m.get(k).is_some();
     let shapes = ["answer", "steps", "paths"].iter().filter(|k| has(k)).count();
-    if shapes == 0 {
+    // a cloze card carries its blanks in the question, so "answer" is optional
+    let cloze_simple = shapes == 0 && crate::models::has_cloze(&question);
+    if shapes == 0 && !cloze_simple {
         return Err("needs one of \"answer\" (a simple card), \"steps\" (a chain), or \"paths\" \
                     (alternative chains)"
             .to_string());
@@ -553,17 +555,24 @@ fn convert(v: &Value) -> Result<OutlineCard, String> {
     if shapes > 1 {
         return Err("use only ONE of \"answer\", \"steps\" and \"paths\" on a card".to_string());
     }
-    if has("reversible") && !has("answer") {
+    if has("reversible") && !has("answer") && !cloze_simple {
         return Err("\"reversible\" only applies to simple cards (those with an \"answer\")".to_string());
     }
 
-    let body = if has("answer") {
+    let body = if has("answer") || cloze_simple {
         let reversible = match m.get("reversible") {
             None | Some(Value::Null) => false,
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err("\"reversible\" must be true or false".to_string()),
         };
-        Body::Simple { answer: required_text(m, "answer", "")?, reversible }
+        if crate::models::has_cloze(&question) {
+            if reversible {
+                return Err("a cloze card (blanks in the question) cannot be reversible".to_string());
+            }
+            Body::Simple { answer: optional_text(m, "answer", "")?.unwrap_or_default(), reversible }
+        } else {
+            Body::Simple { answer: required_text(m, "answer", "")?, reversible }
+        }
     } else {
         let mut b = Builder { drafts: Vec::new() };
         if has("steps") {

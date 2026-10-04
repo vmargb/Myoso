@@ -14,9 +14,9 @@ use ratatui::{
 
 use super::state::{
     AddCardState, AddKind, AddPhase, AppState, ClickTarget, ExportFocus, ImportFocus,
-    LeechPrompt, ListCardsState, MENU_ITEMS, ReviewFocus, ReviewPhase, WeakSpanPrompt,
+    LeechPrompt, ListCardsState, MENU_ITEMS, ReviewFocus, ReviewPhase,
 };
-use crate::models::{CardKind, Item, ItemKind, ReviewMode};
+use crate::models::{CardKind, ItemKind, ReviewMode};
 
 // ~~~ click-region helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
@@ -328,91 +328,49 @@ pub(super) fn render_stats(f: &mut Frame, app: &AppState) {
 
 // ~~ Review ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-/// Weak-step handling Phase 2: pick which phrases get cloze-blanked (and
-/// later highlighted on reveal) for a scaffolded item. Prefers the user's
-/// own weight-sorted weak spans 
-fn select_cloze_phrases(item: &Item) -> Vec<String> {
-    let mut spans: Vec<&crate::models::WeakSpan> = item
-        .weak_spans
-        .iter()
-        .filter(|s| item.answer.contains(s.phrase.as_str()))
-        .collect();
-    spans.sort_by(|a, b| b.weight.cmp(&a.weight));
-
-    let mut phrases: Vec<String> = spans.into_iter().take(3).map(|s| s.phrase.clone()).collect();
-
-    phrases.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
-    phrases
-}
-
-/// Pre-reveal: the answer with each selected phrase replaced by a blank of
-/// matching visual width.
-fn blank_text(answer: &str, phrases: &[String]) -> String {
-    let mut out = answer.to_string();
-    for p in phrases {
-        if p.is_empty() {
-            continue;
+/// push `t` onto the line being built, starting new lines at every '\n'
+fn push_cloze_text(lines: &mut Vec<Vec<Span<'static>>>, t: &str, style: Style) {
+    let mut first = true;
+    for seg in t.split('\n') {
+        if !first {
+            lines.push(Vec::new());
         }
-        let blank = "▁".repeat(p.chars().count().max(3));
-        out = out.replace(p.as_str(), &blank);
+        first = false;
+        if !seg.is_empty() {
+            lines.last_mut().unwrap().push(Span::styled(seg.to_string(), style));
+        }
     }
-    out
 }
 
-/// Post-reveal: the full, un-blanked answer with the tested phrases
-/// highlighted, so the user can directly check their recall against what
-/// was actually asked, the whole point of a reveal step.
-fn highlight_lines(answer: &str, phrases: &[String]) -> Vec<Line<'static>> {
-    answer
-        .lines()
-        .map(|line| {
-            let mut segments: Vec<(String, bool)> = vec![(line.to_string(), false)];
-            for p in phrases {
-                if p.is_empty() {
-                    continue;
+/// Render text containing `{{blanks}}`. Hidden: each blank is `[…]` (or its
+/// hint) in the accent colour. Revealed: the answers are filled in and
+/// highlighted so the user can check their recall at a glance.
+fn cloze_lines(text: &str, revealed: bool, base: Style) -> Vec<Line<'static>> {
+    use crate::models::{cloze_parts, ClozePart};
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    for part in cloze_parts(text) {
+        match part {
+            ClozePart::Text(t) => push_cloze_text(&mut lines, &t, base),
+            ClozePart::Blank { answer, hint } => {
+                if revealed {
+                    let style = Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD);
+                    push_cloze_text(&mut lines, &answer, style);
+                } else {
+                    let label = match hint {
+                        Some(h) => format!("[{h}]"),
+                        None => "[…]".to_string(),
+                    };
+                    let style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                    push_cloze_text(&mut lines, &label, style);
                 }
-                let mut next = Vec::new();
-                for (seg, hl) in segments {
-                    if hl {
-                        next.push((seg, hl));
-                        continue;
-                    }
-                    let mut rest = seg.as_str();
-                    while let Some(idx) = rest.find(p.as_str()) {
-                        if idx > 0 {
-                            next.push((rest[..idx].to_string(), false));
-                        }
-                        next.push((p.clone(), true));
-                        rest = &rest[idx + p.len()..];
-                    }
-                    if !rest.is_empty() {
-                        next.push((rest.to_string(), false));
-                    }
-                }
-                segments = next;
             }
-            let spans: Vec<Span<'static>> = segments
-                .into_iter()
-                .map(|(text, hl)| {
-                    if hl {
-                        Span::styled(
-                            text,
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        Span::styled(text, Style::default())
-                    }
-                })
-                .collect();
-            Line::from(spans)
-        })
-        .collect()
+        }
+    }
+    lines.into_iter().map(Line::from).collect()
 }
-
-
 
 pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) {
     let size = f.area();
@@ -429,7 +387,10 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
 
     let rc   = &rs.session[rs.card_idx];
     let item = &rc.items[rs.item_idx];
-    let is_scaffolded = item.scaffold_state.is_scaffolded();
+    // a cloze is just text with {{blanks}}: a step whose answer has them, or a
+    // simple card whose question has them
+    let is_cloze_step = item.kind == ItemKind::Step && crate::models::has_cloze(&item.answer);
+    let is_cloze_card = item.kind == ItemKind::Forward && crate::models::has_cloze(&item.prompt);
 
     let v = Layout::default()
         .direction(Direction::Vertical)
@@ -546,7 +507,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
                         Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                     )));
                 } else {
-                    for l in prev.answer.lines() {
+                    for l in crate::models::cloze_plain(&prev.answer).lines() {
                         context_lines.push(Line::from(Span::styled(
                             format!("    {l}"),
                             Style::default().fg(Color::DarkGray),
@@ -671,22 +632,26 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
     }
 
     let mut lines: Vec<Line> = vec![Line::from(""), Line::from("")];
-    for l in display_prompt.lines() {
-        lines.push(Line::from(Span::styled(
-            l.to_string(),
+    if is_cloze_card {
+        lines.extend(cloze_lines(
+            &item.prompt,
+            rs.phase == ReviewPhase::Revealed,
             Style::default().add_modifier(Modifier::BOLD),
-        )));
+        ));
+    } else {
+        for l in display_prompt.lines() {
+            lines.push(Line::from(Span::styled(
+                l.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        }
     }
     lines.push(Line::from(""));
     lines.extend(context_lines);
 
-    let border_color = if is_scaffolded {
-        Color::Magenta
-    } else {
-        match rs.phase {
-            ReviewPhase::Thinking => Color::DarkGray,
-            ReviewPhase::Revealed => Color::Cyan,
-        }
+    let border_color = match rs.phase {
+        ReviewPhase::Thinking => Color::DarkGray,
+        ReviewPhase::Revealed => Color::Cyan,
     };
 
     let ans_title = match rs.phase {
@@ -695,93 +660,55 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         ReviewPhase::Revealed => " Answer ".to_string(),
     };
 
-    if is_scaffolded {
-        // no reveal gate, the (cloze-blanked) answer is always on screen
-        lines.push(Line::from(""));
-        let divider_width = (card.width as usize).saturating_sub(4).clamp(10, 60);
-        lines.push(Line::from(Span::styled(
-            format!("  {}", "─".repeat(divider_width)),
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(vec![
-            Span::styled(
-                " Scaffolded ",
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" pass {}/{} to graduate", item.scaffold_passes.max(0), crate::scheduler::LEECH_STREAK_THRESHOLD),
+    // a cloze card has nothing more to show once its blanks are filled in,
+    // unless it also carries an extra answer or image
+    let has_extra = !item.answer.trim().is_empty() || item.image_path.is_some();
+    match rs.phase {
+        ReviewPhase::Thinking => {
+            if is_cloze_step {
+                // the step itself is the question: its answer with the blanks left open
+                lines.push(Line::from(""));
+                lines.extend(cloze_lines(&item.answer, false, Style::default()));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [ Space / Enter to reveal ]",
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-            ),
-        ]));
-        lines.push(Line::from(""));
-
-        let phrases = select_cloze_phrases(item);
-        match rs.phase {
-            ReviewPhase::Thinking => {
-                // Cloze rendering is plain text (not markdown-rendered)
-                for l in blank_text(&item.answer, &phrases).lines() {
-                    lines.push(Line::from(Span::styled(l.to_string(), Style::default())));
-                }
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "  [ Space / Enter to reveal ]",
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                )));
-            }
-            ReviewPhase::Revealed => {
-                // Full answer, with the tested phrase(s) highlighted so the
-                // user can directly confirm their recall was right.
-                lines.extend(highlight_lines(&item.answer, &phrases));
-            }
+            )));
         }
-    } else {
-        match rs.phase {
-            ReviewPhase::Thinking => {
+        ReviewPhase::Revealed if is_cloze_card && !has_extra => {}
+        ReviewPhase::Revealed => {
+            lines.push(Line::from(""));
+            let divider_width = (card.width as usize).saturating_sub(4).clamp(10, 60);
+            lines.push(Line::from(Span::styled(
+                format!("  {}", "─".repeat(divider_width)),
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                ans_title.trim().to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+
+            if item.image_path.is_some() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  Image attached  ",
+                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("press ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "[o]",
+                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" to open", Style::default().fg(Color::DarkGray)),
+                ]));
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "  [ Space / Enter to reveal ]",
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                )));
             }
-            ReviewPhase::Revealed => {
-                lines.push(Line::from(""));
-                let divider_width = (card.width as usize).saturating_sub(4).clamp(10, 60);
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", "─".repeat(divider_width)),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                lines.push(Line::from(Span::styled(
-                    ans_title.trim().to_string(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::from(""));
 
-                if item.image_path.is_some() {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "  Image attached  ",
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            "press ",
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            "[o]",
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            " to open",
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                    lines.push(Line::from(""));
-                }
-
+            if is_cloze_step {
+                lines.extend(cloze_lines(&item.answer, true, Style::default()));
+            } else {
                 let rendered = crate::markdown::render(&item.answer);
                 lines.extend(rendered.lines);
             }
@@ -827,43 +754,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         );
     }
 
-    let footer = if is_scaffolded && rs.phase == ReviewPhase::Thinking {
-        Line::from(vec![
-            Span::styled(
-                " [Space] ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Reveal  "),
-            Span::styled(
-                " (blanks stay hidden until you reveal)  ",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-            ),
-            Span::styled(" [q] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw("Quit"),
-        ])
-    } else if is_scaffolded {
-        // Weak-step handling Phase 2: grading is pass/fail only while
-        // scaffolded, [1] Fail and [3] Good/Pass reuse the existing
-        // Again/Good confidence semantics end-to-end (chain de-unlock,
-        // review_log, rolling averages), just with [2]/[4] not offered.
-        let spans = vec![
-            Span::styled(" [1] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Span::raw("Fail  "),
-            Span::styled(" [3] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw("Pass  "),
-            Span::styled(
-                " (2/4 unavailable while scaffolded)  ",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-            ),
-            Span::styled(" [e] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw("Edit"),
-        ];
-        register_span_clicks(clicks, v[2], &spans, &[
-            ("[1]", ClickTarget::ReviewRate(1)),
-            ("[3]", ClickTarget::ReviewRate(3)),
-        ]);
-        Line::from(spans)
-    } else if rs.phase == ReviewPhase::Thinking {
+    let footer = if rs.phase == ReviewPhase::Thinking {
         Line::from(vec![
             Span::styled(
                 " [Space] ",
@@ -942,45 +833,48 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
     if let Some(prompt) = rs.leech_prompt.as_ref() {
         render_leech_prompt(f, prompt, size, clicks);
     }
-    if let Some(prompt) = rs.weak_span_prompt.as_ref() {
-        render_weak_span_prompt(f, prompt, size);
-    }
 }
 
-/// Blocking rename/split intervention prompt
+/// Blocking leech warning: the step keeps failing, so suggest splitting it
 fn render_leech_prompt(f: &mut Frame, prompt: &LeechPrompt, size: Rect, clicks: &mut Clicks) {
-    let height = 9;
-    let area = centered_rect(60, height, size);
+    let area = centered_rect(64, 9, size);
     f.render_widget(Clear, area);
 
     let title: String = prompt.prompt_text.chars().take(40).collect();
     let ellipsis = if prompt.prompt_text.chars().count() > 40 { "…" } else { "" };
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            " This step keeps giving you trouble ",
+            " This step keeps giving you trouble",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            " what do you want to do?",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            " A step this hard is usually too big to hold at once.",
+            Style::default().fg(Color::Yellow),
         )),
         Line::from(Span::styled(
             format!(" \"{title}{ellipsis}\""),
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(" [1] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Mark blind spot  "),
-            Span::styled("(tag the exact words that tripped you up)", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
-            Span::styled(" [c] ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
-            Span::raw("Ignore"),
-        ]),
     ];
+    if prompt.is_step {
+        lines.push(Line::from(vec![
+            Span::styled(" [s] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Split into two steps  "),
+            Span::styled("(editor opens with a copy)", Style::default().fg(Color::DarkGray)),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " (make it multi-step with [M] in the card list to split it)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(" [c] ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::raw("Keep going"),
+    ]));
 
     f.render_widget(
         Paragraph::new(lines)
@@ -997,70 +891,10 @@ fn render_leech_prompt(f: &mut Frame, prompt: &LeechPrompt, size: Rect, clicks: 
 
     // click regions, one row each starting after the 5-line header
     let base_y = area.y + 6;
-    clicks.push((Rect { x: area.x, y: base_y, width: area.width, height: 1 }, ClickTarget::LeechMarkBlindSpot));
+    if prompt.is_step {
+        clicks.push((Rect { x: area.x, y: base_y, width: area.width, height: 1 }, ClickTarget::LeechSplit));
+    }
     clicks.push((Rect { x: area.x, y: base_y + 1, width: area.width, height: 1 }, ClickTarget::LeechIgnore));
-}
-
-/// Weak-span marking prompt. Entirely skippable
-/// fires after any confidence <= 2 rating so the user can tag
-/// the exact words they blanked on
-fn render_weak_span_prompt(f: &mut Frame, prompt: &WeakSpanPrompt, size: Rect) {
-    let height = (prompt.words.len() as u16 + 8).min(size.height.saturating_sub(2)).max(10);
-    let area = centered_rect(64, height, size);
-    f.render_widget(Clear, area);
-
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            " Mark the word(s) you blanked on (optional)",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            " [space] toggle   [enter] mark phrase   [esc] done",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-    ];
-
-    // wrap the word list across lines of around 8 words so long answers stay readable
-    let mut cur = vec![Span::raw(" ")];
-    for (i, w) in prompt.words.iter().enumerate() {
-        let selected = prompt.selected.contains(&i);
-        let is_cursor = i == prompt.cursor;
-        let style = match (selected, is_cursor) {
-            (true, true)  => Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
-            (true, false) => Style::default().fg(Color::Black).bg(Color::Cyan),
-            (false, true) => Style::default().fg(Color::Yellow).add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
-            (false, false)=> Style::default(),
-        };
-        cur.push(Span::styled(format!("{w} "), style));
-        if (i + 1) % 8 == 0 {
-            lines.push(Line::from(std::mem::replace(&mut cur, vec![Span::raw(" ")])));
-        }
-    }
-    if cur.len() > 1 {
-        lines.push(Line::from(cur));
-    }
-    lines.push(Line::from(""));
-    if prompt.committed_any {
-        lines.push(Line::from(Span::styled(
-            " ✓ marked, select more, or press esc when done",
-            Style::default().fg(Color::Green),
-        )));
-    }
-
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Thick)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(" Mark blind spot "),
-            )
-            .wrap(Wrap { trim: true }),
-        area,
-    );
 }
 
 fn render_nothing_due(f: &mut Frame, app: &AppState, size: Rect, cram: bool) {
@@ -1513,9 +1347,13 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
     clicks.push((v[3], ClickTarget::AddCardField(1)));
 
     // say where the step being typed will attach (after / under / a new path)
-    let name_title = match s.attach_hint() {
-        Some(h) => format!(" Step Name  (optional)  →  {h} "),
-        None    => " Step Name  (optional, leave blank for 'Step N') ".to_string(),
+    let name_title = if let Some(h) = s.split_hint() {
+        format!(" Step Name  →  {h} ")
+    } else {
+        match s.attach_hint() {
+            Some(h) => format!(" Step Name  (optional)  →  {h} "),
+            None    => " Step Name  (optional, leave blank for 'Step N') ".to_string(),
+        }
     };
     f.render_widget(
         Paragraph::new(with_cursor(&s.step_name_buf, s.focused == 2))
@@ -1525,11 +1363,17 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
     );
     clicks.push((v[4], ClickTarget::AddCardField(2)));
 
-    let answer_title = match (s.focused == 3, s.step_image_path.is_some()) {
-        (true,  true)  => " Step Answer  [Enter] newline  │  [Ctrl+e] editor  │  [Ctrl+o] change image  [IMG ✓ ] ",
-        (true,  false) => " Step Answer  [Enter] newline  │  [ctrl+e] editor  │  [Ctrl+o] open image ",
-        (false, true)  => " Step Answer  [IMG ✓ ] ",
-        (false, false) => " Step Answer ",
+    let split_title: String;
+    let answer_title: &str = if let Some(h) = s.split_hint() {
+        split_title = format!(" Step Answer  →  {h}  │  [Ctrl+e] editor ");
+        &split_title
+    } else {
+        match (s.focused == 3, s.step_image_path.is_some()) {
+            (true,  true)  => " Step Answer  [Enter] newline  │  [Ctrl+e] editor  │  [Ctrl+o] change image  [IMG ✓ ] ",
+            (true,  false) => " Step Answer  [Enter] newline  │  [ctrl+e] editor  │  [Ctrl+o] open image ",
+            (false, true)  => " Step Answer  [IMG ✓ ] ",
+            (false, false) => " Step Answer ",
+        }
     };
     let step_text    = with_cursor(&s.step_buf, s.focused == 3);
     let step_lines   = step_text.lines().count() as u16;
@@ -1594,7 +1438,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
     };
 
     let list_title = if s.focused == 5 {
-        format!(" Steps ({})  [Enter] edit  [i] insert  [b] branch  [r] new path  [p] pass  [d] del  [D] del+below ", s.steps.len())
+        format!(" Steps ({})  [Enter] edit  [i] insert  [b] branch  [r] new path  [p] pass  [s] split  [d] del  [D] del+below ", s.steps.len())
     } else {
         format!(" Steps ({}) ", s.steps.len())
     };

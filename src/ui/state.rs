@@ -11,8 +11,8 @@ use ratatui::{layout::Rect, widgets::ListState};
 
 use crate::db::Store;
 use crate::models::{
-    Card, CardKind, CardSummary, Item, ItemKind, LeechStatus, ReviewCard, ReviewMode, Stats,
-    SessionLimits, StepDraft,
+    has_cloze, Card, CardKind, CardSummary, Item, ItemKind, LeechStatus, ReviewCard, ReviewMode,
+    Stats, SessionLimits, StepDraft,
 };
 use crate::tree;
 
@@ -38,59 +38,18 @@ pub enum ReviewPhase {
     Revealed,
 }
 
-// ~~~ leech intervention ~~~~~~~~~~~~~~~~~~~~~~~~~
+// ~~~ leech warning ~~~~~~~~~~~~~~~~~~~~~~~~~
 //
-// when a rating pushes a steps leech status to `Leech`, the review UI must
-// block on a rename/split intervention prompt before the normal
-// advance/chain-fail logic runs.
+// when a rating pushes a step's leech status to `Leech`, the review UI blocks
+// on a warning before the normal advance/chain-fail logic runs. It suggests
+// splitting the step into two smaller ones (steps only) or carrying on.
 pub struct LeechPrompt {
     pub item_id:      String,
     pub card_id:      String,
     pub prompt_text:  String,
-    pub answer_text:  String,
     pub is_step:      bool,
     pub is_last_item: bool,
     pub confidence:   u8,
-}
-
-// ~~~ weak-span marking ~~~~~~~~~~~~~~~~~~~~~~~~~~
-//
-// fires after any confidence <= 2 rating (regardless of current scaffold
-// state), offering a lightweight, entirely skippable way to tag the exact
-// words that tripped the user up. Carries the same
-// finish_rating() fields as LeechPrompt for the same reason, it can appear
-// either directly from rate(), or chained after a leech prompt
-pub struct WeakSpanPrompt {
-    pub item_id:      String,
-    pub card_id:      String,
-    pub is_step:      bool,
-    pub is_last_item: bool,
-    pub confidence:   u8,
-    // the answer, tokenized on whitespace in original order
-    pub words:        Vec<String>,
-    // indices into `words` currently toggled on, building up one phrase
-    pub selected:      HashSet<usize>,
-    // list-navigation cursor
-    pub cursor:        usize,
-    // true once at least one phrase has been committed this prompt, purely
-    // for the "marked!" confirmation flash in the footer
-    pub committed_any: bool,
-}
-
-impl WeakSpanPrompt {
-    fn new(item_id: String, card_id: String, is_step: bool, is_last_item: bool, confidence: u8, answer: &str) -> Self {
-        Self {
-            item_id,
-            card_id,
-            is_step,
-            is_last_item,
-            confidence,
-            words: answer.split_whitespace().map(str::to_string).collect(),
-            selected: HashSet::new(),
-            cursor: 0,
-            committed_any: false,
-        }
-    }
 }
 
 // ~~~ Feynman scratchpad ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -119,8 +78,6 @@ pub struct ReviewState {
     // update analytics, leaving the schedule unchanged
     pub session_rated:     HashSet<String>,
     pub leech_prompt:      Option<LeechPrompt>,
-    // either directly or chained after a leech prompt resolves
-    pub weak_span_prompt:  Option<WeakSpanPrompt>,
     pub scratchpad:        String, // feynman technique
     pub scratchpad_open:   bool,
     pub focus:             ReviewFocus,
@@ -147,7 +104,6 @@ impl ReviewState {
             answer_scroll: 0,
             session_rated: HashSet::new(),
             leech_prompt: None,
-            weak_span_prompt: None,
             scratchpad: String::new(),
             scratchpad_open: false,
             focus: ReviewFocus::Card,
@@ -300,8 +256,8 @@ impl ReviewState {
     }
 
     pub fn rate(&mut self, store: &Store, confidence: u8) -> anyhow::Result<()> {
-        // ignore rating input while a blocking leech intervention, or the
-        if self.is_done() || self.leech_prompt.is_some() || self.weak_span_prompt.is_some() {
+        // ignore rating input while the blocking leech warning is open
+        if self.is_done() || self.leech_prompt.is_some() {
             return Ok(());
         }
 
@@ -316,7 +272,6 @@ impl ReviewState {
         let item         = &self.session[self.card_idx].items[self.item_idx];
         let item_id      = item.id.clone();
         let prompt_text  = item.prompt.clone();
-        let answer_text  = item.answer.clone();
         let is_step      = item.kind == ItemKind::Step;
         let is_last_item = self.item_idx == self.session[self.card_idx].items.len() - 1;
         let card_id      = self.session[self.card_idx].card.id.clone();
@@ -341,35 +296,27 @@ impl ReviewState {
                 // The step that triggered the session must always be a
                 // full-weight test
                 self.leech_prompt = Some(LeechPrompt {
-                    item_id, card_id, prompt_text, answer_text, is_step, is_last_item, confidence,
+                    item_id, card_id, prompt_text, is_step, is_last_item, confidence,
                 });
                 return Ok(());
             }
             LeechStatus::None => {}
         }
 
-        // Weak-span marking is only offered as a follow-on to an actual
-        // leech trigger (see resolve_leech_prompt below), never on a plain
-        // Again/Hard rating by itself — it's a "you've now got a confirmed
-        // leech, want to pin down the exact words?" tool, not a prompt on
-        // every low rating.
         self.finish_rating(store, &card_id, confidence, is_step, is_last_item)
     }
 
-    /// Resolve a pending leech intervention.
-    /// `mark_blind_spot == true`: chain into the weak-span prompt so the
-    /// `mark_blind_spot == false`: "Ignore": just finish the rating as normal.
-    pub fn resolve_leech_prompt(&mut self, store: &Store, mark_blind_spot: bool) -> anyhow::Result<()> {
-        if let Some(p) = self.leech_prompt.take() {
-            if mark_blind_spot {
-                self.weak_span_prompt = Some(WeakSpanPrompt::new(
-                    p.item_id, p.card_id, p.is_step, p.is_last_item, p.confidence, &p.answer_text,
-                ));
-                return Ok(());
-            }
-            self.finish_rating(store, &p.card_id, p.confidence, p.is_step, p.is_last_item)?;
-        }
-        Ok(())
+    /// Resolve the pending leech warning and finish the rating as normal.
+    /// With `split == true` the (card id, item id) of the failing step is
+    /// returned so the caller can open the editor on it, otherwise `None`.
+    pub fn resolve_leech_prompt(
+        &mut self,
+        store: &Store,
+        split: bool,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let Some(p) = self.leech_prompt.take() else { return Ok(None) };
+        self.finish_rating(store, &p.card_id, p.confidence, p.is_step, p.is_last_item)?;
+        Ok(if split && p.is_step { Some((p.card_id, p.item_id)) } else { None })
     }
 
     fn finish_rating(
@@ -409,56 +356,6 @@ impl ReviewState {
             self.finished_duration = Some(self.started_at.elapsed());
         }
 
-        Ok(())
-    }
-
-    // ~~ weak-span marking interaction (Phase 2) ~~~~~~~~~~~
-
-    pub fn weak_span_move_cursor(&mut self, delta: i32) {
-        if let Some(p) = self.weak_span_prompt.as_mut() {
-            if p.words.is_empty() {
-                return;
-            }
-            let len = p.words.len() as i32;
-            let new = (p.cursor as i32 + delta).rem_euclid(len);
-            p.cursor = new as usize;
-        }
-    }
-
-    pub fn weak_span_toggle_cursor(&mut self) {
-        if let Some(p) = self.weak_span_prompt.as_mut() {
-            if p.words.is_empty() {
-                return;
-            }
-            if !p.selected.remove(&p.cursor) {
-                p.selected.insert(p.cursor);
-            }
-        }
-    }
-
-    /// Commit the currently-toggled words as one phrase
-    pub fn weak_span_commit(&mut self, store: &Store) -> anyhow::Result<()> {
-        if let Some(p) = self.weak_span_prompt.as_mut() {
-            if p.selected.is_empty() {
-                return Ok(());
-            }
-            let mut idxs: Vec<usize> = p.selected.iter().copied().collect();
-            idxs.sort_unstable();
-            let phrase = idxs.iter().map(|&i| p.words[i].as_str())
-                .collect::<Vec<_>>().join(" ");
-
-            store.add_weak_span(&p.item_id, &phrase)?;
-            p.selected.clear();
-            p.committed_any = true;
-        }
-        Ok(())
-    }
-
-    /// Finish the weak-span prompt
-    pub fn resolve_weak_span_prompt(&mut self, store: &Store) -> anyhow::Result<()> {
-        if let Some(p) = self.weak_span_prompt.take() {
-            self.finish_rating(store, &p.card_id, p.confidence, p.is_step, p.is_last_item)?;
-        }
         Ok(())
     }
 
@@ -630,6 +527,10 @@ pub struct AddCardState {
     pub reference_buf:       String,
     // which of `reference_matches()` is highlighted (Up/Down), attached on Enter
     pub reference_idx:       usize,
+    // split flow: key of the step being trimmed to its first half, and of the
+    // copy that becomes the second half (see `begin_split_selected_step`)
+    pub split_first:         Option<u32>,
+    pub split_pending:       Option<u32>,
 }
 
 impl AddCardState {
@@ -663,6 +564,8 @@ impl AddCardState {
             reference_ids:       Vec::new(),
             reference_buf:       String::new(),
             reference_idx:       0,
+            split_first:         None,
+            split_pending:       None,
         }
     }
 
@@ -918,6 +821,7 @@ impl AddCardState {
         let answer = self.step_buf.trim().to_string();
         let name   = self.step_name_buf.trim().to_string();
         let img = self.step_image_path.take();
+        let mut edited_key: Option<u32> = None;
         if !answer.is_empty() {
             if let Some(idx) = self.editing_step_idx {
                 if idx < self.steps.len() {
@@ -927,6 +831,7 @@ impl AddCardState {
                     self.steps[idx].image   = img;
                     // a real answer was just written, this is no longer a pass
                     self.steps[idx].is_pass = false;
+                    edited_key = Some(self.steps[idx].key);
                 }
                 self.editing_step_idx = None;
                 self.focused = 5; // jump back to the list after editing
@@ -949,6 +854,17 @@ impl AddCardState {
             // resets after commit
             self.step_name_buf.clear();
             self.step_buf.clear();
+            // split flow: after the first half is trimmed, go straight on to the second
+            if let Some(k) = edited_key {
+                if self.split_first == Some(k) {
+                    self.split_first = None;
+                    if let Some(next) = self.split_pending {
+                        self.begin_edit_key(next);
+                    }
+                } else if self.split_pending == Some(k) {
+                    self.split_pending = None;
+                }
+            }
         } else if let Some(idx) = self.editing_step_idx {
             // cancel edit if user submits blank answer UNLESS the step is
             // (or was) a pass step, re-saving a pass step with no answer
@@ -1021,8 +937,11 @@ impl AddCardState {
         };
         if q.trim().is_empty() { return Err("Question cannot be empty."); }
         match self.kind {
-            AddKind::Simple if self.answer.trim().is_empty() =>
-                Err("Answer cannot be empty."),
+            // a cloze card keeps its blanks in the question, so it needs no answer
+            AddKind::Simple if self.answer.trim().is_empty() && !has_cloze(&self.simple_question) =>
+                Err("Answer cannot be empty (or put {{blanks}} in the question for a cloze card)."),
+            AddKind::Simple if self.reversible && has_cloze(&self.simple_question) =>
+                Err("A cloze card can't be reversible."),
             AddKind::Multi if self.steps.is_empty() =>
                 Err("Add at least one step (type in the step field, then press the Add step button)."),
             // a pass step deliberately has no answer, so it doesn't count
@@ -1100,6 +1019,72 @@ impl AddCardState {
         self.step_name_buf.clear();
         self.step_buf.clear();
         self.focused = 2; // jump to Step Name field first
+    }
+
+    /// load step `key` into the step editor boxes and start editing it, with the
+    /// cursor in the answer
+    fn begin_edit_key(&mut self, key: u32) -> bool {
+        let Some(i) = self.steps.iter().position(|d| d.key == key) else { return false };
+        let d = self.steps[i].clone();
+        self.step_name_buf = d.name;
+        self.step_buf = d.answer;
+        self.step_image_path = d.image;
+        self.pending_parent = None;
+        self.editing_step_idx = Some(i);
+        self.step_list_state.select(Some(i));
+        self.focused = 3;
+        true
+    }
+
+    /// [s] on the steps list: split the selected step in two. The step is
+    /// duplicated right after itself (taking over its children), so ALL of the
+    /// original text is in both halves, and the editor opens on the first half
+    /// to trim it down to its first part; committing it moves on to the second
+    /// half to keep the rest.
+    pub fn begin_split_selected_step(&mut self) {
+        let Some(i) = self.selected_step() else { return };
+        let d = self.steps[i].clone();
+        if d.is_pass || d.answer.trim().is_empty() {
+            return; // nothing to split
+        }
+        let name = if d.name.trim().is_empty() {
+            String::new()
+        } else {
+            format!("{} (cont.)", d.name.trim())
+        };
+        let first_key = d.key;
+        let at = tree::insert_after(
+            &mut self.steps,
+            i,
+            StepDraft { name, answer: d.answer.clone(), ..StepDraft::default() },
+        );
+        self.split_first = Some(first_key);
+        self.split_pending = Some(self.steps[at].key);
+        self.begin_edit_key(first_key);
+    }
+
+    /// select the step backed by DB item `id` and split it (leech warning flow)
+    pub fn begin_split_for_item(&mut self, id: &str) -> bool {
+        match self.steps.iter().position(|d| d.db_id.as_deref() == Some(id)) {
+            Some(i) => {
+                self.step_list_state.select(Some(i));
+                self.begin_split_selected_step();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// one-line guidance shown while a split is in progress
+    pub fn split_hint(&self) -> Option<&'static str> {
+        let key = self.steps.get(self.editing_step_idx?)?.key;
+        if self.split_first == Some(key) {
+            Some("SPLIT 1/2: keep only the FIRST part of the text")
+        } else if self.split_pending == Some(key) {
+            Some("SPLIT 2/2: keep only the REST of the text")
+        } else {
+            None
+        }
     }
 
     /// jump to the Step Name field so the next thing typed becomes a new step
@@ -1414,7 +1399,7 @@ pub enum ClickTarget {
     DeckSuggestions,
     ReviewCard,
     ReviewRate(u8),
-    LeechMarkBlindSpot,
+    LeechSplit,
     LeechIgnore,
     DecksList,
     CardsList,
@@ -2025,6 +2010,21 @@ mod tests {
     }
 
     #[test]
+    fn focus_first_pass_selects_the_placeholder_step() {
+        let store = mem();
+        let real = draft(0, None, "", "real");
+        let mut pass = draft(1, Some(0), "todo", "");
+        pass.is_pass = true;
+        let id = store
+            .add_multi_card("D", "Q?", &[real, pass], true, &ReviewMode::SpacedRepetition)
+            .unwrap();
+        let mut s = editor_for(&store, &id);
+        s.focus_first_pass();
+        assert_eq!(s.step_list_state.selected(), Some(1));
+        assert!(s.is_steps_list());
+    }
+
+    #[test]
     fn a_converted_simple_card_opens_as_a_one_step_multi_editor() {
         let store = mem();
         let id = store
@@ -2036,5 +2036,66 @@ mod tests {
         assert_eq!(step_answers(&s), vec!["A"]);
         s.focus_new_step();
         assert!(s.is_step_name());
+    }
+
+    #[test]
+    fn split_copies_the_step_into_two_halves_and_hands_over_the_children() {
+        let store = mem();
+        let id = store
+            .add_multi_card(
+                "D",
+                "Q?",
+                &[draft(0, None, "", "a b c d"), draft(1, Some(0), "", "tail")],
+                true,
+                &ReviewMode::SpacedRepetition,
+            )
+            .unwrap();
+        let mut s = editor_for(&store, &id);
+        s.step_list_state.select(Some(0));
+        s.begin_split_selected_step();
+        assert_eq!(step_answers(&s), vec!["a b c d", "a b c d", "tail"]);
+        assert_eq!(s.editing_step_idx, Some(0));
+        assert!(s.split_hint().unwrap().contains("FIRST"));
+
+        s.step_buf = "a b".into();
+        s.commit_step();
+        assert_eq!(s.editing_step_idx, Some(1), "moves on to the second half");
+        assert!(s.split_hint().unwrap().contains("REST"));
+
+        s.step_buf = "c d".into();
+        s.commit_step();
+        assert_eq!(step_answers(&s), vec!["a b", "c d", "tail"]);
+        assert_eq!(s.editing_step_idx, None);
+        assert!(s.split_hint().is_none());
+        assert_eq!(s.steps[2].parent, Some(s.steps[1].key), "the tail now follows the second half");
+    }
+
+    #[test]
+    fn split_for_item_finds_the_step_by_database_id() {
+        let store = mem();
+        let id = store
+            .add_multi_card("D", "Q?", &[draft(0, None, "", "x"), draft(1, Some(0), "", "y")], true, &ReviewMode::SpacedRepetition)
+            .unwrap();
+        let target = store.load_items(&id).unwrap().into_iter().find(|i| i.answer == "y").unwrap().id;
+        let mut s = editor_for(&store, &id);
+        assert!(s.begin_split_for_item(&target));
+        assert_eq!(step_answers(&s), vec!["x", "y", "y"]);
+        assert!(!s.begin_split_for_item("no-such-id"));
+    }
+
+    #[test]
+    fn cloze_simple_cards_need_no_answer_but_cannot_be_reversible() {
+        let store = mem();
+        let mut s = AddCardState::new(vec![], vec![]);
+        s.kind = AddKind::Simple;
+        s.deck = "D".into();
+        s.simple_question = "The capital of France is {{Paris}}".into();
+        assert!(s.validate().is_ok());
+        s.reversible = true;
+        assert!(s.validate().is_err());
+        s.reversible = false;
+        s.simple_question = "plain question".into();
+        assert!(s.validate().is_err(), "a normal card still needs an answer");
+        let _ = store;
     }
 }

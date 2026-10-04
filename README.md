@@ -100,7 +100,7 @@ shown in every review session once per day, bypassing any scheduling applied to 
 Once the demand is gone(e.g. after the exam), you can move those cards back into SRS.
 
 You can also use the **cram** feature on a deck or a filtered search to get through as many cards
-as possible in a day, just in case you don't have enough time to benefit from Spaced-repetition.
+as possible in a day (only for when you don't have enough time to benefit from Spaced-repetition)
 
 
 ## Generating decks with AI
@@ -134,8 +134,23 @@ Additionally, `Myoso` handles a unique problem called *re-exposure*, triggered b
 
 ---
 
-## Leech detection and intervention
+## Cloze deletions
 
-Some steps just don't stick, and collect `again` and `hard` ratings over and over. In Anki these are called leeches and are usually pulled out of the review queue. Myoso can't simply remove a step from the middle of a chain, so it offers two alternatives instead.
+Any text can hide part of itself behind `{{double braces}}`. Put them in the **answer of a step** and that step is shown with the hidden words blanked as `[...]`, revealing fills them in and highlights them, and you rate the step as usual. If you put them in the **question of a simple card** you get a classic Anki-style cloze card, where the answer field is optional and can be left empty.
 
-A **cloze test** lets you highlight the exact word, formula or phrase that keeps tripping you up, and future reviews hide just that part. These lighter reviews never touch your normal schedule. They exist only to rebuild the specific piece of recall that was missing, and once it is back the step returns to normal full-recall review. If the whole step is too much to hold at once, you can instead **split it in two**, so that each half is easier to remember.
+| You write | Shown while thinking | After reveal |
+|-----------|----------------------|--------------|
+| `d/dx {{ln(x)}} = 1/x` | `d/dx [...] = 1/x` | `ln(x)` highlighted |
+| `{{c1::Paris}}` (Anki style) | `[...]` | `Paris` |
+| `{{Paris::capital}}` (with hint) | `[capital]` | `Paris` |
+| `\{{` | a literal `{{` (for code) | |
+
+Every blank in a step is tested together as one unit, so one step is still one retrievable unit.
+
+---
+
+## Leech detection and splitting
+
+After **8 `Again` ratings in a row** (or 8 `Again`/`Hard` ratings out of the last 10) Myoso warns you that the step is a leech. Anki usually removes leeches out of the review queue, however, Myoso can't simply remove an intermediary step from a chain.
+
+Instead, the warning offers to **split it in two**: press `s` and the editor opens with the step's text copied into both halves to be simplified.

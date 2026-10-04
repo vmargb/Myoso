@@ -565,7 +565,7 @@ pub fn outline(drafts: &[StepDraft]) -> Vec<OutlineRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ItemKind, ScaffoldState};
+    use crate::models::ItemKind;
     use chrono::Duration;
 
     fn item(id: &str, pos: i32, parent: Option<&str>, due_in_min: i64) -> Item {
@@ -597,10 +597,6 @@ mod tests {
             image_path: None,
             consecutive_fails: 0,
             consecutive_hards: 0,
-            scaffold_state: ScaffoldState::Normal,
-            scaffold_passes: 0,
-            scaffold_pass_date: None,
-            weak_spans: Vec::new(),
             is_pass,
         }
     }
