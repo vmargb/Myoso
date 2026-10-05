@@ -196,6 +196,11 @@ pub struct Item {
     /// a placeholder step, doesn't know the answer yet
     #[serde(default)]
     pub is_pass: bool,
+    /// the steps own question: markdown, may be several line
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub heavy: bool, // hard question/step marker
 }
 
 /// A Simple card attached to a Multi card as a "margin" context clue
@@ -267,6 +272,8 @@ pub struct StepDraft {
     pub branched: bool,
     /// a placeholder step with a prompt but no answer yet, see `Item::is_pass`
     pub is_pass: bool,
+    pub body: String, // Item::body
+    pub heavy: bool, // Item::heavy
 }
 
 impl StepDraft {
@@ -286,6 +293,8 @@ impl StepDraft {
                 image: image.clone(),
                 branched: false,
                 is_pass: false,
+                body: String::new(),
+                heavy: false,
             })
             .collect()
     }

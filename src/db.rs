@@ -207,6 +207,15 @@ impl Store {
             "ALTER TABLE items ADD COLUMN is_pass INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // a step's own multi-line question, and the "this one is harder" marker
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN body TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN heavy INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // after the ALTERs, so old databases have the column when this runs
         self.conn
             .execute(
@@ -337,14 +346,19 @@ impl Store {
                 self.conn
                     .execute(
                         "UPDATE items
-                         SET prompt=?1, answer=?2, image_path=?3, position=?4, parent_id=?5, is_pass=?6
-                         WHERE id=?7 AND card_id=?8",
-                        params![label, d.answer, d.image, pos, parent, d.is_pass as i32, id, card_id],
+                         SET prompt=?1, answer=?2, image_path=?3, position=?4, parent_id=?5, is_pass=?6,
+                             body=?7, heavy=?8
+                         WHERE id=?9 AND card_id=?10",
+                        params![
+                            label, d.answer, d.image, pos, parent, d.is_pass as i32,
+                            d.body, d.heavy as i32, id, card_id
+                        ],
                     )
                     .context("update step item")?;
             } else {
                 self.insert_item_full(
                     id, card_id, pos, parent, "step", &label, &d.answer, now, d.image.as_deref(), d.is_pass,
+                    &d.body, d.heavy,
                 )?;
             }
         }
@@ -361,7 +375,7 @@ impl Store {
         now: DateTime<Utc>,
         image_path: Option<&str>,
     ) -> Result<()> {
-        self.insert_item_full(&new_id(), card_id, pos, None, kind, prompt, answer, now, image_path, false)
+        self.insert_item_full(&new_id(), card_id, pos, None, kind, prompt, answer, now, image_path, false, "", false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -377,6 +391,8 @@ impl Store {
         now: DateTime<Utc>,
         image_path: Option<&str>,
         is_pass: bool,
+        body: &str,
+        heavy: bool,
     ) -> Result<()> {
         // due_at is set just before now so every new item is immediately reviewable
         // interval_days, ease (stability), and difficulty all start at 0.0, so the
@@ -387,9 +403,12 @@ impl Store {
             .execute(
                 "INSERT INTO items(id,card_id,position,kind,prompt,answer,due_at,
                                    interval_days,ease,lapses,review_count,confidence_avg,image_path,difficulty,
-                                   consecutive_fails,consecutive_hards,parent_id,is_pass)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7, 0.0,0.0,0,0,0.0,?8,0.0, 0,0,?9,?10)",
-                params![id, card_id, pos, kind, prompt, answer, due, image_path, parent_id, is_pass as i32],
+                                   consecutive_fails,consecutive_hards,parent_id,is_pass,body,heavy)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7, 0.0,0.0,0,0,0.0,?8,0.0, 0,0,?9,?10,?11,?12)",
+                params![
+                    id, card_id, pos, kind, prompt, answer, due, image_path, parent_id,
+                    is_pass as i32, body, heavy as i32
+                ],
             )
             .context("insert item")?;
         Ok(())
@@ -1350,8 +1369,8 @@ impl Store {
                             interval_days, ease, last_reviewed_at,
                             lapses, review_count, confidence_avg, image_path, difficulty,
                             consecutive_fails, consecutive_hards,
-                            parent_id, is_pass)
-                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                            parent_id, is_pass, body, heavy)
+                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                         params![
                             item.id,
                             item.card_id,
@@ -1372,6 +1391,8 @@ impl Store {
                             item.consecutive_hards,
                             parent_id,
                             item.is_pass as i32,
+                            item.body,
+                            item.heavy as i32,
                         ],
                     )
                     .context("upsert item")?;
@@ -1802,14 +1823,14 @@ fn target_retrievability(rc: &ReviewCard, now: DateTime<Utc>) -> f64 {
 ///  9 last_reviewed_at | 10 lapses | 11 review_count |
 ///  12 confidence_avg | 13 image_path | 14 difficulty |
 ///  15 consecutive_fails | 16 consecutive_hards |
-///  17 parent_id | 18 is_pass
+///  17 parent_id | 18 is_pass | 19 body | 20 heavy
 ///  (the legacy scaffold_state / scaffold_passes / weak_spans /
 ///  scaffold_pass_date columns still exist in old databases and are ignored)
 const ITEM_COLS: &str = "id, card_id, position, kind, prompt, answer, due_at,
                         interval_days, ease, last_reviewed_at, lapses, review_count,
                         confidence_avg, image_path, difficulty,
                         consecutive_fails, consecutive_hards,
-                        parent_id, is_pass";
+                        parent_id, is_pass, body, heavy";
 
 fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     let kind: String                       = row.get(3)?;
@@ -1817,6 +1838,7 @@ fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     let last: Option<String>               = row.get(9)?;
     let image_path: Option<String>         = row.get(13)?;
     let is_pass: i32                       = row.get(18)?;
+    let heavy: i32                         = row.get(20)?;
     Ok(Item {
         id:               row.get(0)?,
         card_id:          row.get(1)?,
@@ -1837,6 +1859,8 @@ fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         consecutive_fails: row.get(15)?,
         consecutive_hards: row.get(16)?,
         is_pass: is_pass != 0,
+        body: row.get(19)?,
+        heavy: heavy != 0,
     })
 }
 
@@ -1867,7 +1891,7 @@ mod tests {
     }
 
     fn draft(key: u32, parent: Option<u32>, name: &str, answer: &str) -> StepDraft {
-        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false, is_pass: false }
+        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false, body: String::new(), heavy: false, is_pass: false }
     }
 
     /// t1 - t2 -+- a1 - a2      (branch names A / B)
