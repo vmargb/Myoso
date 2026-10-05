@@ -1087,6 +1087,25 @@ impl AddCardState {
         }
     }
 
+    /// [h] on the steps list: toggle the textbook-style "harder question" marker
+    pub fn toggle_heavy_selected_step(&mut self) {
+        if let Some(i) = self.selected_step() {
+            self.steps[i].heavy = !self.steps[i].heavy;
+        }
+    }
+
+    /// the selected step's question body, for editing in the external editor
+    pub fn selected_step_body(&self) -> Option<String> {
+        self.selected_step().map(|i| self.steps[i].body.clone())
+    }
+
+    /// replace the selected step's question body (empty clears it)
+    pub fn set_selected_step_body(&mut self, text: String) {
+        if let Some(i) = self.selected_step() {
+            self.steps[i].body = text;
+        }
+    }
+
     /// jump to the Step Name field so the next thing typed becomes a new step
     /// (used right after converting a simple card to a multi-step one)
     pub fn focus_new_step(&mut self) {
@@ -1549,7 +1568,7 @@ mod tests {
     }
 
     fn draft(key: u32, parent: Option<u32>, name: &str, answer: &str) -> StepDraft {
-        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false, is_pass: false }
+        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false, body: String::new(), heavy: false, is_pass: false }
     }
 
     /// t1 - t2 -+- a1 - a2   (branches "A" / "B")
