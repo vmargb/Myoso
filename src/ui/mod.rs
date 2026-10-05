@@ -82,6 +82,22 @@ fn event_loop(
                 Event::Key(key) => {
                 if key.kind != KeyEventKind::Press { continue; }
 
+                // Ctrl+E on the steps list edits the selected step's own question
+                // (its body) in the external editor
+                if key.code == KeyCode::Char('e')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.screen == Screen::AddCard
+                    && app.add_card.as_ref().map_or(false, |s| s.kind == AddKind::Multi && s.is_steps_list())
+                {
+                    let content = app.add_card.as_ref().and_then(|s| s.selected_step_body());
+                    if let Some(text) = content {
+                        let edited = open_in_editor_raw(terminal, &text)?;
+                        if let Some(s) = app.add_card.as_mut() {
+                            s.set_selected_step_body(edited);
+                        }
+                    }
+                    continue;
+                }
                 // Ctrl+E on any multiline field opens external editor
                 if key.code == KeyCode::Char('e') // EDITOR
                     && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -421,6 +437,10 @@ fn on_add_card(app: &mut AppState, key: KeyEvent) -> anyhow::Result<()> {
         // halves so you can decide where to cut)
         KeyCode::Char('s') if is_steps_list => {
             app.add_card.as_mut().unwrap().begin_split_selected_step();
+        }
+        // [h] mark / unmark the selected step as a harder ("heavy") question
+        KeyCode::Char('h') if is_steps_list => {
+            app.add_card.as_mut().unwrap().toggle_heavy_selected_step();
         }
         // [p] toggle the selected step between normal and "pass"
         KeyCode::Char('p') if is_steps_list => {
@@ -1584,6 +1604,17 @@ fn open_in_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     content: &str,
 ) -> anyhow::Result<String> {
+    let trimmed = open_in_editor_raw(terminal, content)?;
+    // an emptied buffer keeps the original, so a stray save can't wipe a field
+    Ok(if trimmed.is_empty() { content.to_string() } else { trimmed })
+}
+
+// like `open_in_editor`, but an empty result is returned as empty (used where
+// clearing the text is a legitimate thing to do, e.g. removing a step's question)
+fn open_in_editor_raw(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    content: &str,
+) -> anyhow::Result<String> {
     // give the terminal back to the OS so the editor gets a clean screen
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
@@ -1594,6 +1625,5 @@ fn open_in_editor(
     terminal.clear()?; // force a full redraw
     // trim the trailing newline that most editors append on save, since the
     // user's original content wont have had one originally
-    let trimmed = result.trim_end_matches('\n').to_string();
-    Ok(if trimmed.is_empty() { content.to_string() } else { trimmed })
+    Ok(result.trim_end_matches('\n').to_string())
 }
