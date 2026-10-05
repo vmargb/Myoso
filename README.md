@@ -134,6 +134,14 @@ Additionally, `Myoso` handles a unique problem called *re-exposure*, triggered b
 
 ---
 
+## Heavy steps and step questions
+
+Not every step is the same size. A step can carry its **own question**, for instance a code snippet and "what if we changed this line?", without becoming a separate card, because it still belongs to the root question. In the card editor, select a step in the step list and press `Ctrl+E` to write its question in your `$EDITOR` (markdown, as many lines as you like; save an empty file to remove it). During review the question is shown under the step's label when that step comes up. Steps without one look exactly as before, and the root question stays on screen as always.
+
+Like the "challenge" marker in a textbook, press `h` on a step to flag it as a **harder question**. It shows up as `▲ challenge` next to the step in review (and `▲` / `¶` in the editor's step list) so you know to think a little harder. It is only a signal, scheduling is unchanged, since every step already has its own difficulty. In the AI outline format a step object can take `"body"` (text) and `"heavy"` (true/false). Combine a step question with a cloze answer to be tested on just the lines that changed.
+
+---
+
 ## Cloze deletions
 
 Any text can hide part of itself behind `{{double braces}}`. Put them in the **answer of a step** and that step is shown with the hidden words blanked as `[...]`, revealing fills them in and highlights them, and you rate the step as usual. If you put them in the **question of a simple card** you get a classic Anki-style cloze card, where the answer field is optional and can be left empty.

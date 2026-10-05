@@ -429,7 +429,7 @@ impl Builder {
             return Err(format!("more than {MAX_STEPS_PER_CARD} steps in one card: split it into several cards"));
         }
         let key = self.drafts.len() as u32;
-        self.drafts.push(StepDraft { key, db_id: None, parent, name, answer, image: None, branched: false, is_pass: false });
+        self.drafts.push(StepDraft { key, db_id: None, parent, name, answer, image: None, branched: false, is_pass: false, body: String::new(), heavy: false });
         Ok(key)
     }
 
@@ -450,14 +450,21 @@ impl Builder {
         let mut parent = parent;
         for (i, s) in arr.iter().enumerate() {
             let sctx = format!("{ctx}steps[{i}]: ");
-            let (own_name, answer, branches) = match s {
-                Value::String(t) => (String::new(), clean_text(t, "the step", &sctx)?, None),
+            let (own_name, answer, branches, body, heavy) = match s {
+                Value::String(t) => (String::new(), clean_text(t, "the step", &sctx)?, None, String::new(), false),
                 Value::Object(m) => {
-                    only_keys(m, &["name", "answer", "branches"], &sctx)?;
+                    only_keys(m, &["name", "answer", "branches", "body", "heavy"], &sctx)?;
+                    let heavy = match m.get("heavy") {
+                        None | Some(Value::Null) => false,
+                        Some(Value::Bool(b)) => *b,
+                        Some(_) => return Err(format!("{sctx}\"heavy\" must be true or false")),
+                    };
                     (
                         optional_text(m, "name", &sctx)?.unwrap_or_default(),
                         required_text(m, "answer", &sctx)?,
                         m.get("branches"),
+                        optional_text(m, "body", &sctx)?.unwrap_or_default(),
+                        heavy,
                     )
                 }
                 _ => {
@@ -471,6 +478,8 @@ impl Builder {
                 _ => own_name,
             };
             let key = self.push(parent, name, answer)?;
+            self.drafts[key as usize].body = body;
+            self.drafts[key as usize].heavy = heavy;
             parent = Some(key);
 
             if let Some(b) = branches {

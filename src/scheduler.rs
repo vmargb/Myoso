@@ -243,6 +243,8 @@ mod tests {
             consecutive_fails: 0,
             consecutive_hards: 0,
             is_pass: false,
+            body: String::new(),
+            heavy: false,
         }
     }
 
