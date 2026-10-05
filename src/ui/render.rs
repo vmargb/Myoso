@@ -543,6 +543,20 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
                 ),
             ]));
         }
+        // textbook-style signal: this one is a harder question
+        if item.heavy {
+            if let Some(last) = context_lines.last_mut() {
+                last.spans.push(Span::styled(
+                    "  ▲ challenge",
+                    Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        // the step's own question, e.g. a code snippet plus "what if we changed this?"
+        if !item.body.trim().is_empty() {
+            context_lines.push(Line::from(""));
+            context_lines.extend(crate::markdown::render(&item.body).lines);
+        }
     } else {
         let hint = match item.kind {
             ItemKind::Forward => "  Answer",
@@ -1413,10 +1427,16 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
                 } else {
                     first_line.to_string()
                 };
+                // ▲ = marked as a harder question, ¶ = has its own question text
+                let flags = format!(
+                    "{}{}",
+                    if d.heavy { "▲ " } else { "" },
+                    if d.body.trim().is_empty() { "" } else { "¶ " },
+                );
                 let text = if d.name.trim().is_empty() {
-                    format!("{}. {}", row.step_no, body)
+                    format!("{}. {}{}", row.step_no, flags, body)
                 } else {
-                    format!("{}. [{}]  {}", row.step_no, d.name, body)
+                    format!("{}. {}[{}]  {}", row.step_no, flags, d.name, body)
                 };
                 let style = if editing {
                     Style::default().fg(Color::Yellow)
@@ -1438,7 +1458,7 @@ fn render_multi_form(f: &mut Frame, app: &mut AppState, size: Rect, clicks: &mut
     };
 
     let list_title = if s.focused == 5 {
-        format!(" Steps ({})  [Enter] edit  [i] insert  [b] branch  [r] new path  [p] pass  [s] split  [d] del  [D] del+below ", s.steps.len())
+        format!(" Steps ({})  [Enter] edit  [i] insert  [b] branch  [r] new path  [h] heavy  [^E] question  [p] pass  [s] split  [d] del  [D] del+below ", s.steps.len())
     } else {
         format!(" Steps ({}) ", s.steps.len())
     };
@@ -2140,7 +2160,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     fn draft(key: u32, parent: Option<u32>, name: &str, answer: &str) -> StepDraft {
-        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false, is_pass: false }
+        StepDraft { key, db_id: None, parent, name: name.into(), answer: answer.into(), image: None, branched: false, body: String::new(), heavy: false, is_pass: false }
     }
 
     fn dump(term: &Terminal<TestBackend>) -> String {
