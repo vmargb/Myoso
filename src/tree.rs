@@ -295,6 +295,8 @@ pub fn drafts_from_items(is_tree: bool, items: &[Item]) -> Vec<StepDraft> {
                 // steps loaded back from the DB are shown by real sibling count alone
                 branched: false,
                 is_pass: it.is_pass,
+                body: it.body.clone(),
+                heavy: it.heavy,
             }
         })
         .collect()
@@ -598,6 +600,8 @@ mod tests {
             consecutive_fails: 0,
             consecutive_hards: 0,
             is_pass,
+            body: String::new(),
+            heavy: false,
         }
     }
 
@@ -876,7 +880,7 @@ mod tests {
     // ~~ drafts ~~
 
     fn draft(name: &str, answer: &str) -> StepDraft {
-        StepDraft { key: 0, db_id: None, parent: None, name: name.into(), answer: answer.into(), image: None, branched: false, is_pass: false }
+        StepDraft { key: 0, db_id: None, parent: None, name: name.into(), answer: answer.into(), image: None, branched: false, is_pass: false, body: String::new(), heavy: false }
     }
 
     fn names(d: &[StepDraft]) -> Vec<String> {
