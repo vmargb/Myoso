@@ -12,8 +12,9 @@ use ratatui::{layout::Rect, widgets::ListState};
 use crate::db::Store;
 use crate::models::{
     has_cloze, Card, CardKind, CardSummary, Item, ItemKind, LeechStatus, ReviewCard, ReviewMode,
-    Stats, SessionLimits, StepDraft,
+    Stats, StepDraft,
 };
+use crate::settings::{SettingId, Settings};
 use crate::tree;
 
 // ~~~ Screens ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -28,6 +29,7 @@ pub enum Screen {
     ListCards,
     Export,
     Import,
+    Settings,
 }
 
 // ~~~ Review state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1398,6 +1400,42 @@ impl ImportState {
     }
 }
 
+// ~~~ Settings state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// the screen holds no copy of the values, they live in `Store::settings()`.
+// Every change is written straight through (`AppState::settings_adjust`), so
+// there is no save button and nothing to lose by leaving with [Esc]
+
+pub struct SettingsState {
+    pub list_state: ListState,
+    /// one-line feedback under the list ("Reset to defaults", save errors)
+    pub status:     Option<String>,
+}
+
+impl SettingsState {
+    pub fn new() -> Self {
+        let mut ls = ListState::default();
+        ls.select(Some(0));
+        Self { list_state: ls, status: None }
+    }
+
+    pub fn selected_id(&self) -> Option<SettingId> {
+        self.list_state.selected().and_then(|i| SettingId::ALL.get(i).copied())
+    }
+
+    pub fn next(&mut self) {
+        let n = SettingId::ALL.len();
+        let i = self.list_state.selected().map_or(0, |i| (i + 1) % n);
+        self.list_state.select(Some(i));
+    }
+
+    pub fn prev(&mut self) {
+        let n = SettingId::ALL.len();
+        let i = self.list_state.selected().map_or(0, |i| if i == 0 { n - 1 } else { i - 1 });
+        self.list_state.select(Some(i));
+    }
+}
+
 // ~~~ Mouse click targets ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
 // Rect -> ClickTarget mapping for every clickable widget
@@ -1429,11 +1467,12 @@ pub enum ClickTarget {
     ExportConfirmBtn,
     ImportPathField,
     ImportConfirmBtn,
+    SettingsList,
 }
 
 // ~~~ Application state ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-pub const MENU_ITEMS: usize = 8;
+pub const MENU_ITEMS: usize = 9;
 
 pub struct AppState<'a> {
     pub store:       &'a Store,
@@ -1449,6 +1488,7 @@ pub struct AppState<'a> {
     pub should_quit: bool,
     pub export:      Option<ExportState>,
     pub import:      Option<ImportState>,
+    pub settings_ui: Option<SettingsState>,
     // rebuilt every frame by the renderers, checked on mouse clicks
     pub click_regions: Vec<(Rect, ClickTarget)>,
 }
@@ -1471,6 +1511,7 @@ impl<'a> AppState<'a> {
             should_quit: false,
             export:      None,
             import:      None,
+            settings_ui: None,
             click_regions: Vec::new(),
         }
     }
@@ -1518,7 +1559,7 @@ impl<'a> AppState<'a> {
         self.flash = None;
         match self.menu_state.selected() {
             Some(0) => {
-                let session = self.store.due_session(None, &SessionLimits::default())?;
+                let session = self.store.due_session(None, &self.store.settings().session_limits())?;
                 self.review = Some(ReviewState::new(session));
                 self.go_to(Screen::Review);
             }
@@ -1551,9 +1592,50 @@ impl<'a> AppState<'a> {
                 self.import = Some(ImportState::new());
                 self.go_to(Screen::Import);
             }
+            Some(7) => {
+                self.settings_ui = Some(SettingsState::new());
+                self.go_to(Screen::Settings);
+            }
             _ => self.should_quit = true,
         }
         Ok(())
+    }
+
+    // ~~ settings screen actions ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    /// Run `edit` on a copy of the current settings and persist the result.
+    /// On a failed write the in-memory settings are untouched
+    /// (`Store::save_settings`) and the error is shown instead of crashing
+    fn settings_apply(&mut self, edit: impl FnOnce(&mut Settings)) {
+        let mut s = self.store.settings();
+        edit(&mut s);
+        if let Err(e) = self.store.save_settings(&s) {
+            if let Some(ui) = self.settings_ui.as_mut() {
+                ui.status = Some(format!("Could not save: {e}"));
+            }
+        } else if let Some(ui) = self.settings_ui.as_mut() {
+            ui.status = None;
+        }
+    }
+
+    /// change the selected setting one notch (`dir` < 0 down, > 0 up)
+    pub fn settings_adjust(&mut self, dir: i32, coarse: bool) {
+        let Some(id) = self.settings_ui.as_ref().and_then(|u| u.selected_id()) else { return };
+        self.settings_apply(|s| id.adjust(s, dir, coarse));
+    }
+
+    pub fn settings_reset_row(&mut self) {
+        let Some(id) = self.settings_ui.as_ref().and_then(|u| u.selected_id()) else { return };
+        self.settings_apply(|s| id.reset(s));
+    }
+
+    pub fn settings_reset_all(&mut self) {
+        self.settings_apply(|s| *s = Settings::default());
+        if let Some(ui) = self.settings_ui.as_mut() {
+            if ui.status.is_none() {
+                ui.status = Some("All settings reset to their defaults".into());
+            }
+        }
     }
 }
 
@@ -1562,6 +1644,7 @@ impl<'a> AppState<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::SessionLimits;
 
     fn mem() -> Store {
         Store::open(":memory:").unwrap()

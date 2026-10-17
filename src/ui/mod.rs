@@ -7,6 +7,7 @@ pub mod state;
 mod render;
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::{
     event::{
@@ -20,7 +21,8 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use rfd::FileDialog;
 
 use crate::db::{ImportOutcome, Store};
-use crate::models::{CardKind, ReviewMode, SessionLimits};
+use crate::models::{CardKind, ReviewMode};
+use crate::settings::SettingId;
 use crate::outline::OutlineSummary;
 
 use state::{
@@ -35,7 +37,13 @@ use render::row_to_list_index;
 pub fn run_tui(store: &Store) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    // mouse capture follows the `mouse` setting (re-synced every frame, so
+    // toggling it in Settings applies immediately)
+    MOUSE_ON.store(store.settings().mouse, Ordering::Relaxed);
+    if store.settings().mouse {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -47,6 +55,24 @@ pub fn run_tui(store: &Store) -> anyhow::Result<()> {
     res
 }
 
+// ~~~ Mouse capture ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/// whether mouse capture is currently enabled on the terminal. The editor
+/// helpers read it to restore the right state after returning from `$EDITOR`
+static MOUSE_ON: AtomicBool = AtomicBool::new(true);
+
+/// bring the terminal's mouse capture in line with the setting
+fn sync_mouse(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, want: bool) {
+    if MOUSE_ON.swap(want, Ordering::Relaxed) == want {
+        return;
+    }
+    let _ = if want {
+        execute!(terminal.backend_mut(), EnableMouseCapture)
+    } else {
+        execute!(terminal.backend_mut(), DisableMouseCapture)
+    };
+}
+
 // ~~~ Event loop ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 fn event_loop(
@@ -55,6 +81,8 @@ fn event_loop(
 ) -> anyhow::Result<()> {
     loop {
         if app.should_quit { break; }
+
+        sync_mouse(terminal, app.store.settings().mouse);
 
         // click regions are rebuilt fresh every frame by the renderers, since
         // layouts and screen coordinates can change between draws
@@ -69,6 +97,7 @@ fn event_loop(
                 Screen::ListCards => render::render_list_cards(f, app, &mut clicks),
                 Screen::Export    => render::render_export(f, app, &mut clicks),
                 Screen::Import    => render::render_import(f, app, &mut clicks),
+                Screen::Settings  => render::render_settings(f, app, &mut clicks),
             }
         })?;
         app.click_regions = clicks;
@@ -162,6 +191,7 @@ fn event_loop(
                     Screen::ListCards => on_list_cards(app, key)?,
                     Screen::Export    => on_export(app, key.code)?,
                     Screen::Import    => on_import(app, key.code)?,
+                    Screen::Settings  => on_settings(app, key.code)?,
                 }
                 }
                 _ => {}
@@ -179,6 +209,27 @@ fn on_menu(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         KeyCode::Down      | KeyCode::Char('j') => app.menu_down(),
         KeyCode::Up        | KeyCode::Char('k') => app.menu_up(),
         KeyCode::Enter                          => app.menu_select()?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn on_settings(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => app.go_back(),
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(ui) = app.settings_ui.as_mut() { ui.next(); }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(ui) = app.settings_ui.as_mut() { ui.prev(); }
+        }
+        // fine steps: arrows / h l, coarse steps: H L (capital) or - +
+        KeyCode::Left  | KeyCode::Char('h') => app.settings_adjust(-1, false),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => app.settings_adjust(1, false),
+        KeyCode::Char('H') | KeyCode::Char('-') => app.settings_adjust(-1, true),
+        KeyCode::Char('L') | KeyCode::Char('+') | KeyCode::Char('=') => app.settings_adjust(1, true),
+        KeyCode::Char('r') => app.settings_reset_row(),
+        KeyCode::Char('R') => app.settings_reset_all(),
         _ => {}
     }
     Ok(())
@@ -275,7 +326,12 @@ fn on_review(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         }
         KeyCode::Char(c @ '1'..='4') if !is_done && phase == Some(ReviewPhase::Revealed) => {
             if let Some(r) = app.review.as_mut() {
-                r.rate(store, c as u8 - b'0')?;
+                let mut rating = c as u8 - b'0';
+                // with the Easy rating disabled in Settings, [4] counts as Good
+                if rating == 4 && !store.settings().allow_easy {
+                    rating = 3;
+                }
+                r.rate(store, rating)?;
             }
         }
         // Cram-only: move on without rating at all, from either phase
@@ -1033,7 +1089,7 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
                 let deck = app.list_decks.as_ref()
                     .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
                 if let Some(deck) = deck {
-                    let session = app.store.due_session(Some(&deck), &SessionLimits::default())?;
+                    let session = app.store.due_session(Some(&deck), &app.store.settings().session_limits())?;
                     app.review = Some(ReviewState::new(session));
                     app.go_to(Screen::Review);
                 }
@@ -1096,7 +1152,7 @@ fn on_list_decks(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
             let deck = app.list_decks.as_ref()
                 .and_then(|ld| ld.selected_deck().map(|s| s.to_string()));
             if let Some(deck) = deck {
-                let session = app.store.due_session(Some(&deck), &SessionLimits::default())?;
+                let session = app.store.due_session(Some(&deck), &app.store.settings().session_limits())?;
                 app.review = Some(ReviewState::new(session));
                 app.go_to(Screen::Review);
             }
@@ -1353,6 +1409,10 @@ fn outline_status(summary: &OutlineSummary, report_path: Option<&str>) -> String
 // state::ClickTarget / render::Clicks
 
 fn on_mouse(app: &mut AppState, mouse: MouseEvent) -> anyhow::Result<()> {
+    // a stray event can still arrive right after the setting was switched off
+    if !app.store.settings().mouse {
+        return Ok(());
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => on_click(app, mouse.column, mouse.row)?,
         MouseEventKind::ScrollDown => dispatch_scroll(app, KeyCode::Down)?,
@@ -1374,6 +1434,7 @@ fn dispatch_scroll(app: &mut AppState, code: KeyCode) -> anyhow::Result<()> {
         Screen::ListCards => on_list_cards(app, KeyEvent::new(code, KeyModifiers::NONE))?,
         Screen::Export    => on_export(app, code)?,
         Screen::Import    => on_import(app, code)?,
+        Screen::Settings  => on_settings(app, code)?,
     }
     Ok(())
 }
@@ -1522,6 +1583,22 @@ fn on_click(app: &mut AppState, col: u16, row: u16) -> anyhow::Result<()> {
             on_export(app, KeyCode::Enter)?;
         }
 
+        ClickTarget::SettingsList => {
+            let Some(ui) = app.settings_ui.as_mut() else { return Ok(()) };
+            let Some(i) = row_to_list_index(area, ui.list_state.offset(), row) else { return Ok(()) };
+            let Some(&id) = SettingId::ALL.get(i) else { return Ok(()) };
+            if ui.list_state.selected() != Some(i) {
+                // the first click only selects, so a stray click changes nothing
+                ui.list_state.select(Some(i));
+            } else if id.is_bool() {
+                app.settings_adjust(1, false);
+            } else {
+                // numeric rows: left half steps down, right half steps up
+                let dir = if col >= area.x + area.width / 2 { 1 } else { -1 };
+                app.settings_adjust(dir, false);
+            }
+        }
+
         ClickTarget::ImportPathField => {
             if let Some(im) = app.import.as_mut() { im.focus = ImportFocus::PathField; }
         }
@@ -1620,7 +1697,10 @@ fn open_in_editor_raw(
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
     let result = edit::edit(content).unwrap_or_else(|_| content.to_string());
     // reclaim the terminal for ratatui
-    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture);
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    if MOUSE_ON.load(Ordering::Relaxed) {
+        let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+    }
     let _ = enable_raw_mode();
     terminal.clear()?; // force a full redraw
     // trim the trailing newline that most editors append on save, since the

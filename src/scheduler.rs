@@ -16,14 +16,20 @@ const DECAY: f64 = -0.5;
 ///    FACTOR             = 1/0.81 − 1 = 19/81
 const FACTOR: f64 = 19.0 / 81.0;
 
-/// target recall probability at each scheduled review
+/// default target recall probability at each scheduled review
+/// (the user can change it in Settings, this is what `apply_confidence` uses)
 const DESIRED_RETENTION: f64 = 0.9;
+
+/// default interval ceiling in days (100 years, effectively "no limit")
+const MAX_INTERVAL_DAYS: u32 = 36_500;
 
 // ~~~ weak-step handling ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
-/// consecutive `Again` ratings after which a step is flagged as a leech
-/// (Anki's default is 8 as well). A leech is only a warning, the review screen
-/// suggests splitting the step into two easier ones
+/// DEFAULT number of consecutive `Again` ratings after which a step is flagged
+/// as a leech (Anki's default is 8 as well). The live value comes from
+/// `Settings::leech_threshold`, these three constants are the defaults it
+/// starts from. A leech is only a warning, the review screen suggests
+/// splitting the step into two easier ones
 pub const LEECH_STREAK_THRESHOLD: u32 = 8;
 
 /// Number of most-recent rating events (from `review_log`) inspected for the
@@ -164,7 +170,23 @@ fn to_fsrs_rating(confidence: u8) -> u8 {
 /// `db::record_review` bypasses this function entirely for daily-mode items
 /// and for chain-re-exposure reviews, so the step-chain unlock / de-unlock
 /// logic is completely unaffected by this scheduler
-pub fn apply_confidence(mut item: Item, confidence: u8, reviewed_at: DateTime<Utc>) -> Item {
+pub fn apply_confidence(item: Item, confidence: u8, reviewed_at: DateTime<Utc>) -> Item {
+    apply_confidence_with(item, confidence, reviewed_at, DESIRED_RETENTION, MAX_INTERVAL_DAYS)
+}
+
+/// Same as `apply_confidence`, with the two user-tunable scheduling knobs
+/// supplied by the caller (see `settings::Settings`)
+///   `retention`     target recall probability at each review (0.70..=0.97)
+///   `max_interval`  ceiling on the scheduled interval in days. It caps the
+///                   *interval* only, stability keeps its true value so
+///                   lifting the cap later doesn't lose any progress
+pub fn apply_confidence_with(
+    mut item: Item,
+    confidence: u8,
+    reviewed_at: DateTime<Utc>,
+    retention: f64,
+    max_interval: u32,
+) -> Item {
     let rating = to_fsrs_rating(confidence);
 
     // days elapsed since the last honest FSRS review of this item
@@ -195,7 +217,7 @@ pub fn apply_confidence(mut item: Item, confidence: u8, reviewed_at: DateTime<Ut
         item.lapses += 1;
     }
 
-    let interval = next_interval(new_stability, DESIRED_RETENTION);
+    let interval = next_interval(new_stability, retention).min(max_interval.max(1) as i64);
 
     // Rolling average of raw 1–5 confidence scores (analytics only;
     // does not influence scheduling)
@@ -335,5 +357,41 @@ mod tests {
         let a = apply_confidence(blank_item(), 4, Utc::now()); // avg = 4.0
         let b = apply_confidence(a,            2, Utc::now()); // avg = 3.0
         assert!((b.confidence_avg - 3.0).abs() < 1e-9);
+    }
+
+    // a higher target retention must schedule sooner, a lower one later
+    #[test]
+    fn retention_knob_moves_the_interval_the_right_way() {
+        let seed = apply_confidence(blank_item(), 3, Utc::now());
+        let at = seed.due_at;
+        let strict = apply_confidence_with(seed.clone(), 3, at, 0.95, 36_500);
+        let base   = apply_confidence_with(seed.clone(), 3, at, 0.90, 36_500);
+        let loose  = apply_confidence_with(seed,         3, at, 0.75, 36_500);
+        assert!(strict.interval_days < base.interval_days);
+        assert!(base.interval_days   < loose.interval_days);
+    }
+
+    // the default entry point must behave exactly like the explicit defaults
+    #[test]
+    fn apply_confidence_uses_the_defaults() {
+        let now = Utc::now();
+        let a = apply_confidence(blank_item(), 3, now);
+        let b = apply_confidence_with(blank_item(), 3, now, 0.90, 36_500);
+        assert_eq!(a.interval_days, b.interval_days);
+        assert_eq!(a.stability, b.stability);
+    }
+
+    // the cap limits the interval but not the stability, and never below a day
+    #[test]
+    fn max_interval_caps_interval_not_stability() {
+        let now = Utc::now();
+        let free   = apply_confidence_with(blank_item(), 4, now, 0.90, 36_500);
+        let capped = apply_confidence_with(blank_item(), 4, now, 0.90, 7);
+        assert!(free.interval_days > 7.0, "test needs an Easy first interval above the cap");
+        assert_eq!(capped.interval_days, 7.0);
+        assert_eq!(capped.stability, free.stability);
+        assert_eq!(capped.due_at, now + Duration::days(7));
+        let floor = apply_confidence_with(blank_item(), 3, now, 0.90, 0);
+        assert_eq!(floor.interval_days, 1.0);
     }
 }

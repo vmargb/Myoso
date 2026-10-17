@@ -5,6 +5,7 @@ mod ui;
 mod markdown;
 mod tree;
 mod outline;
+mod settings;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

@@ -4,12 +4,14 @@ use rand::seq::SliceRandom;
 use rand::{rng, RngExt};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
 
 use crate::models::*;
 use crate::scheduler;
+use crate::settings::{SettingId, Settings};
 use crate::outline::{self, Body, OutlineSummary};
 use crate::tree::{self, StepTree};
 
@@ -23,6 +25,9 @@ pub enum ImportOutcome {
 
 pub struct Store {
     conn: Connection,
+    // user preferences, mirrored from the `settings` table. `Settings` is Copy
+    // so hot paths read it with `.get()`, `save_settings` is the only writer
+    settings: Cell<Settings>,
 }
 
 impl Store {
@@ -32,9 +37,58 @@ impl Store {
         // foreign-key enforcement (SQLite disables it by default)
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .context("enable foreign keys")?;
-        let store = Self { conn };
+        let store = Self { conn, settings: Cell::new(Settings::default()) };
         store.migrate()?;
+        store.settings.set(store.load_settings()?);
         Ok(store)
+    }
+
+    // ~~ Settings ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    /// current preferences (cheap, no query)
+    pub fn settings(&self) -> Settings {
+        self.settings.get()
+    }
+
+    /// read every stored setting over the defaults. Unknown keys (from a newer
+    /// version) and malformed values are skipped, then everything is clamped
+    fn load_settings(&self) -> Result<Settings> {
+        let mut s = Settings::default();
+        let mut stmt = self.conn
+            .prepare("SELECT key, value FROM settings")
+            .context("prepare load settings")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .context("query settings")?;
+        for row in rows {
+            let (key, value) = row.context("read settings row")?;
+            if let Some(id) = SettingId::from_key(&key) {
+                id.decode(&mut s, &value);
+            }
+        }
+        Ok(s.clamped())
+    }
+
+    /// validate, persist and publish new preferences. All rows are written in
+    /// one transaction, the in-memory copy only changes if the write succeeded
+    pub fn save_settings(&self, new: &Settings) -> Result<()> {
+        let new = new.clamped();
+        let tx = self.conn.unchecked_transaction().context("begin save settings")?;
+        {
+            let mut up = self.conn
+                .prepare(
+                    "INSERT INTO settings(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .context("prepare save settings")?;
+            for id in SettingId::ALL {
+                up.execute(params![id.key(), id.encode(&new)])
+                    .context("write setting")?;
+            }
+        }
+        tx.commit().context("commit settings")?;
+        self.settings.set(new);
+        Ok(())
     }
 
     // ~~ Schema ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -132,6 +186,12 @@ impl Store {
                 ref_id   TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
                 PRIMARY KEY (card_id, ref_id)
+            );
+
+            -- user preferences (see settings.rs), one row per setting key
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_card_refs_card ON card_refs(card_id);
@@ -918,6 +978,7 @@ impl Store {
         let is_daily = mode_str == "daily";
         let is_tree  = tree_flag != 0;
 
+        let cfg = self.settings();
         let prev_interval = item.interval_days;
         // snapshot before `item` is moved into the branches below (they
         // each consume it by value, either via `..item` or apply_confidence)
@@ -948,7 +1009,9 @@ impl Store {
             Item { review_count: n, confidence_avg: new_avg, last_reviewed_at: Some(now), ..item }
         } else {
             // normal SR review: hand off to the FSRS scheduler
-            scheduler::apply_confidence(item, confidence, now)
+            scheduler::apply_confidence_with(
+                item, confidence, now, cfg.desired_retention, cfg.max_interval_days,
+            )
         };
 
         // weak-step handling rolling consecutive-fail/hard counters
@@ -997,7 +1060,8 @@ impl Store {
         // in a tree it is the steps descendants across all of its branches,
         // and not the siblings or ancestors (forgetting the SSD path doesn't reset HDD)
         // This only applies to SR cards (never daily mode) (obviously)
-        if !is_daily && updated.kind == ItemKind::Step && confidence <= 2 {
+        // The setting `relock_on_hard` decides whether Hard counts, too
+        if !is_daily && updated.kind == ItemKind::Step && confidence <= cfg.relock_max_rating() {
             let items = self.load_items(&updated.card_id)?;
             let tree  = StepTree::new(is_tree, &items);
             if let Some(idx) = tree.index_of(&updated.id) {
@@ -1045,19 +1109,20 @@ impl Store {
         // a leech is something to warn about when a step FAILS again, never
         // right after the user finally recalled it (the recent-history rule
         // below would otherwise still see the old failures)
-        if confidence >= 3 {
+        if confidence >= 3 || !cfg.leech_warnings {
             return Ok(LeechStatus::None);
         }
         self.leech_status_for(item_id, new_fails)
     }
 
-    /// primary trigger: `fails >= LEECH_STREAK_THRESHOLD` -> `Leech`
-    /// secondary trigger: `LEECH_OSCILLATION_WEAK`+ fails-or-hards (with at least 2 fails) within the last
-    /// `LEECH_LOOKBACK_EVENTS` rating events (from `review_log`), to catch
+    /// primary trigger: `fails >= leech_threshold` (setting, default 8) -> `Leech`
+    /// secondary trigger: `leech_threshold`+ fails-or-hards (with at least 2 fails) within the last
+    /// `leech_threshold + 2` rating events (`Settings::leech_lookback`) (from `review_log`), to catch
     /// an oscillating Again/Hard pattern that never produces a clean
     /// consecutive streak of either kind alone -> `Leech`
     fn leech_status_for(&self, item_id: &str, fails: i32) -> Result<LeechStatus> {
-        if fails as u32 >= scheduler::LEECH_STREAK_THRESHOLD {
+        let cfg = self.settings();
+        if fails as u32 >= cfg.leech_threshold {
             return Ok(LeechStatus::Leech);
         }
 
@@ -1073,12 +1138,12 @@ impl Store {
                     ORDER BY reviewed_at DESC
                     LIMIT ?2
                  )",
-                params![item_id, scheduler::LEECH_LOOKBACK_EVENTS as i64],
+                params![item_id, cfg.leech_lookback() as i64],
                 |r| Ok((r.get::<_, Option<i64>>(0)?.unwrap_or(0), r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
             )
             .context("query recent leech pattern")?;
 
-        if recent_weak as u32 >= scheduler::LEECH_OSCILLATION_WEAK && recent_fails >= 2 {
+        if recent_weak as u32 >= cfg.leech_threshold && recent_fails >= 2 {
             return Ok(LeechStatus::Leech);
         }
 
@@ -2861,5 +2926,120 @@ mod tests {
         let items = store.load_items(&id).unwrap();
         assert_eq!(items.len(), 1);
         assert!(crate::models::has_cloze(&items[0].prompt));
+    }
+
+    // ~~ settings ~~
+
+    #[test]
+    fn a_fresh_database_starts_on_the_defaults() {
+        let store = mem();
+        assert_eq!(store.settings(), Settings::default());
+    }
+
+    #[test]
+    fn settings_persist_across_reopening_the_database() {
+        let path = std::env::temp_dir().join(format!("myoso-settings-{}.db", new_id()));
+        let path_str = path.to_str().unwrap();
+        {
+            let store = Store::open(path_str).unwrap();
+            let mut s = store.settings();
+            s.new_cards = 3;
+            s.desired_retention = 0.85;
+            s.relock_on_hard = false;
+            s.mouse = false;
+            store.save_settings(&s).unwrap();
+            assert_eq!(store.settings(), s);
+        }
+        let again = Store::open(path_str).unwrap();
+        let s = again.settings();
+        assert_eq!(s.new_cards, 3);
+        assert!((s.desired_retention - 0.85).abs() < 1e-9);
+        assert!(!s.relock_on_hard && !s.mouse);
+        assert!(s.allow_easy, "untouched settings keep their defaults");
+        drop(again);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_clamps_out_of_range_values() {
+        let store = mem();
+        let mut s = Settings::default();
+        s.desired_retention = 0.1;
+        s.max_reviews = 0;
+        store.save_settings(&s).unwrap();
+        assert!((store.settings().desired_retention - 0.70).abs() < 1e-9);
+        assert_eq!(store.settings().max_reviews, 1);
+    }
+
+    #[test]
+    fn unknown_or_garbled_stored_rows_are_ignored_on_load() {
+        let store = mem();
+        store.conn.execute("INSERT INTO settings(key,value) VALUES('from_the_future','x')", []).unwrap();
+        store.conn.execute("INSERT INTO settings(key,value) VALUES('new_cards','many')", []).unwrap();
+        assert_eq!(store.load_settings().unwrap(), Settings::default());
+    }
+
+    #[test]
+    fn leech_threshold_and_switch_are_honoured() {
+        let store = mem();
+        let mut s = store.settings();
+        s.leech_threshold = 4;
+        store.save_settings(&s).unwrap();
+        let id = add(&store, &chain_drafts(&["only"]));
+        let item = by_answer(&store, &id, "only").id;
+        for n in 1..=3 {
+            let st = store.record_review(&item, 1, Duration::from_secs(1), false).unwrap();
+            assert_eq!(st, LeechStatus::None, "again #{n}");
+        }
+        let st = store.record_review(&item, 1, Duration::from_secs(1), false).unwrap();
+        assert_eq!(st, LeechStatus::Leech);
+
+        s.leech_warnings = false;
+        store.save_settings(&s).unwrap();
+        let st = store.record_review(&item, 1, Duration::from_secs(1), false).unwrap();
+        assert_eq!(st, LeechStatus::None, "warnings off never reports a leech");
+    }
+
+    #[test]
+    fn hard_only_relocks_later_steps_when_enabled() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2", "s3"]));
+        for a in ["s1", "s2", "s3"] { rate(&store, &id, a, 3); }
+        assert!(!is_due(&store, &id, "s3"));
+
+        // default: Hard re-locks everything below
+        rate(&store, &id, "s1", 2);
+        assert!(is_due(&store, &id, "s2") && is_due(&store, &id, "s3"));
+
+        for a in ["s2", "s3"] { rate(&store, &id, a, 3); }
+        assert!(!is_due(&store, &id, "s3"));
+
+        let mut s = store.settings();
+        s.relock_on_hard = false;
+        store.save_settings(&s).unwrap();
+        rate(&store, &id, "s1", 2);
+        assert!(!is_due(&store, &id, "s2") && !is_due(&store, &id, "s3"), "Hard no longer re-locks");
+        rate(&store, &id, "s1", 1);
+        assert!(is_due(&store, &id, "s2") && is_due(&store, &id, "s3"), "Again still does");
+    }
+
+    #[test]
+    fn max_interval_setting_caps_the_next_due_date() {
+        let store = mem();
+        let mut s = store.settings();
+        s.max_interval_days = 30;
+        store.save_settings(&s).unwrap();
+        let id = add(&store, &chain_drafts(&["only"]));
+        rate(&store, &id, "only", 4); // Easy: first interval is ~15 days uncapped
+        for _ in 0..6 {
+            // push it as far as the algorithm wants to go
+            let it = by_answer(&store, &id, "only");
+            store.conn.execute(
+                "UPDATE items SET due_at=?1 WHERE id=?2",
+                params![(Utc::now() - chrono::Duration::days(400)).to_rfc3339(), it.id],
+            ).unwrap();
+            rate(&store, &id, "only", 4);
+        }
+        assert!(by_answer(&store, &id, "only").interval_days <= 30.0);
     }
 }

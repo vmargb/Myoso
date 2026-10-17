@@ -17,6 +17,7 @@ use super::state::{
     LeechPrompt, ListCardsState, MENU_ITEMS, ReviewFocus, ReviewPhase,
 };
 use crate::models::{CardKind, ItemKind, ReviewMode};
+use crate::settings::SettingId;
 
 // ~~~ click-region helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
@@ -204,6 +205,7 @@ pub(super) fn render_menu(f: &mut Frame, app: &mut AppState, clicks: &mut Clicks
         " @  Statistics",
         " ~  Export",
         " ^  Import",
+        " #  Settings",
         " x  Quit",
     ]
     .iter()
@@ -435,7 +437,13 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         }
     };
     let mut prompt_title_spans: Vec<Span<'static>> = vec![
-        Span::raw(format!(" {}{} | {}", daily_prefix, rc.card.deck, kind_part)),
+        Span::raw(format!(" {} ", daily_prefix)),
+        // Highlight the deck / subdeck name with bold yellow text
+        Span::styled(
+            rc.card.deck.clone(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" | {} ", kind_part)),
     ];
     if !rc.card.tags.is_empty() {
         let tags_text = rc.card.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
@@ -2145,6 +2153,127 @@ pub(super) fn render_import(f: &mut Frame, app: &mut AppState, clicks: &mut Clic
         Paragraph::new(hint)
             .alignment(if multi_line { Alignment::Left } else { Alignment::Center })
             .wrap(Wrap { trim: false }),
+        v[3],
+    );
+}
+
+// ~~ Settings ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+pub(super) fn render_settings(f: &mut Frame, app: &mut AppState, clicks: &mut Clicks) {
+    let size = f.area();
+    let cfg  = app.store.settings();
+    let n    = SettingId::ALL.len() as u16;
+
+    // list + help box + status line + key hints
+    let area = centered_rect(80, n + 2 + 6 + 1 + 2, size);
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(n + 2), // list
+            Constraint::Length(6),     // help for the selected row (wraps, + default hint)
+            Constraint::Length(1),     // status
+            Constraint::Min(1),        // key hints
+        ])
+        .split(area);
+
+    let ui = match app.settings_ui.as_mut() { Some(u) => u, None => return };
+    let selected = ui.list_state.selected();
+
+    // ~~ list ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    // section name only where it changes, the selected row carries no colours
+    // of its own so the highlight style stays readable
+    let mut prev_section = "";
+    let items: Vec<ListItem> = SettingId::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            let sel      = selected == Some(i);
+            let active   = id.is_active(&cfg);
+            let section  = if id.section() != prev_section { id.section() } else { "" };
+            prev_section = id.section();
+
+            let value = if id.is_bool() {
+                format!("[{}] {}", if id.value_text(&cfg) == "on" { "x" } else { " " }, id.value_text(&cfg))
+            } else {
+                format!("◀ {} ▶", id.value_text(&cfg))
+            };
+
+            let dim   = |c: Color| if sel { Style::default() } else { Style::default().fg(c) };
+            let value_style = if sel {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else if !active {
+                Style::default().fg(Color::DarkGray)
+            } else if id.is_default(&cfg) {
+                Style::default().fg(Color::White)
+            } else {
+                // differs from the default
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            };
+            let label_style = if !active { dim(Color::DarkGray) } else { Style::default() };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{:<11}", section), dim(Color::DarkGray)),
+                Span::styled(format!("{:<27}", id.label()), label_style),
+                Span::styled(value, value_style),
+            ]))
+        })
+        .collect();
+
+    f.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .title(" Settings ")
+                    .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            )
+            .highlight_style(
+                Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(" ▶ "),
+        v[0],
+        &mut ui.list_state,
+    );
+    clicks.push((v[0], ClickTarget::SettingsList));
+
+    // ~~ help for the selected row ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    if let Some(id) = ui.selected_id() {
+        let mut lines = vec![Line::from(id.help())];
+        if !id.is_default(&cfg) {
+            // show what the default is, using the row's own formatting
+            let d = crate::settings::Settings::default();
+            lines.push(Line::from(Span::styled(
+                format!("Default: {}  ([r] to restore)", id.value_text(&d)),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::DarkGray))),
+            v[1],
+        );
+    }
+
+    // ~~ status + hints ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    if let Some(ref msg) = ui.status {
+        let col = if msg.starts_with("Could not") { Color::Red } else { Color::Green };
+        f.render_widget(
+            Paragraph::new(Span::styled(msg.as_str(), Style::default().fg(col)))
+                .alignment(Alignment::Center),
+            v[2],
+        );
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "[↑↓ ] select  │  [←→ ] change  │  [H/L] big step  │  [r] reset row  │  [R] reset all  │  [Esc] back",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true }),
         v[3],
     );
 }
