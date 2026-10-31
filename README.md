@@ -119,13 +119,13 @@ Asking you to produce every step of a brand-new chain from a cold start strains 
 S1 -> S2 -> S3 -> S4        boundary 3:   S1 ◆  S2 ◆  S3 tested  S4 tested
 ```
 
-- Only tested steps are rated and scheduled. A worked step is never rated, never touches FSRS and never writes to the review log, so showing an answer can't inflate how well a step is remembered.
-- All tested steps `Good`/`Easy` moves the boundary back by one. Any `Again` or `Hard` keeps it where it is. Easy never skips ahead.
-- A miss on a tested step does not stop the review or re-lock the steps below it, they were attempted in the same review and are scheduled on their own ratings.
-- Each branch of a tree card fades independently, the state lives on the leaf of each path.
+- Only tested steps are rated and scheduled.
+- `Good`/`Easy` moves the boundary back by one. Any `Again` or `Hard` keeps it where it is.
+- Each **branch** of a tree card fades independently, the state lives on the leaf of each path.
 - When every step is strong (stability of 21 days or more, no recent failures) the path goes back to the normal step-by-step review. If it lapses later, it comes back faded starting from the earliest weak step, not from the end.
-- Prefer to always be tested on every step? Turn off **Adaptive fading** in Settings (Scheduling). Review then behaves exactly as it did before this feature.
 - A path is only advanced once per session. Daily cards fade too, but their scheduling stays frozen. Cram always shows the full chain.
+
+**Note:** Turn off **Adaptive fading** in Settings (Scheduling) to remove this behaviour.
 
 ---
 
