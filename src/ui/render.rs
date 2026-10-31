@@ -532,9 +532,12 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
                 } else {
                     format!("  {}. {} {mark}", i + 1, prev.prompt)
                 };
+
+                // keep the step header clearly visible, only dim the body/answer
+                let header_color = if is_worked { Color::Cyan } else { Color::White };
                 context_lines.push(Line::from(Span::styled(
                     display_label,
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                    Style::default().fg(header_color).add_modifier(Modifier::BOLD),
                 )));
                 if prev.is_pass {
                     context_lines.push(Line::from(Span::styled(
