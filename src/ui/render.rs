@@ -363,7 +363,7 @@ fn cloze_lines(text: &str, revealed: bool, base: Style) -> Vec<Line<'static>> {
                 } else {
                     let label = match hint {
                         Some(h) => format!("[{h}]"),
-                        None => "[…]".to_string(),
+                        None => "[… ]".to_string(),
                     };
                     let style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
                     push_cloze_text(&mut lines, &label, style);

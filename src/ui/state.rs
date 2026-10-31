@@ -142,7 +142,6 @@ impl ReviewState {
 
     pub fn reveal(&mut self) {
         self.phase = ReviewPhase::Revealed;
-        self.answer_scroll = 0; // reset scroll on new reveal
     }
 
     // appends a review path to the end of the session for every branch of
