@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::fade;
 use crate::models::*;
 use crate::scheduler;
 use crate::settings::{SettingId, Settings};
@@ -274,6 +275,12 @@ impl Store {
         );
         let _ = self.conn.execute(
             "ALTER TABLE items ADD COLUMN heavy INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // adaptive fading: boundary of the root -> leaf path, stored on the leaf
+        // step. NULL = never entered fading (see fade.rs)
+        let _ = self.conn.execute(
+            "ALTER TABLE items ADD COLUMN fade_boundary INTEGER",
             [],
         );
         // after the ALTERs, so old databases have the column when this runs
@@ -600,8 +607,10 @@ impl Store {
         for card in daily_cards {
             let items = self.load_items(&card.id)?;
             let refs  = self.references_for(&card)?;
-            for path in daily_paths(&card, &items, &today) {
-                session.push(ReviewCard { card: card.clone(), items: path, references: refs.clone() });
+            for p in planned_daily_paths(&card, &items, &today, self.settings().adaptive_fading) {
+                session.push(ReviewCard {
+                    card: card.clone(), items: p.items, references: refs.clone(), fade: p.fade,
+                });
             }
         }
 
@@ -617,18 +626,21 @@ impl Store {
         // is correctly classified as a review card, not a new card
         //
         // each bucket entry is the cards whole group of paths kept together
+        let fading = self.settings().adaptive_fading;
         let mut sr_reviews: Vec<Vec<ReviewCard>> = Vec::new();
         let mut sr_new:     Vec<Vec<ReviewCard>> = Vec::new();
 
         for card in sr_cards {
             let items = self.load_items(&card.id)?;
-            let paths = due_paths_for_card(&card, &items, now);
+            let paths = planned_due_paths(&card, &items, now, fading);
             if paths.is_empty() { continue; }
             let refs = self.references_for(&card)?;
 
             let group: Vec<ReviewCard> = paths
                 .into_iter()
-                .map(|path| ReviewCard { card: card.clone(), items: path, references: refs.clone() })
+                .map(|p| ReviewCard {
+                    card: card.clone(), items: p.items, references: refs.clone(), fade: p.fade,
+                })
                 .collect();
 
             if items.iter().all(|it| it.review_count == 0) {
@@ -714,7 +726,10 @@ impl Store {
             };
 
             for path in paths {
-                session.push(ReviewCard { card: card.clone(), items: path, references: refs.clone() });
+                // cram never fades: the complete chain, nothing written
+                session.push(ReviewCard {
+                    card: card.clone(), items: path, references: refs.clone(), fade: None,
+                });
             }
         }
 
@@ -781,14 +796,16 @@ impl Store {
 
         let paths = if card.review_mode.is_daily() {
             let today = now.format("%Y-%m-%d").to_string();
-            daily_paths(&card, &items, &today)
+            planned_daily_paths(&card, &items, &today, self.settings().adaptive_fading)
         } else {
-            due_paths_for_card(&card, &items, now)
+            planned_due_paths(&card, &items, now, self.settings().adaptive_fading)
         };
 
         Ok(paths
             .into_iter()
-            .map(|path| ReviewCard { card: card.clone(), items: path, references: refs.clone() })
+            .map(|p| ReviewCard {
+                card: card.clone(), items: p.items, references: refs.clone(), fade: p.fade,
+            })
             .collect())
     }
 
@@ -956,6 +973,22 @@ impl Store {
         duration: Duration,
         chain_reexposure: bool,
     ) -> Result<LeechStatus> {
+        self.record_review_with(item_id, confidence, duration, chain_reexposure, false)
+    }
+
+    /// `record_review` for a step that was TESTED inside a faded review
+    /// (`faded == true`). Everything is scored exactly as usual, but the step
+    /// de-unlock below is skipped: the later tested steps were attempted in the
+    /// same review, so re-locking them would only duplicate that work.
+    /// Worked steps are never passed here at all.
+    pub fn record_review_with(
+        &self,
+        item_id: &str,
+        confidence: u8,
+        duration: Duration,
+        chain_reexposure: bool,
+        faded: bool,
+    ) -> Result<LeechStatus> {
         // load current item state
         let item = self
             .conn
@@ -979,6 +1012,21 @@ impl Store {
         let is_tree  = tree_flag != 0;
 
         let cfg = self.settings();
+
+        // would the de-unlock run for this rating? It is skipped for a faded
+        // review, and also while any branch through this step is being faded.
+        // That has to be judged on the state from BEFORE this rating: an Again
+        // makes the path look weak, which must not retroactively count as
+        // "was fading"
+        let relock = !is_daily
+            && item.kind == ItemKind::Step
+            && confidence <= cfg.relock_max_rating()
+            && !faded
+            && (!cfg.adaptive_fading || {
+                let all = self.load_items(&item.card_id)?;
+                !fade::fading_through(is_tree, &all, &item.id)
+            });
+
         let prev_interval = item.interval_days;
         // snapshot before `item` is moved into the branches below (they
         // each consume it by value, either via `..item` or apply_confidence)
@@ -1061,7 +1109,7 @@ impl Store {
         // and not the siblings or ancestors (forgetting the SSD path doesn't reset HDD)
         // This only applies to SR cards (never daily mode) (obviously)
         // The setting `relock_on_hard` decides whether Hard counts, too
-        if !is_daily && updated.kind == ItemKind::Step && confidence <= cfg.relock_max_rating() {
+        if relock {
             let items = self.load_items(&updated.card_id)?;
             let tree  = StepTree::new(is_tree, &items);
             if let Some(idx) = tree.index_of(&updated.id) {
@@ -1148,6 +1196,89 @@ impl Store {
         }
 
         Ok(LeechStatus::None)
+    }
+
+    // ~~ Adaptive fading ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    /// Called once the user has rated every TESTED step of a faded path (SR or
+    /// daily, never cram). `boundary` is the one the path was shown with and
+    /// `tested` the ratings of its tested steps in order. Moves the boundary
+    /// back one step when all of them were Good/Easy, otherwise keeps it, or
+    /// graduates the path (stores `GRADUATED`) once every step is strong.
+    /// Returns the stored value. Touches nothing but `fade_boundary`.
+    pub fn complete_fade(&self, leaf_id: &str, boundary: usize, tested: &[u8]) -> Result<i32> {
+        let card_id: String = self
+            .conn
+            .query_row("SELECT card_id FROM items WHERE id=?1", params![leaf_id], |r| r.get(0))
+            .context("load leaf for fade")?;
+        let card  = self.load_card(&card_id)?;
+        let items = self.load_items(&card_id)?;
+        let tree  = StepTree::new(card.is_tree, &items);
+        let Some(idx) = tree.index_of(leaf_id) else { return Ok(fade::GRADUATED) };
+        if !tree.is_leaf(idx) {
+            return Ok(fade::GRADUATED); // edited under us, nothing to store
+        }
+        let path: Vec<Item> = tree.path_to(idx).into_iter().map(|i| tree.item(i).clone()).collect();
+
+        let next = fade::next_boundary(boundary, tested).min(path.len()).max(1);
+        let stored = if fade::is_graduated(&path) { fade::GRADUATED } else { next as i32 };
+        self.conn
+            .execute(
+                "UPDATE items SET fade_boundary=?1 WHERE id=?2",
+                params![stored, leaf_id],
+            )
+            .context("store fade boundary")?;
+        Ok(stored)
+    }
+
+    /// fade state only lives on leaves. After an edit a step that gained
+    /// children is an internal node, so its boundary is dropped (the new leaf
+    /// paths start fresh) and can never be read as a different branch's state
+    fn clear_internal_fade(&self, card_id: &str) -> Result<()> {
+        let card  = self.load_card(card_id)?;
+        let items = self.load_items(card_id)?;
+        let tree  = StepTree::new(card.is_tree, &items);
+        for i in 0..tree.len() {
+            let it = tree.item(i);
+            if it.fade_boundary.is_some() && !tree.is_leaf(i) {
+                self.conn
+                    .execute("UPDATE items SET fade_boundary=NULL WHERE id=?1", params![it.id])
+                    .context("clear internal fade")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// test fixture: every step of a card becomes strong and scheduled well
+    /// ahead (so fading has graduated), except the steps whose answers are in
+    /// `due_now`, which are due. Lets tests exercise the legacy per-step unlocking
+    #[cfg(test)]
+    pub fn test_make_mature(&self, card_id: &str, due_now: &[&str]) {
+        let ahead = (Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let past = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let last = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE items SET review_count=5, ease=40.0, difficulty=5.0, consecutive_fails=0,
+                        consecutive_hards=0, due_at=?2, last_reviewed_at=?3, fade_boundary=NULL
+                 WHERE card_id=?1",
+                params![card_id, ahead, last],
+            )
+            .unwrap();
+        for a in due_now {
+            self.conn
+                .execute("UPDATE items SET due_at=?1 WHERE card_id=?2 AND answer=?3", params![past, card_id, a])
+                .unwrap();
+        }
+    }
+
+    /// test fixture: a day passes, every step of the card is due again
+    #[cfg(test)]
+    pub fn test_make_due_all(&self, card_id: &str) {
+        let past = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        self.conn
+            .execute("UPDATE items SET due_at=?1 WHERE card_id=?2", params![past, card_id])
+            .unwrap();
     }
 
     // ~~ Deck listing ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1717,6 +1848,7 @@ impl Store {
                 .execute("DELETE FROM items WHERE id=?1", params![id])
                 .context("delete removed step")?;
         }
+        self.clear_internal_fade(card_id)?;
 
         tx.commit().context("commit update multi card")?;
         Ok(())
@@ -1843,6 +1975,38 @@ fn due_paths_for_card(card: &Card, items: &[Item], now: DateTime<Utc>) -> Vec<Ve
     }
 }
 
+/// `due_paths_for_card` with adaptive fading applied (see fade.rs). Simple
+/// cards and paths that are not fading come out exactly as before
+/// (`fading == false` is the Adaptive fading setting turned off: the old paths)
+fn planned_due_paths(card: &Card, items: &[Item], now: DateTime<Utc>, fading: bool) -> Vec<fade::PlannedPath> {
+    match card.kind {
+        CardKind::Multi if fading => fade::plan_due_paths(card.is_tree, items, now),
+        CardKind::Multi => due_paths_for_card(card, items, now)
+            .into_iter()
+            .map(|items| fade::PlannedPath { items, fade: None })
+            .collect(),
+        CardKind::Simple => due_paths_for_card(card, items, now)
+            .into_iter()
+            .map(|items| fade::PlannedPath { items, fade: None })
+            .collect(),
+    }
+}
+
+/// `daily_paths` with adaptive fading applied
+fn planned_daily_paths(card: &Card, items: &[Item], today: &str, fading: bool) -> Vec<fade::PlannedPath> {
+    match card.kind {
+        CardKind::Multi if fading => fade::plan_daily_paths(card.is_tree, items, today),
+        CardKind::Multi => daily_paths(card, items, today)
+            .into_iter()
+            .map(|items| fade::PlannedPath { items, fade: None })
+            .collect(),
+        CardKind::Simple => daily_paths(card, items, today)
+            .into_iter()
+            .map(|items| fade::PlannedPath { items, fade: None })
+            .collect(),
+    }
+}
+
 // daily-mode paths. A daily card ignores schedulingt
 fn daily_paths(card: &Card, items: &[Item], today: &str) -> Vec<Vec<Item>> {
     let not_today = |it: &Item| {
@@ -1888,14 +2052,14 @@ fn target_retrievability(rc: &ReviewCard, now: DateTime<Utc>) -> f64 {
 ///  9 last_reviewed_at | 10 lapses | 11 review_count |
 ///  12 confidence_avg | 13 image_path | 14 difficulty |
 ///  15 consecutive_fails | 16 consecutive_hards |
-///  17 parent_id | 18 is_pass | 19 body | 20 heavy
+///  17 parent_id | 18 is_pass | 19 body | 20 heavy | 21 fade_boundary
 ///  (the legacy scaffold_state / scaffold_passes / weak_spans /
 ///  scaffold_pass_date columns still exist in old databases and are ignored)
 const ITEM_COLS: &str = "id, card_id, position, kind, prompt, answer, due_at,
                         interval_days, ease, last_reviewed_at, lapses, review_count,
                         confidence_avg, image_path, difficulty,
                         consecutive_fails, consecutive_hards,
-                        parent_id, is_pass, body, heavy";
+                        parent_id, is_pass, body, heavy, fade_boundary";
 
 fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     let kind: String                       = row.get(3)?;
@@ -1926,6 +2090,7 @@ fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         is_pass: is_pass != 0,
         body: row.get(19)?,
         heavy: heavy != 0,
+        fade_boundary: row.get(21)?,
     })
 }
 
@@ -2009,6 +2174,26 @@ mod tests {
         store.record_review(&id, confidence, Duration::from_secs(1), false).unwrap();
     }
 
+    /// make every step of a card strong (the state adaptive fading graduates
+    /// to), scheduled well ahead. The legacy unlocking tests below use this:
+    /// a card that has only been rated Good once or twice is still young, and
+    /// young paths are faded (no re-locking), see fade.rs
+    fn mature(store: &Store, card: &str) {
+        store.conn
+            .execute(
+                "UPDATE items SET review_count=5, ease=40.0, difficulty=5.0,
+                        consecutive_fails=0, consecutive_hards=0, due_at=?2, last_reviewed_at=?3,
+                        fade_boundary=NULL
+                 WHERE card_id=?1",
+                params![
+                    card,
+                    (Utc::now() + ChronoDuration::days(30)).to_rfc3339(),
+                    (Utc::now() - ChronoDuration::days(1)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+    }
+
     fn is_due(store: &Store, card: &str, answer: &str) -> bool {
         by_answer(store, card, answer).due_at <= Utc::now()
     }
@@ -2073,6 +2258,7 @@ mod tests {
         let id = add(&store, &chain_drafts(&["s1", "s2", "s3", "s4"]));
         make_legacy(&store, &id);
         for a in ["s1", "s2", "s3", "s4"] { rate(&store, &id, a, 3); }
+        mature(&store, &id);
         assert!(["s1", "s2", "s3", "s4"].iter().all(|a| !is_due(&store, &id, a)));
 
         rate(&store, &id, "s2", 1);
@@ -2090,14 +2276,24 @@ mod tests {
         let id = add(&store, &root_fork_drafts());
         assert!(store.load_card(&id).unwrap().is_tree);
 
+        // a brand-new card is faded: the complete path of each root, with only
+        // the last step tested
         let session = store.due_session(None, &SessionLimits::default()).unwrap();
         assert_eq!(session.len(), 2, "one review path per root");
-        assert!(session.iter().all(|rc| rc.card.id == id && rc.items.len() == 1));
-        let mut targets: Vec<&str> = session.iter().map(|rc| rc.items[0].answer.as_str()).collect();
+        assert!(session.iter().all(|rc| rc.card.id == id && rc.items.len() == 2 && rc.fade == Some(2)));
+        let mut targets: Vec<Vec<&str>> = session.iter().map(|rc| answers(&rc.items)).collect();
         targets.sort();
-        assert_eq!(targets, ["h1", "s1"]);
+        assert_eq!(targets, vec![vec!["h1", "h2"], vec!["s1", "s2"]]);
 
-        // passing SSD step 1 unlocks SSD step 2 (with step 1 as context) and leaves HDD as it was
+        // the same card with mature steps keeps the legacy per-step unlocking:
+        // passing SSD step 1 unlocks SSD step 2 (with step 1 as context) and
+        // leaves HDD as it was
+        let store = mem();
+        let id = add(&store, &root_fork_drafts());
+        mature(&store, &id);
+        store.conn.execute("UPDATE items SET due_at=?1", params![(Utc::now() - ChronoDuration::minutes(1)).to_rfc3339()]).unwrap();
+        let session = store.due_session(None, &SessionLimits::default()).unwrap();
+        assert!(session.iter().all(|rc| rc.fade.is_none() && rc.items.len() == 1));
         rate(&store, &id, "s1", 3);
         let next = store.review_card_if_due(&id).unwrap();
         let paths: Vec<Vec<&str>> = next.iter().map(|rc| answers(&rc.items)).collect();
@@ -2109,6 +2305,7 @@ mod tests {
         let store = mem();
         let id = add(&store, &root_fork_drafts());
         for a in ["s1", "s2", "h1", "h2"] { rate(&store, &id, a, 3); }
+        mature(&store, &id);
 
         rate(&store, &id, "s1", 1); // forget the first SSD step
         assert!(is_due(&store, &id, "s2"), "below the failure");
@@ -2122,6 +2319,7 @@ mod tests {
         let store = mem();
         let id = add(&store, &fork_drafts());
         for a in ["t1", "t2", "a1", "a2", "b1"] { rate(&store, &id, a, 3); }
+        mature(&store, &id);
         assert!(["t1", "t2", "a1", "a2", "b1"].iter().all(|a| !is_due(&store, &id, a)));
 
         // forgetting a leaf-side step only re-locks what is below it
@@ -2129,6 +2327,10 @@ mod tests {
         assert!(is_due(&store, &id, "a2"));
         assert!(!is_due(&store, &id, "b1"), "sibling branch untouched");
         assert!(!is_due(&store, &id, "t2") && !is_due(&store, &id, "t1"), "ancestors untouched");
+
+        // (branch A is weak now and being faded, which switches the re-lock
+        // off for everything on its path, so start the trunk case clean)
+        mature(&store, &id);
 
         // forgetting the trunk re-locks BOTH branches
         rate(&store, &id, "t2", 2);
@@ -2371,11 +2573,17 @@ mod tests {
         let dst = mem();
         dst.import_json(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(!dst.load_card(&id).unwrap().is_tree);
+        // a new chain is shown whole, with only the last step tested
         let session = dst.due_session(None, &SessionLimits::default()).unwrap();
         assert_eq!(session.len(), 1);
-        assert_eq!(answers(&session[0].items), ["s1"]);
+        assert_eq!(answers(&session[0].items), ["s1", "s2", "s3"]);
+        assert_eq!(session[0].fade, Some(3));
+        // and the old-export chain still unlocks step by step once it is mature
+        mature(&dst, &id);
+        dst.conn.execute("UPDATE items SET due_at=?1", params![(Utc::now() - ChronoDuration::minutes(1)).to_rfc3339()]).unwrap();
         rate(&dst, &id, "s1", 3);
         let next = dst.review_card_if_due(&id).unwrap();
+        assert_eq!(next[0].fade, None);
         assert_eq!(answers(&next[0].items), ["s1", "s2"]);
     }
 
@@ -2585,12 +2793,12 @@ mod tests {
         let store = Store::open(&path_str).unwrap();
 
         // behaves like the chain it always was
+        // the column added for adaptive fading exists and starts empty
+        assert!(store.load_items("c1").unwrap().iter().all(|i| i.fade_boundary.is_none()));
         let session = store.due_session(None, &SessionLimits::default()).unwrap();
         assert_eq!(session.len(), 1);
-        assert_eq!(answers(&session[0].items), ["one"]);
-        store.record_review("i1", 3, Duration::from_secs(1), false).unwrap();
-        let next = store.review_card_if_due("c1").unwrap();
-        assert_eq!(answers(&next[0].items), ["one", "two"]);
+        assert_eq!(answers(&session[0].items), ["one", "two", "three"]);
+        assert_eq!(session[0].fade, Some(3));
 
         // and can be branched by editing it
         let items = store.load_items("c1").unwrap();
@@ -3005,6 +3213,7 @@ mod tests {
         let store = mem();
         let id = add(&store, &chain_drafts(&["s1", "s2", "s3"]));
         for a in ["s1", "s2", "s3"] { rate(&store, &id, a, 3); }
+        mature(&store, &id);
         assert!(!is_due(&store, &id, "s3"));
 
         // default: Hard re-locks everything below
@@ -3042,4 +3251,157 @@ mod tests {
         }
         assert!(by_answer(&store, &id, "only").interval_days <= 30.0);
     }
+
+    // ~~ adaptive fading (storage side) ~~
+
+    fn log_count(store: &Store) -> i64 {
+        store.conn.query_row("SELECT COUNT(*) FROM review_log", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_faded_rating_does_not_relock_what_is_below_it() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2", "s3"]));
+        for a in ["s1", "s2", "s3"] { rate(&store, &id, a, 3); }
+        let s1 = by_answer(&store, &id, "s1").id;
+        store.record_review_with(&s1, 1, Duration::from_secs(1), false, true).unwrap();
+        assert!(!is_due(&store, &id, "s2") && !is_due(&store, &id, "s3"), "faded: no de-unlock");
+        // and the same Again on a young path outside a faded review: the path is
+        // being faded (young), so the shared-trunk rule keeps the re-lock off too
+        let s2 = by_answer(&store, &id, "s2").id;
+        store.record_review(&s2, 1, Duration::from_secs(1), false).unwrap();
+        assert!(!is_due(&store, &id, "s3"));
+    }
+
+    #[test]
+    fn a_mature_path_relocks_exactly_as_before() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2", "s3"]));
+        store.test_make_mature(&id, &[]);
+        rate(&store, &id, "s1", 1);
+        assert!(is_due(&store, &id, "s2") && is_due(&store, &id, "s3"));
+    }
+
+    #[test]
+    fn complete_fade_only_writes_the_boundary() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2", "s3"]));
+        let leaf = by_answer(&store, &id, "s3").id;
+        let logs = log_count(&store);
+        assert_eq!(store.complete_fade(&leaf, 3, &[3]).unwrap(), 2);
+        assert_eq!(store.complete_fade(&leaf, 2, &[3, 4]).unwrap(), 1);
+        assert_eq!(store.complete_fade(&leaf, 1, &[3, 3]).unwrap(), 1, "never below 1");
+        assert_eq!(store.complete_fade(&leaf, 2, &[3, 1]).unwrap(), 2);
+        assert_eq!(log_count(&store), logs, "no review_log row");
+        let s3 = by_answer(&store, &id, "s3");
+        assert_eq!((s3.review_count, s3.stability), (0, 0.0));
+    }
+
+    #[test]
+    fn a_strong_path_graduates_instead_of_storing_a_boundary() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2"]));
+        store.test_make_mature(&id, &[]);
+        let leaf = by_answer(&store, &id, "s2").id;
+        assert_eq!(store.complete_fade(&leaf, 2, &[3]).unwrap(), fade::GRADUATED);
+        assert_eq!(by_answer(&store, &id, "s2").fade_boundary, Some(fade::GRADUATED));
+    }
+
+    #[test]
+    fn faded_branches_store_their_boundary_on_their_own_leaf() {
+        let store = mem();
+        let id = add(&store, &fork_drafts());
+        let (a2, b1) = (by_answer(&store, &id, "a2").id, by_answer(&store, &id, "b1").id);
+        store.complete_fade(&a2, 4, &[3]).unwrap();
+        assert_eq!(by_answer(&store, &id, "a2").fade_boundary, Some(3));
+        assert_eq!(by_answer(&store, &id, "b1").fade_boundary, None);
+        store.complete_fade(&b1, 3, &[1]).unwrap();
+        assert_eq!(by_answer(&store, &id, "b1").fade_boundary, Some(3));
+        assert_eq!(by_answer(&store, &id, "a2").fade_boundary, Some(3));
+    }
+
+    #[test]
+    fn a_leaf_that_gains_children_drops_its_fade_state() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2"]));
+        let old_leaf = by_answer(&store, &id, "s2").id;
+        store.complete_fade(&old_leaf, 2, &[3]).unwrap();
+        assert_eq!(by_answer(&store, &id, "s2").fade_boundary, Some(1));
+
+        // s2 becomes a fork point with two children
+        let card = store.load_card(&id).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let mut d = tree::drafts_from_items(card.is_tree, &items);
+        let s2_key = d.iter().find(|x| x.answer == "s2").unwrap().key;
+        let mut x = draft(10, Some(s2_key), "X", "x1");
+        x.branched = true;
+        let mut y = draft(11, Some(s2_key), "Y", "y1");
+        y.branched = true;
+        d.push(x);
+        d.push(y);
+        store.update_multi_card(&id, "Deck", "Q?", &d, true, &ReviewMode::SpacedRepetition).unwrap();
+
+        assert_eq!(by_answer(&store, &id, "s2").fade_boundary, None, "internal node carries no state");
+        assert_eq!(by_answer(&store, &id, "x1").fade_boundary, None);
+        assert_eq!(by_answer(&store, &id, "y1").fade_boundary, None);
+        // both new leaf paths start faded and fully supported
+        let paths = store.review_card_if_due(&id).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|rc| rc.fade == Some(3)));
+    }
+
+    #[test]
+    fn a_stored_boundary_beyond_the_path_is_clamped_after_steps_are_removed() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2", "s3", "s4"]));
+        let leaf = by_answer(&store, &id, "s4").id;
+        store.conn.execute("UPDATE items SET fade_boundary=4 WHERE id=?1", params![leaf]).unwrap();
+        let card = store.load_card(&id).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let mut d = tree::drafts_from_items(card.is_tree, &items);
+        d.remove(1); // splice out s2: the path is now 3 long and s4 is still its leaf
+        d[1].parent = Some(d[0].key);
+        store.update_multi_card(&id, "Deck", "Q?", &d, true, &ReviewMode::SpacedRepetition).unwrap();
+        let paths = store.review_card_if_due(&id).unwrap();
+        assert_eq!(paths[0].items.len(), 3);
+        assert_eq!(paths[0].fade, Some(3), "4 clamped to the path length");
+    }
+
+    #[test]
+    fn cram_sessions_never_fade() {
+        let store = mem();
+        let id = add(&store, &chain_drafts(&["s1", "s2", "s3"]));
+        let session = store.cram_session(None).unwrap();
+        assert!(session.iter().all(|rc| rc.fade.is_none() && rc.items.len() == 3));
+        assert!(by_answer(&store, &id, "s3").fade_boundary.is_none());
+    }
+
+
+    #[test]
+    fn with_adaptive_fading_off_everything_behaves_as_before_the_feature() {
+        let store = mem();
+        let mut cfg = store.settings();
+        cfg.adaptive_fading = false;
+        store.save_settings(&cfg).unwrap();
+
+        // a new chain: one growing path, nothing worked, nothing stored
+        let id = add(&store, &chain_drafts(&["s1", "s2", "s3"]));
+        let session = store.due_session(None, &SessionLimits::default()).unwrap();
+        assert_eq!(session.len(), 1);
+        assert_eq!(answers(&session[0].items), ["s1"]);
+        assert_eq!(session[0].fade, None);
+
+        // young steps still re-lock what is below them
+        for a in ["s1", "s2", "s3"] { rate(&store, &id, a, 3); }
+        rate(&store, &id, "s1", 1);
+        assert!(is_due(&store, &id, "s2") && is_due(&store, &id, "s3"));
+
+        // daily cards are not faded either
+        let d = store
+            .add_multi_card("Deck", "Daily?", &chain_drafts(&["d1", "d2"]), true, &ReviewMode::Daily)
+            .unwrap();
+        let daily = store.review_card_if_due(&d).unwrap();
+        assert!(daily.iter().all(|rc| rc.fade.is_none()));
+    }
+
 }

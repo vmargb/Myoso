@@ -6,6 +6,7 @@ mod markdown;
 mod tree;
 mod outline;
 mod settings;
+mod fade;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

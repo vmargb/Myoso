@@ -27,6 +27,10 @@ pub struct Settings {
     pub max_interval_days: u32,
     /// Hard (2) re-locks the steps below it not just Again (1)
     pub relock_on_hard: bool,
+    /// adaptive fading: new, weak or lapsed paths are shown as worked examples
+    /// and only the tail is tested (see fade.rs). Off = every step is tested
+    /// and the old step-by-step unlocking applies everywhere
+    pub adaptive_fading: bool,
 
     // ~~ weak steps ~~
     /// show the "this step is a leech" prompt at all
@@ -51,6 +55,7 @@ impl Default for Settings {
             desired_retention: 0.90,
             max_interval_days: 36_500,
             relock_on_hard:    true,
+            adaptive_fading:   true,
             leech_warnings:    true,
             leech_threshold:   8,
             allow_easy:        true,
@@ -102,6 +107,7 @@ pub enum SettingId {
     DesiredRetention,
     MaxInterval,
     RelockOnHard,
+    AdaptiveFading,
     LeechWarnings,
     LeechThreshold,
     AllowEasy,
@@ -118,12 +124,13 @@ fn step_usize(v: usize, dir: i32, step: usize, coarse: bool) -> usize {
 
 impl SettingId {
     /// display order, top to bottom
-    pub const ALL: [SettingId; 9] = [
+    pub const ALL: [SettingId; 10] = [
         SettingId::NewCards,
         SettingId::MaxReviews,
         SettingId::DesiredRetention,
         SettingId::MaxInterval,
         SettingId::RelockOnHard,
+        SettingId::AdaptiveFading,
         SettingId::LeechWarnings,
         SettingId::LeechThreshold,
         SettingId::AllowEasy,
@@ -133,7 +140,8 @@ impl SettingId {
     pub fn section(self) -> &'static str {
         match self {
             Self::NewCards | Self::MaxReviews => "Sessions",
-            Self::DesiredRetention | Self::MaxInterval | Self::RelockOnHard => "Scheduling",
+            Self::DesiredRetention | Self::MaxInterval | Self::RelockOnHard
+            | Self::AdaptiveFading => "Scheduling",
             Self::LeechWarnings | Self::LeechThreshold => "Weak steps",
             Self::AllowEasy | Self::Mouse => "Interface",
         }
@@ -146,6 +154,7 @@ impl SettingId {
             Self::DesiredRetention => "Target retention",
             Self::MaxInterval      => "Maximum interval",
             Self::RelockOnHard     => "Hard re-locks later steps",
+            Self::AdaptiveFading   => "Adaptive fading",
             Self::LeechWarnings    => "Leech warnings",
             Self::LeechThreshold   => "Leech after N Agains",
             Self::AllowEasy        => "Allow the Easy rating",
@@ -166,6 +175,8 @@ impl SettingId {
                 "No step is scheduled further out than this. Useful for exam material that must stay fresh. Does not change a step's stability.",
             Self::RelockOnHard =>
                 "On: rating a step Hard (2) makes every step below it due again, like Again. Off: only Again does this.",
+            Self::AdaptiveFading =>
+                "On: new, weak or forgotten chains show their early steps as a worked example and test only the end, testing more each time you succeed. Off: every step is always tested.",
             Self::LeechWarnings =>
                 "Warn when a step keeps failing and offer to split it into two simpler steps.",
             Self::LeechThreshold =>
@@ -186,6 +197,7 @@ impl SettingId {
             Self::DesiredRetention => "desired_retention",
             Self::MaxInterval      => "max_interval_days",
             Self::RelockOnHard     => "relock_on_hard",
+            Self::AdaptiveFading   => "adaptive_fading",
             Self::LeechWarnings    => "leech_warnings",
             Self::LeechThreshold   => "leech_threshold",
             Self::AllowEasy        => "allow_easy",
@@ -196,7 +208,7 @@ impl SettingId {
     pub fn is_bool(self) -> bool {
         matches!(
             self,
-            Self::RelockOnHard | Self::LeechWarnings | Self::AllowEasy | Self::Mouse
+            Self::RelockOnHard | Self::AdaptiveFading | Self::LeechWarnings | Self::AllowEasy | Self::Mouse
         )
     }
 
@@ -230,6 +242,7 @@ impl SettingId {
                 n      => format!("{n} days"),
             },
             Self::RelockOnHard     => onoff(s.relock_on_hard),
+            Self::AdaptiveFading   => onoff(s.adaptive_fading),
             Self::LeechWarnings    => onoff(s.leech_warnings),
             Self::LeechThreshold   => s.leech_threshold.to_string(),
             Self::AllowEasy        => onoff(s.allow_easy),
@@ -267,6 +280,7 @@ impl SettingId {
                 };
             }
             Self::RelockOnHard  => s.relock_on_hard = !s.relock_on_hard,
+            Self::AdaptiveFading => s.adaptive_fading = !s.adaptive_fading,
             Self::LeechWarnings => s.leech_warnings = !s.leech_warnings,
             Self::AllowEasy     => s.allow_easy     = !s.allow_easy,
             Self::Mouse         => s.mouse          = !s.mouse,
@@ -282,6 +296,7 @@ impl SettingId {
             Self::DesiredRetention => s.desired_retention = d.desired_retention,
             Self::MaxInterval      => s.max_interval_days = d.max_interval_days,
             Self::RelockOnHard     => s.relock_on_hard = d.relock_on_hard,
+            Self::AdaptiveFading   => s.adaptive_fading = d.adaptive_fading,
             Self::LeechWarnings    => s.leech_warnings = d.leech_warnings,
             Self::LeechThreshold   => s.leech_threshold = d.leech_threshold,
             Self::AllowEasy        => s.allow_easy = d.allow_easy,
@@ -300,6 +315,7 @@ impl SettingId {
             Self::DesiredRetention => format!("{:.2}", s.desired_retention),
             Self::MaxInterval      => s.max_interval_days.to_string(),
             Self::RelockOnHard     => b(s.relock_on_hard),
+            Self::AdaptiveFading   => b(s.adaptive_fading),
             Self::LeechWarnings    => b(s.leech_warnings),
             Self::LeechThreshold   => s.leech_threshold.to_string(),
             Self::AllowEasy        => b(s.allow_easy),
@@ -323,6 +339,7 @@ impl SettingId {
             Self::MaxInterval      => if let Ok(v) = raw.parse() { s.max_interval_days = v },
             Self::LeechThreshold   => if let Ok(v) = raw.parse() { s.leech_threshold = v },
             Self::RelockOnHard     => if let Some(v) = flag() { s.relock_on_hard = v },
+            Self::AdaptiveFading   => if let Some(v) = flag() { s.adaptive_fading = v },
             Self::LeechWarnings    => if let Some(v) = flag() { s.leech_warnings = v },
             Self::AllowEasy        => if let Some(v) = flag() { s.allow_easy = v },
             Self::Mouse            => if let Some(v) = flag() { s.mouse = v },

@@ -428,8 +428,16 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
     );
 
     let daily_prefix = if rc.card.review_mode.is_daily() { "★ DAILY  " } else { "" };
+    let worked = rc.worked();
     let kind_part = if rc.card.kind == CardKind::Multi {
-        format!("multi | step {} of {}", rs.item_idx + 1, rc.items.len())
+        if worked > 0 {
+            format!(
+                "multi | step {} of {} | worked example 1-{}",
+                rs.item_idx + 1, rc.items.len(), worked,
+            )
+        } else {
+            format!("multi | step {} of {}", rs.item_idx + 1, rc.items.len())
+        }
     } else {
         match item.kind {
             ItemKind::Reverse => format!("{} | A->Q", rc.card.kind),
@@ -476,7 +484,10 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         // ~~ Chain breadcrumb ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         let mut crumb_spans: Vec<Span> = vec![Span::raw("  ")];
         for i in 0..total_in_session {
-            if i < rs.item_idx {
+            if i < worked {
+                // shown, not tested
+                crumb_spans.push(Span::styled("◆ ", Style::default().fg(Color::Blue)));
+            } else if i < rs.item_idx {
                 crumb_spans.push(Span::styled("✓ ", Style::default().fg(Color::DarkGray)));
             } else if i == rs.item_idx {
                 let col = if is_target { Color::Cyan } else { Color::Yellow };
@@ -485,7 +496,7 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
                 crumb_spans.push(Span::styled("○ ", Style::default().fg(Color::DarkGray)));
             }
         }
-        if !is_target {
+        if !is_target && rc.fade.is_none() {
             crumb_spans.push(Span::styled(
                 format!(" target is step {total_in_session}"),
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
@@ -495,9 +506,25 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
         context_lines.push(Line::from(""));
 
         // ~~ Preceding steps rebuild context ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        if rc.card.show_chain {
+        // worked examples are instruction, so they are always shown whatever
+        // the card's show_chain setting says
+        if worked > 0 {
+            context_lines.push(Line::from(Span::styled(
+                format!(
+                    "  ◆ steps 1-{worked} are shown as a worked example, recall from step {}",
+                    worked + 1,
+                ),
+                Style::default().fg(Color::Blue).add_modifier(Modifier::ITALIC),
+            )));
+            context_lines.push(Line::from(""));
+        }
+        if rc.card.show_chain || worked > 0 {
             for (i, prev) in rc.items[..rs.item_idx].iter().enumerate() {
-                let mark = if prev.is_pass { "…" } else { "✓" };
+                if i >= worked && !rc.card.show_chain {
+                    continue;
+                }
+                let is_worked = i < worked;
+                let mark = if prev.is_pass { "…" } else if is_worked { "◆" } else { "✓" };
                 let step_label = format!("  {} {mark}", prev.prompt);
                 // if the prompt is just the auto "Step N" we already have the number, otherwise show it
                 let display_label = if prev.prompt == format!("Step {}", i + 1) {
@@ -515,10 +542,13 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
                         Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                     )));
                 } else {
+                    // a worked answer is something to read, so it is brighter than
+                    // the greyed-out already-tested steps
+                    let answer_color = if is_worked { Color::Gray } else { Color::DarkGray };
                     for l in crate::models::cloze_plain(&prev.answer).lines() {
                         context_lines.push(Line::from(Span::styled(
                             format!("    {l}"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(answer_color),
                         )));
                     }
                 }
@@ -533,13 +563,18 @@ pub(super) fn render_review(f: &mut Frame, app: &AppState, clicks: &mut Clicks) 
             format!("  {}. {}  ", rs.item_idx + 1, item.prompt)
         };
         if is_target {
+            let hint = if rc.fade.is_some() {
+                "← last step"
+            } else {
+                "← current target  (pass to unlock the next step)"
+            };
             context_lines.push(Line::from(vec![
                 Span::styled(
                     cur_step_label,
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    "← current target  (pass to unlock the next step)",
+                    hint,
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                 ),
             ]));
@@ -2429,5 +2464,77 @@ mod tests {
         println!("{out}");
         assert!(out.contains("Justify a storage choice"));
         assert!(out.contains("SSD"), "the branch name tells the learner which path they are on");
+    }
+
+    #[test]
+    fn a_faded_review_shows_worked_steps_with_answers_and_hides_the_tested_one() {
+        let store = Store::open(":memory:").unwrap();
+        let drafts = vec![
+            draft(0, None, "Open", "Wire the breadboard"),
+            draft(1, Some(0), "Connect", "Resistor to the anode"),
+            draft(2, Some(1), "Power", "Secret final answer"),
+        ];
+        // show_chain off: worked steps must still be shown
+        store
+            .add_multi_card("Hardware", "Blink an LED", &drafts, false, &ReviewMode::SpacedRepetition)
+            .unwrap();
+        let session = store.due_session(None, &SessionLimits::default()).unwrap();
+        assert_eq!(session[0].fade, Some(3));
+        let mut app = AppState::new(&store);
+        app.review = Some(ReviewState::new(session));
+        app.screen = Screen::Review;
+
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut clicks = Vec::new();
+        term.draw(|f| render_review(f, &app, &mut clicks)).unwrap();
+        let out = dump(&term);
+        println!("{out}");
+        assert!(out.contains("Wire the breadboard") && out.contains("Resistor to the anode"));
+        assert!(out.contains("worked example"));
+        assert!(!out.contains("Secret final answer"), "the tested step is hidden until revealed");
+        assert!(!out.contains("pass to unlock"), "no unlock hint while fading");
+
+        // and revealing the tested step shows it
+        app.review.as_mut().unwrap().reveal();
+        term.draw(|f| render_review(f, &app, &mut clicks)).unwrap();
+        assert!(dump(&term).contains("Secret final answer"));
+    }
+
+    #[test]
+    fn settings_screen_lists_every_row_and_flags_changed_values() {
+        let store = Store::open(":memory:").unwrap();
+        let mut s = store.settings();
+        s.desired_retention = 0.85;
+        store.save_settings(&s).unwrap();
+
+        let mut app = AppState::new(&store);
+        app.settings_ui = Some(crate::ui::state::SettingsState::new());
+        app.screen = Screen::Settings;
+        // select the retention row so its help + default hint show
+        app.settings_ui.as_mut().unwrap().list_state.select(Some(2));
+
+        let mut term = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        let mut clicks = Vec::new();
+        term.draw(|f| render_settings(f, &mut app, &mut clicks)).unwrap();
+        let out = dump(&term);
+        println!("{out}");
+        for id in SettingId::ALL {
+            assert!(out.contains(id.label()), "missing row: {}", id.label());
+        }
+        assert!(out.contains("85%"), "changed value is shown");
+        assert!(out.contains("Default: 90%"), "default hint is shown for a changed row");
+        assert!(clicks.iter().any(|(_, t)| *t == ClickTarget::SettingsList));
+    }
+
+    #[test]
+    fn menu_lists_settings_before_quit() {
+        let store = Store::open(":memory:").unwrap();
+        let mut app = AppState::new(&store);
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut clicks = Vec::new();
+        term.draw(|f| render_menu(f, &mut app, &mut clicks)).unwrap();
+        let out = dump(&term);
+        let (si, qi) = (out.find("Settings").unwrap(), out.find("Quit").unwrap());
+        assert!(si < qi);
     }
 }

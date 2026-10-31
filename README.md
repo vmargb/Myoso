@@ -111,9 +111,27 @@ Import the file from the menu like any other. Myoso will recognize the format on
 
 ---
 
+## Adaptive fading (new)
+
+Asking you to produce every step of a brand-new chain from a cold start strains cognitive load, especially with a deck of hundreds/thousands of these cards. So a path that is new, weak or recently forgotten is shown as a **worked example** first, the early steps are displayed with their answers (marked `◆`) and you are only tested on the last part of the chain. Every time you recall the tested part well, the tested region grows one step backwards, until you are recalling the whole chain. After this point, normal behaviour is persisted.
+
+```text
+S1 -> S2 -> S3 -> S4        boundary 3:   S1 ◆  S2 ◆  S3 tested  S4 tested
+```
+
+- Only tested steps are rated and scheduled. A worked step is never rated, never touches FSRS and never writes to the review log, so showing an answer can't inflate how well a step is remembered.
+- All tested steps `Good`/`Easy` moves the boundary back by one. Any `Again` or `Hard` keeps it where it is. Easy never skips ahead.
+- A miss on a tested step does not stop the review or re-lock the steps below it, they were attempted in the same review and are scheduled on their own ratings.
+- Each branch of a tree card fades independently, the state lives on the leaf of each path.
+- When every step is strong (stability of 21 days or more, no recent failures) the path goes back to the normal step-by-step review. If it lapses later, it comes back faded starting from the earliest weak step, not from the end.
+- Prefer to always be tested on every step? Turn off **Adaptive fading** in Settings (Scheduling). Review then behaves exactly as it did before this feature.
+- A path is only advanced once per session. Daily cards fade too, but their scheduling stays frozen. Cram always shows the full chain.
+
+---
+
 ## Scheduling algorithm
 
-`Myoso` now uses **FSRS** (Free Spaced Repetition Scheduler). FSRS has been modified to track each **item** (step) independently using two properties:
+`Myoso` now uses **FSRS** (Free Spaced Repetition Scheduler). FSRS has been extended to track each **item** (step) independently using two properties:
 1. *stability* (how long the memory lasts)
 2. *difficulty* (how hard the item is for you personally)
 

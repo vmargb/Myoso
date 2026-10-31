@@ -201,6 +201,12 @@ pub struct Item {
     pub body: String,
     #[serde(default)]
     pub heavy: bool, // hard question/step marker
+    /// adaptive fading, stored on the LEAF item of a root -> leaf path, see
+    /// `fade.rs`. `None` = never entered fading, `Some(N>=1)` = steps before N
+    /// are shown as worked examples and steps N.. are tested, `Some(0)` =
+    /// graduated back to normal review. Meaningless on non-leaf items.
+    #[serde(default)]
+    pub fade_boundary: Option<i32>,
 }
 
 /// A Simple card attached to a Multi card as a "margin" context clue
@@ -219,6 +225,20 @@ pub struct ReviewCard {
     pub items: Vec<Item>,
     /// Simple cards attached to this card as margin context clues
     pub references: Vec<CardRef>,
+    /// `Some(boundary)` (1-based) when this path is reviewed with adaptive
+    /// fading: the first `boundary - 1` steps are worked examples (shown with
+    /// their answers, never rated), the rest are tested. `None` = the normal
+    /// review. Always `None` in cram mode.
+    pub fade: Option<usize>,
+}
+
+impl ReviewCard {
+    /// how many leading steps are worked examples (0 when not fading)
+    pub fn worked(&self) -> usize {
+        self.fade
+            .map(|b| b.saturating_sub(1).min(self.items.len().saturating_sub(1)))
+            .unwrap_or(0)
+    }
 }
 
 /// Lightweight row returned by `list_cards`.

@@ -602,6 +602,7 @@ mod tests {
             is_pass,
             body: String::new(),
             heavy: false,
+            fade_boundary: None,
         }
     }
 

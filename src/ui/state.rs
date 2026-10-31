@@ -88,15 +88,21 @@ pub struct ReviewState {
     // cram-only: how many items were skipped rather than answered, for the
     // end-of-session summary. Always 0 outside cram mode.
     pub skipped_items:     usize,
+    // adaptive fading: ratings of the TESTED steps of the path on screen, and
+    // the leaves of the faded paths already finished this session
+    pub fade_ratings:      Vec<u8>,
+    pub faded_done:        HashSet<String>,
 }
 
 impl ReviewState {
     pub fn new(session: Vec<ReviewCard>) -> Self {
-        let total = session.iter().map(|rc| rc.items.len()).sum();
+        // worked steps are shown but never rated, so they are not progress
+        let total = session.iter().map(|rc| rc.items.len() - rc.worked()).sum();
+        let first = session.first().map_or(0, |rc| rc.worked());
         Self {
             session,
             card_idx: 0,
-            item_idx: 0,
+            item_idx: first,
             phase: ReviewPhase::Thinking,
             started_at: Instant::now(),
             item_started_at: Instant::now(),
@@ -111,7 +117,15 @@ impl ReviewState {
             focus: ReviewFocus::Card,
             cram: false,
             skipped_items: 0,
+            fade_ratings: Vec::new(),
+            faded_done: HashSet::new(),
         }
+    }
+
+    /// the step a path is entered on: 0 normally, the first TESTED step for a
+    /// faded path (the steps before it are worked examples)
+    fn start_idx(&self) -> usize {
+        self.session.get(self.card_idx).map_or(0, |rc| rc.worked())
     }
 
     /// Build a cram session (`Store::cram_session`). Everything else
@@ -142,6 +156,14 @@ impl ReviewState {
     pub fn requeue_if_due(&mut self, store: &Store, card_id: &str) -> anyhow::Result<()> {
         for review_card in store.review_card_if_due(card_id)? {
             let target = review_card.items.last().map(|it| it.id.as_str());
+            // one faded pass per path per session: the boundary moves on after
+            // a successful review, but the steps it just uncovered are not
+            // asked again minutes after they were shown as worked examples
+            if review_card.fade.is_some()
+                && target.map_or(false, |t| self.faded_done.contains(t))
+            {
+                continue;
+            }
             let already_queued = self
                 .session
                 .get(self.card_idx..)
@@ -153,7 +175,7 @@ impl ReviewState {
             if already_queued {
                 continue;
             }
-            self.total_items += review_card.items.len();
+            self.total_items += review_card.items.len() - review_card.worked();
             self.session.push(review_card);
         }
 
@@ -214,7 +236,8 @@ impl ReviewState {
                 // nothing left to review in this path
                 self.session.remove(i);
                 if is_current {
-                    self.item_idx = 0;
+                    self.fade_ratings.clear();
+                    self.item_idx = self.start_idx();
                     self.phase = ReviewPhase::Thinking;
                     self.item_started_at = Instant::now();
                     self.answer_scroll = 0;
@@ -224,9 +247,20 @@ impl ReviewState {
             }
 
             self.session[i].card = card.clone();
+            // steps may have been added or removed, keep the boundary on the path
+            let n = kept.len();
+            self.session[i].fade = self.session[i].fade.map(|b| b.clamp(1, n.max(1)));
             self.session[i].items = kept;
             if is_current {
                 self.item_idx = survivors_before_cursor;
+                let worked = self.session[i].worked();
+                if self.item_idx < worked {
+                    // the cursor must never rest on a worked step
+                    self.item_idx = worked;
+                    self.phase = ReviewPhase::Thinking;
+                    self.item_started_at = Instant::now();
+                    self.answer_scroll = 0;
+                }
                 if !cursor_item_survived {
                     // the step on screen is gone, so show the next one fresh
                     self.phase = ReviewPhase::Thinking;
@@ -244,12 +278,27 @@ impl ReviewState {
             .unwrap_or(&[])
             .iter()
             .enumerate()
-            .map(|(n, rc)| if n == 0 { rc.items.len().saturating_sub(self.item_idx) } else { rc.items.len() })
+            .map(|(n, rc)| {
+                if n == 0 {
+                    rc.items.len().saturating_sub(self.item_idx)
+                } else {
+                    rc.items.len().saturating_sub(rc.worked())
+                }
+            })
             .sum();
         self.total_items = self.done_items + remaining;
 
         if card.kind == CardKind::Multi {
             self.requeue_if_due(store, card_id)?;
+        }
+        // a path queued just now may be the one on screen, and it is entered on
+        // its first tested step, never on a worked one
+        let worked = self.start_idx();
+        if !self.is_done() && self.item_idx < worked {
+            self.item_idx = worked;
+            self.phase = ReviewPhase::Thinking;
+            self.item_started_at = Instant::now();
+            self.answer_scroll = 0;
         }
         if self.is_done() && self.finished_duration.is_none() {
             self.finished_duration = Some(self.started_at.elapsed());
@@ -270,6 +319,14 @@ impl ReviewState {
             return Ok(());
         }
 
+        // a worked example is only ever shown. It is never rated, which keeps
+        // fading from fabricating evidence of recall (the cursor never rests
+        // on one, this is just a guard)
+        if self.item_idx < self.session[self.card_idx].worked() {
+            return Ok(());
+        }
+        let faded = self.session[self.card_idx].fade.is_some();
+
         // snapshot of what we need before state mutation
         let item         = &self.session[self.card_idx].items[self.item_idx];
         let item_id      = item.id.clone();
@@ -283,8 +340,8 @@ impl ReviewState {
         // forward/reverse items are never re-shown within a session
         let chain_reexposure = is_step && self.session_rated.contains(&item_id);
 
-        let leech_status = store.record_review(
-            &item_id, confidence, self.item_started_at.elapsed(), chain_reexposure,
+        let leech_status = store.record_review_with(
+            &item_id, confidence, self.item_started_at.elapsed(), chain_reexposure, faded,
         )?;
 
         // mark this item as having received its first full update this session
@@ -329,12 +386,25 @@ impl ReviewState {
         is_step: bool,
         is_last_item: bool,
     ) -> anyhow::Result<()> {
-        if is_step && confidence == 1 {
+        let fading = self.session.get(self.card_idx).map_or(false, |rc| rc.fade.is_some());
+        if fading {
+            // a faded review attempts every tested step even after a miss, so
+            // nothing is skipped and nothing is re-locked (the db side skips
+            // the de-unlock too). Only the tested ratings move the boundary
+            self.fade_ratings.push(confidence);
+            if is_last_item {
+                self.complete_fade(store)?;
+            }
+            self.advance();
+            if is_last_item && is_step {
+                self.requeue_if_due(store, card_id)?;
+            }
+        } else if is_step && confidence == 1 {
             // failure: skip remaining steps, jump to next card
             let skipped_items = self.session[self.card_idx].items.len() - self.item_idx - 1;
             self.total_items -= skipped_items;
             self.card_idx += 1;
-            self.item_idx = 0;
+            self.item_idx = self.start_idx();
             self.phase = ReviewPhase::Thinking;
             self.item_started_at = Instant::now();
             self.answer_scroll = 0;
@@ -361,6 +431,19 @@ impl ReviewState {
         Ok(())
     }
 
+    /// every tested step of the faded path on screen has been rated, so move
+    /// (or keep, or graduate) its boundary
+    fn complete_fade(&mut self, store: &Store) -> anyhow::Result<()> {
+        let rc = &self.session[self.card_idx];
+        if let (Some(boundary), Some(leaf)) = (rc.fade, rc.items.last()) {
+            let leaf_id = leaf.id.clone();
+            store.complete_fade(&leaf_id, boundary, &self.fade_ratings)?;
+            self.faded_done.insert(leaf_id);
+        }
+        self.fade_ratings.clear();
+        Ok(())
+    }
+
     /// Cram-only: skip the whole card (every remaining step of the current
     /// path, if it's a multi-step one) and move on, without rating anything.
     pub fn skip(&mut self) {
@@ -371,7 +454,7 @@ impl ReviewState {
         self.skipped_items += remaining;
 
         self.card_idx += 1;
-        self.item_idx = 0;
+        self.item_idx = self.start_idx();
         self.phase = ReviewPhase::Thinking;
         self.item_started_at = Instant::now();
         self.answer_scroll = 0;
@@ -390,10 +473,11 @@ impl ReviewState {
         if let Some(card) = self.session.get(self.card_idx) {
             if self.item_idx >= card.items.len() {
                 self.card_idx += 1;
-                self.item_idx = 0;
+                self.item_idx = self.start_idx();
             }
         }
         if self.card_idx != prev_card_idx {
+            self.fade_ratings.clear();
             self.answer_scroll = 0; // fresh card: don't carry over old scroll
             self.clear_scratchpad();
         }
@@ -1710,6 +1794,8 @@ mod tests {
     fn a_root_fork_session_walks_both_paths_without_inflating_the_trunk() {
         let store = mem();
         let id = add(&store, &root_fork());
+        store.test_make_mature(&id, &["s1", "s2", "h1", "h2"]);
+        let before = item(&store, &id, "s1").review_count;
         let mut rs = ReviewState::new(store.due_session(None, &SessionLimits::default()).unwrap());
         assert_eq!(queued_paths(&rs), vec![vec!["s1"], vec!["h1"]]);
 
@@ -1723,7 +1809,7 @@ mod tests {
         // s1 / h1 were shown twice (alone, then as context for step 2), but the second
         // showing is a re-exposure, still a first-Good interval, not a compounded one
         let s1 = item(&store, &id, "s1");
-        assert_eq!(s1.review_count, 2);
+        assert_eq!(s1.review_count, before + 2);
         assert_eq!(s1.interval_days, item(&store, &id, "s2").interval_days);
         // progress bookkeeping ends consistent
         assert_eq!(rs.done_items, rs.total_items);
@@ -1737,27 +1823,34 @@ mod tests {
         for a in ["t1", "t2", "a1", "a2", "b1"] {
             store.record_review(&item(&store, &id, a).id, 3, std::time::Duration::from_secs(1), false).unwrap();
         }
-        // make the trunk due again and fail it
+        store.test_make_mature(&id, &[]);
+        // fail the trunk of a mature card: normal review, so everything under it is re-locked
         store.record_review(&item(&store, &id, "t2").id, 1, std::time::Duration::from_secs(1), false).unwrap();
-        // t2 was rescheduled ahead but everything under it is now due
+        for a in ["a1", "a2", "b1"] {
+            assert!(item(&store, &id, a).due_at <= chrono::Utc::now(), "{a} re-locked");
+        }
+        // the lapsed trunk is weak, so both branches now come back faded from t2:
+        // t1 is a worked example, t2 and everything below it is tested
         let mut rs = ReviewState::new(store.review_card_if_due(&id).unwrap());
-        assert_eq!(queued_paths(&rs), vec![vec!["t1", "t2", "a1"], vec!["t1", "t2", "b1"]]);
+        assert_eq!(queued_paths(&rs), vec![vec!["t1", "t2", "a1", "a2"], vec!["t1", "t2", "b1"]]);
+        assert!(rs.session.iter().all(|rc| rc.fade == Some(2)));
+        assert_eq!(rs.item_idx, 1, "starts on t2, t1 is only shown");
 
-        // fail t1 on screen mid-path, the rest of THIS path is skipped, and the card is requeued
-        rs.rate(&store, 3).unwrap(); // t1 (re-exposure of a well-known step)
-        rs.rate(&store, 3).unwrap(); // t2 (re-exposure)
-        rs.rate(&store, 1).unwrap(); // a1: fail
+        rs.rate(&store, 3).unwrap(); // t2 (re-exposure of the step just failed)
+        rs.rate(&store, 1).unwrap(); // a1: fail, but a2 is still attempted in the same review
+        assert_eq!(rs.session[rs.card_idx].items[rs.item_idx].answer, "a2");
         let queued = queued_paths(&rs);
         assert!(queued.contains(&vec!["t1".into(), "t2".into(), "b1".into()]), "b1 path still queued: {queued:?}");
-        assert!(rs.total_items >= rs.done_items);
         run_to_end(&mut rs, &store, 3);
         assert!(rs.is_done());
+        assert_eq!(item(&store, &id, "t1").review_count, 5, "a worked step is never rated");
     }
 
     #[test]
     fn requeue_does_not_duplicate_a_queued_path_but_keeps_sibling_paths() {
         let store = mem();
-        add(&store, &root_fork());
+        let id = add(&store, &root_fork());
+        store.test_make_mature(&id, &["s1", "s2", "h1", "h2"]);
         let mut rs = ReviewState::new(store.due_session(None, &SessionLimits::default()).unwrap());
         rs.rate(&store, 3).unwrap(); // s1
         // [h1] still queued, [s1,s2] appended
@@ -1769,7 +1862,8 @@ mod tests {
     #[test]
     fn linear_card_still_produces_one_growing_path() {
         let store = mem();
-        add(&store, &chain(&["s1", "s2", "s3"]));
+        let id = add(&store, &chain(&["s1", "s2", "s3"]));
+        store.test_make_mature(&id, &["s1", "s2", "s3"]);
         let mut rs = ReviewState::new(store.due_session(None, &SessionLimits::default()).unwrap());
         assert_eq!(queued_paths(&rs), vec![vec!["s1"]]);
         rs.rate(&store, 3).unwrap();
@@ -1812,6 +1906,163 @@ mod tests {
         assert_finishes_after_one_hard_on_context(root_fork(), 3);
     }
 
+    // ~~ adaptive fading ~~
+
+    fn session_of(store: &Store) -> ReviewState {
+        ReviewState::new(store.due_session(None, &SessionLimits::default()).unwrap())
+    }
+
+    #[test]
+    fn a_new_linear_path_starts_faded_and_only_tested_steps_are_rated() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2", "s3", "s4"]));
+        let mut rs = session_of(&store);
+        assert_eq!(rs.session.len(), 1);
+        assert_eq!(rs.session[0].fade, Some(4));
+        assert_eq!(rs.item_idx, 3, "S1-S3 worked, S4 tested");
+        assert_eq!(rs.total_items, 1, "worked steps are not progress");
+
+        rs.rate(&store, 3).unwrap();
+        assert!(rs.is_done(), "the path is not asked again this session");
+        // S4 got a real FSRS update, the worked steps nothing at all
+        let s4 = item(&store, &id, "s4");
+        assert_eq!(s4.review_count, 1);
+        assert!(s4.stability > 0.0);
+        for a in ["s1", "s2", "s3"] {
+            let it = item(&store, &id, a);
+            assert_eq!((it.review_count, it.stability, it.difficulty), (0, 0.0, 0.0), "{a}");
+            assert!(it.last_reviewed_at.is_none(), "{a}");
+        }
+        assert_eq!(s4.fade_boundary, Some(3));
+    }
+
+    #[test]
+    fn the_boundary_fades_back_across_sessions_down_to_full_recall() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2", "s3", "s4"]));
+        for (session_no, (boundary, tested)) in [(4, 1), (3, 2), (2, 3), (1, 4)].into_iter().enumerate() {
+            let mut rs = session_of(&store);
+            assert_eq!(rs.session.len(), 1, "session {session_no}");
+            assert_eq!(rs.session[0].fade, Some(boundary), "session {session_no}");
+            assert_eq!(rs.total_items, tested);
+            run_to_end(&mut rs, &store, 3);
+            // pretend a day passed so the next session can find the steps due again
+            store.test_make_due_all(&id);
+        }
+        assert_eq!(item(&store, &id, "s4").fade_boundary, Some(1));
+        assert!(["s1", "s2", "s3", "s4"].iter().all(|a| item(&store, &id, a).review_count >= 1));
+    }
+
+    #[test]
+    fn again_keeps_the_boundary_and_does_not_stop_the_review() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2", "s3", "s4"]));
+        run_to_end(&mut session_of(&store), &store, 3); // boundary 4 -> 3
+        store.test_make_due_all(&id);
+
+        let mut rs = session_of(&store);
+        assert_eq!(rs.session[0].fade, Some(3));
+        rs.rate(&store, 1).unwrap(); // s3: Again
+        assert_eq!(rs.session[rs.card_idx].items[rs.item_idx].answer, "s4", "s4 is still asked");
+        rs.rate(&store, 3).unwrap(); // s4: Good
+        assert!(rs.is_done());
+        assert_eq!(item(&store, &id, "s4").fade_boundary, Some(3), "unchanged after an Again");
+        // each tested step was scored on its own rating, and nothing was re-locked
+        let (s3, s4) = (item(&store, &id, "s3"), item(&store, &id, "s4"));
+        assert_eq!(s3.consecutive_fails, 1);
+        assert_eq!(s4.consecutive_fails, 0);
+        assert!(s4.due_at > chrono::Utc::now(), "s4 was not made due again by the miss on s3");
+    }
+
+    #[test]
+    fn hard_keeps_the_boundary_too() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2", "s3"]));
+        let mut rs = session_of(&store);
+        rs.rate(&store, 2).unwrap();
+        assert_eq!(item(&store, &id, "s3").fade_boundary, Some(3));
+    }
+
+    #[test]
+    fn a_lapsed_mature_path_comes_back_faded_from_its_earliest_weak_step() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2", "s3", "s4"]));
+        store.test_make_mature(&id, &[]);
+        // forget s2 in a normal review: its descendants are re-locked as before
+        store.record_review(&item(&store, &id, "s2").id, 1, std::time::Duration::from_secs(1), false).unwrap();
+        assert!(item(&store, &id, "s3").due_at <= chrono::Utc::now());
+        let rs = ReviewState::new(store.review_card_if_due(&id).unwrap());
+        assert_eq!(rs.session[0].fade, Some(2), "S1 worked, S2-S4 tested, not S1-S3 worked");
+        assert_eq!(rs.item_idx, 1);
+    }
+
+    #[test]
+    fn sibling_branches_keep_independent_boundaries() {
+        let store = mem();
+        let id = add(&store, &fork());
+        // a1 -> a2 gets its pass in, b1 does not
+        let mut rs = session_of(&store);
+        assert_eq!(rs.session.len(), 2);
+        // walk only the first path (A), then drop the rest of the session
+        while rs.card_idx == 0 && !rs.is_done() { rs.rate(&store, 3).unwrap(); }
+        assert_eq!(item(&store, &id, "a2").fade_boundary, Some(3));
+        assert_eq!(item(&store, &id, "b1").fade_boundary, None, "B was not touched");
+    }
+
+    #[test]
+    fn daily_fading_moves_the_boundary_but_freezes_scheduling() {
+        let store = mem();
+        let id = store
+            .add_multi_card("Deck", "Q?", &chain(&["s1", "s2", "s3"]), true, &ReviewMode::Daily)
+            .unwrap();
+        let mut rs = session_of(&store);
+        assert_eq!(rs.session[0].fade, Some(3));
+        run_to_end(&mut rs, &store, 3);
+        let s3 = item(&store, &id, "s3");
+        assert_eq!(s3.fade_boundary, Some(2), "the boundary progresses");
+        assert_eq!((s3.stability, s3.difficulty, s3.interval_days), (0.0, 0.0, 0.0), "FSRS stays frozen");
+        assert!(item(&store, &id, "s1").last_reviewed_at.is_none());
+        // the reviewed-today gate holds even though the worked steps never were
+        assert!(session_of(&store).session.is_empty());
+    }
+
+    #[test]
+    fn cram_shows_the_whole_chain_and_writes_nothing() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2", "s3"]));
+        let mut rs = ReviewState::new_cram(store.cram_session_for_ids(&[id.clone()]).unwrap());
+        assert_eq!(rs.session[0].fade, None);
+        assert_eq!(rs.item_idx, 0);
+        assert_eq!(rs.session[0].items.len(), 3);
+        run_to_end(&mut rs, &store, 3);
+        for a in ["s1", "s2", "s3"] {
+            let it = item(&store, &id, a);
+            assert_eq!((it.review_count, it.fade_boundary), (0, None), "{a}");
+        }
+    }
+
+    #[test]
+    fn refresh_keeps_the_cursor_off_worked_steps_and_the_boundary_on_the_path() {
+        let store = mem();
+        let id = add(&store, &chain(&["s1", "s2", "s3", "s4"]));
+        let mut rs = session_of(&store);
+        assert_eq!(rs.item_idx, 3);
+        // delete s4's neighbours until the path is shorter than the boundary
+        let card = store.load_card(&id).unwrap();
+        let items = store.load_items(&id).unwrap();
+        let mut d = crate::tree::drafts_from_items(card.is_tree, &items);
+        d.truncate(2); // s1, s2 only
+        store.update_multi_card(&id, "Deck", "Q?", &d, true, &ReviewMode::SpacedRepetition).unwrap();
+        rs.refresh_card(&store, &id).unwrap();
+        // the old target is gone: the path was dropped and the new leaf queued, still faded
+        for rc in &rs.session[rs.card_idx..] {
+            if let Some(b) = rc.fade { assert!(b >= 1 && b <= rc.items.len()); }
+        }
+        if !rs.is_done() {
+            assert!(rs.item_idx >= rs.session[rs.card_idx].worked());
+        }
+    }
+
     // ~~ editing a card from inside a session ~~
 
     #[test]
@@ -1821,6 +2072,7 @@ mod tests {
         for a in ["t1", "t2"] {
             store.record_review(&item(&store, &id, a).id, 3, std::time::Duration::from_secs(1), false).unwrap();
         }
+        store.test_make_mature(&id, &["a1", "a2", "b1"]);
         let mut rs = ReviewState::new(store.review_card_if_due(&id).unwrap());
         assert_eq!(queued_paths(&rs), vec![vec!["t1", "t2", "a1"], vec!["t1", "t2", "b1"]]);
         rs.item_idx = 1; // looking at t2
@@ -1861,6 +2113,7 @@ mod tests {
     fn refresh_card_ends_the_session_cleanly_when_the_target_is_deleted() {
         let store = mem();
         let id = add(&store, &chain(&["s1", "s2"]));
+        store.test_make_mature(&id, &["s1", "s2"]);
         let mut rs = ReviewState::new(store.due_session(None, &SessionLimits::default()).unwrap());
         assert_eq!(queued_paths(&rs), vec![vec!["s1"]]);
 
@@ -2199,5 +2452,59 @@ mod tests {
         s.simple_question = "plain question".into();
         assert!(s.validate().is_err(), "a normal card still needs an answer");
         let _ = store;
+    }
+
+    // ~~ settings screen ~~
+
+    #[test]
+    fn menu_opens_settings_and_changes_are_written_through() {
+        let store = mem();
+        let mut app = AppState::new(&store);
+        app.menu_state.select(Some(7));
+        app.menu_select().unwrap();
+        assert!(app.screen == Screen::Settings);
+        assert!(app.settings_ui.is_some());
+
+        // first row is "new cards per session" (default 20, steps of 5)
+        app.settings_adjust(1, false);
+        assert_eq!(store.settings().new_cards, 25);
+        app.settings_adjust(-1, true);
+        assert_eq!(store.settings().new_cards, 0);
+
+        // a boolean row flips
+        let easy_row = SettingId::ALL.iter().position(|&i| i == SettingId::AllowEasy).unwrap();
+        app.settings_ui.as_mut().unwrap().list_state.select(Some(easy_row));
+        app.settings_adjust(1, false);
+        assert!(!store.settings().allow_easy);
+
+        // reset row, then reset all
+        app.settings_reset_row();
+        assert!(store.settings().allow_easy);
+        app.settings_reset_all();
+        assert_eq!(store.settings(), Settings::default());
+    }
+
+    #[test]
+    fn selection_wraps_in_the_settings_list() {
+        let mut ui = SettingsState::new();
+        ui.prev();
+        assert_eq!(ui.selected_id(), SettingId::ALL.last().copied());
+        ui.next();
+        assert_eq!(ui.selected_id(), Some(SettingId::ALL[0]));
+    }
+
+    #[test]
+    fn new_cards_setting_limits_the_next_session() {
+        let store = mem();
+        for i in 0..4 {
+            store.add_simple_card("D", &format!("q{i}"), "a", false, None, &ReviewMode::SpacedRepetition).unwrap();
+        }
+        let mut s = store.settings();
+        s.new_cards = 2;
+        store.save_settings(&s).unwrap();
+        let mut app = AppState::new(&store);
+        app.menu_state.select(Some(0));
+        app.menu_select().unwrap();
+        assert_eq!(app.review.as_ref().unwrap().session.len(), 2);
     }
 }

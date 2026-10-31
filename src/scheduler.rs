@@ -267,6 +267,7 @@ mod tests {
             is_pass: false,
             body: String::new(),
             heavy: false,
+            fade_boundary: None,
         }
     }
 
